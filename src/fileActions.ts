@@ -4,6 +4,7 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { aiReady } from "./aiActions";
 import { api } from "./api";
+import { renderMermaidToPng, renderMermaidToSvg } from "./mermaidRender";
 import { useStore } from "./store";
 import type { Document, ExportFormat } from "./types";
 
@@ -118,6 +119,24 @@ export async function importDocument(): Promise<void> {
   }
 }
 
+/**
+ * Snapshot every diagram chunk's rendered graph into `metadata.renderedImage`
+ * (a 2x PNG data URL) on a clone of the document, for EXPORT payloads only —
+ * the editor's own document is never mutated. Rust embeds the PNG in RTF/PPTX;
+ * a chunk whose render fails is left untouched (Rust warns + falls back).
+ */
+async function withRenderedDiagrams(doc: Document): Promise<Document> {
+  const chunks = [...doc.chunks];
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    if (c.metadata.chunkType !== "diagram" || !c.content.trim()) continue;
+    const png = await renderMermaidToPng(c.content, { scale: 2, background: "white" });
+    if (!png) continue;
+    chunks[i] = { ...c, metadata: { ...c.metadata, renderedImage: png } };
+  }
+  return { ...doc, chunks };
+}
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -127,33 +146,36 @@ function escapeHtml(s: string): string {
 }
 
 /** Build a clean, print-ready HTML document from the current document. */
-function buildPrintHtml(doc: Document): string {
-  const body = doc.chunks
-    .map((c) => {
-      const type = c.metadata.chunkType;
-      if (type === "heading") {
-        const lv = Math.min(Math.max(c.metadata.level ?? 1, 1), 3);
-        return `<h${lv}>${escapeHtml(c.content)}</h${lv}>`;
+async function buildPrintHtml(doc: Document): Promise<string> {
+  const parts: string[] = [];
+  for (const c of doc.chunks) {
+    const type = c.metadata.chunkType;
+    if (type === "heading") {
+      const lv = Math.min(Math.max(c.metadata.level ?? 1, 1), 3);
+      parts.push(`<h${lv}>${escapeHtml(c.content)}</h${lv}>`);
+    } else if (type === "image") {
+      const cap = c.metadata.summary
+        ? `<figcaption>${escapeHtml(c.metadata.summary)}</figcaption>`
+        : "";
+      if (c.content) parts.push(`<figure><img src="${c.content}" />${cap}</figure>`);
+    } else if (type === "diagram") {
+      // Reuse the already-rendered Mermaid SVG from the live DOM when present;
+      // for unmounted chunks (backgrounded slide, virtualized view) render it
+      // off-screen instead — the raw source <pre> is only a last resort.
+      const live = document.querySelector(`#chunk-${c.id} svg`);
+      if (live) {
+        parts.push(`<figure class="diagram">${live.outerHTML}</figure>`);
+      } else {
+        const svg = c.content.trim() ? await renderMermaidToSvg(c.content) : null;
+        if (svg) parts.push(`<figure class="diagram">${svg}</figure>`);
+        else parts.push(`<pre>${escapeHtml(c.content)}</pre>`);
       }
-      if (type === "image") {
-        const cap = c.metadata.summary
-          ? `<figcaption>${escapeHtml(c.metadata.summary)}</figcaption>`
-          : "";
-        return c.content
-          ? `<figure><img src="${c.content}" />${cap}</figure>`
-          : "";
-      }
-      if (type === "diagram") {
-        // Reuse the already-rendered Mermaid SVG from the live DOM when present;
-        // otherwise fall back to the diagram source so nothing is lost.
-        const svg = document.querySelector(`#chunk-${c.id} svg`);
-        if (svg) return `<figure class="diagram">${svg.outerHTML}</figure>`;
-        return `<pre>${escapeHtml(c.content)}</pre>`;
-      }
+    } else {
       // text
-      return `<p>${escapeHtml(c.content)}</p>`;
-    })
-    .join("\n");
+      parts.push(`<p>${escapeHtml(c.content)}</p>`);
+    }
+  }
+  const body = parts.join("\n");
 
   const title = escapeHtml(doc.title.trim() || "Untitled");
   return `<!doctype html><html><head><meta charset="utf-8" />
@@ -185,7 +207,7 @@ function buildPrintHtml(doc: Document): string {
 export async function exportPdf(): Promise<void> {
   const s = useStore.getState();
   try {
-    const html = buildPrintHtml(s.doc);
+    const html = await buildPrintHtml(s.doc);
     const iframe = document.createElement("iframe");
     iframe.setAttribute("aria-hidden", "true");
     Object.assign(iframe.style, {
@@ -249,7 +271,11 @@ export async function exportDocument(format: ExportFormat): Promise<void> {
       filters: [{ name: format.toUpperCase(), extensions: [format] }],
     });
     if (!path) return;
-    await api.exportDocument(s.doc, path, format);
+    // RTF embeds diagram snapshots (PNG); txt is placeholder-by-design and md
+    // keeps the mermaid fences, so neither needs the (costly) render pass.
+    const payload = format === "rtf" ? await withRenderedDiagrams(s.doc) : s.doc;
+    await api.exportDocument(payload, path, format);
+    s.setLastExportReport(format, []);
     s.notify(`Exported as ${format.toUpperCase()}.`, "success");
   } catch (e) {
     s.notify(message(e), "error");
@@ -269,7 +295,13 @@ export async function exportPptx(): Promise<void> {
       filters: [{ name: "PowerPoint", extensions: ["pptx"] }],
     });
     if (!path) return;
-    const report = await api.exportPptx(s.doc, path);
+    // Snapshot diagrams to PNG so the deck embeds real graphs (ズレ① FE half).
+    const payload = await withRenderedDiagrams(s.doc);
+    const report = await api.exportPptx(payload, path);
+    // Keep the warnings reviewable in the health bar (提案2) — a toast alone
+    // disappears in seconds and silently-lost content was the report's core
+    // complaint (ズレ①).
+    s.setLastExportReport("pptx", report.warnings);
     if (report.warnings.length > 0) {
       s.notify(
         `Exported ${report.slides} slide(s) as PPTX. ${report.warnings.join(" ")}`,

@@ -5,7 +5,7 @@
 // toolbar's view toggle (both are the same chunks, presented differently). A
 // small icon on each tab shows its current mode.
 
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirmDiscard } from "../confirm";
 import { useStore } from "../store";
 import type { DocMode } from "../types";
 import { CloseIcon, FileIcon, PlusIcon, SlidesIcon } from "./icons";
@@ -37,13 +37,8 @@ export default function TabBar() {
     (id === activeTabId ? activeMode : inactiveTabs[id]?.doc.mode ?? "editor") as DocMode;
 
   const onClose = async (id: string) => {
-    if (dirtyOf(id)) {
-      const ok = await confirm("This tab has unsaved changes. Close it?", {
-        title: "Unsaved changes",
-        kind: "warning",
-      });
-      if (!ok) return;
-    }
+    // Shared discard dialog (item 18) — same wording/labels as the Quit path.
+    if (dirtyOf(id) && !(await confirmDiscard("tab"))) return;
     closeTab(id);
   };
 

@@ -10,6 +10,11 @@ use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+// Kept as com.aix.texteditor across the NurumayuFacet rebrand on purpose: this
+// keychain service id is invisible to users; changing it (like the matching
+// bundle identifier in tauri.conf.json) would strand every existing user's
+// stored API key. The rebrand is display-only, so internal ids stay put and
+// no migration is needed.
 pub const KEYRING_SERVICE: &str = "com.aix.texteditor";
 pub const KEYRING_ACCOUNT: &str = "openrouter-api-key";
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -62,30 +67,93 @@ fn default_writing_tone() -> String {
     String::new()
 }
 
+/// Default editor body font family. One of "serif" | "sans" | "mono";
+/// anything else is reset to "serif" on load.
+fn default_editor_font_family() -> String {
+    "serif".to_string()
+}
+
+/// Default editor body font size in px. Clamped to 12..=28 on load.
+fn default_editor_font_size() -> u32 {
+    17
+}
+
+/// Map a locale string (`ja_JP`, `en_US.UTF-8`, `zh-Hans-CN`, …) to the display
+/// name used for the default output language, or `None` when the language code
+/// isn't one we pre-translate. Pure so it's unit-testable.
+fn language_from_locale(locale: &str) -> Option<&'static str> {
+    let loc = locale.trim().to_lowercase();
+    let lang = loc.split(['_', '.', '-']).next().unwrap_or("");
+    match lang {
+        "en" => Some("English"),
+        "ja" => Some("日本語"),
+        "zh" => Some("中文"),
+        "ko" => Some("한국어"),
+        "es" => Some("Español"),
+        "fr" => Some("Français"),
+        "de" => Some("Deutsch"),
+        "pt" => Some("Português"),
+        "it" => Some("Italiano"),
+        "ru" => Some("Русский"),
+        "ar" => Some("العربية"),
+        _ => None,
+    }
+}
+
+/// Read a global macOS user default via the `defaults` CLI, e.g.
+/// `defaults read -g AppleLocale` → `ja_JP`.
+#[cfg(target_os = "macos")]
+fn macos_defaults_read(key: &str) -> Option<String> {
+    let out = std::process::Command::new("defaults")
+        .args(["read", "-g", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Best-effort default output language from the OS locale, so a Japanese (or
 /// other non-English) user isn't forced to English out of the box. Used only
 /// for a fresh install; fully overridable in Settings. Falls back to English.
+///
+/// Env vars (LANG/LC_*) are checked first, but a Finder/Dock launch on macOS
+/// inherits launchd's environment, which sets none of them — so when they
+/// yield no match we ask the system preferences via `defaults read`.
 fn default_language() -> String {
     let loc = std::env::var("LANG")
         .or_else(|_| std::env::var("LC_ALL"))
         .or_else(|_| std::env::var("LC_MESSAGES"))
-        .unwrap_or_default()
-        .to_lowercase();
-    let lang = loc.split(['_', '.', '-']).next().unwrap_or("");
-    match lang {
-        "ja" => "日本語",
-        "zh" => "中文",
-        "ko" => "한국어",
-        "es" => "Español",
-        "fr" => "Français",
-        "de" => "Deutsch",
-        "pt" => "Português",
-        "it" => "Italiano",
-        "ru" => "Русский",
-        "ar" => "العربية",
-        _ => "English",
+        .unwrap_or_default();
+    if let Some(lang) = language_from_locale(&loc) {
+        return lang.to_string();
     }
-    .to_string()
+    #[cfg(target_os = "macos")]
+    {
+        // `AppleLocale` is a plain locale string (`ja_JP`).
+        if let Some(lang) = macos_defaults_read("AppleLocale")
+            .as_deref()
+            .and_then(language_from_locale)
+        {
+            return lang.to_string();
+        }
+        // `AppleLanguages` prints a plist array like `(\n    "ja-JP",\n …)`;
+        // the first quoted entry is the user's preferred language.
+        if let Some(lang) = macos_defaults_read("AppleLanguages")
+            .as_deref()
+            .and_then(|s| s.split('"').nth(1))
+            .and_then(language_from_locale)
+        {
+            return lang.to_string();
+        }
+    }
+    "English".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +181,17 @@ pub struct Settings {
     #[serde(default = "default_writing_tone")]
     pub writing_tone: String,
     pub temperature: f32,
+    /// Built-in default model ids the user explicitly removed. Without this
+    /// tombstone list, `merge_default_models` would resurrect a deleted
+    /// built-in on every load.
+    #[serde(default)]
+    pub removed_models: Vec<String>,
+    /// Editor body font family: "serif" | "sans" | "mono".
+    #[serde(default = "default_editor_font_family")]
+    pub editor_font_family: String,
+    /// Editor body font size in px (12..=28).
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: u32,
 }
 
 impl Default for Settings {
@@ -126,45 +205,78 @@ impl Default for Settings {
             default_target_language: default_language(),
             writing_tone: default_writing_tone(),
             temperature: 0.3,
+            removed_models: Vec::new(),
+            editor_font_family: default_editor_font_family(),
+            editor_font_size: default_editor_font_size(),
         }
     }
 }
 
 impl Settings {
     /// Load settings from `<config_dir>/settings.json`, falling back to defaults
-    /// when the file is absent or unreadable.
+    /// when the file is absent. A file that exists but fails to parse is backed
+    /// up to `settings.json.bak` (instead of being silently overwritten on the
+    /// next save) so a hand-edit typo can't destroy the user's configuration.
     pub fn load(config_dir: &Path) -> Self {
         let path = config_dir.join(SETTINGS_FILE);
-        let mut settings: Settings = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let mut settings = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Settings>(&text) {
+                Ok(s) => s,
+                Err(e) => {
+                    let bak = path.with_extension("json.bak");
+                    let _ = std::fs::remove_file(&bak); // overwrite an older backup
+                    let _ = std::fs::rename(&path, &bak);
+                    eprintln!(
+                        "settings: {SETTINGS_FILE} is corrupt ({e}); backed up to {} and using defaults",
+                        bak.display()
+                    );
+                    Settings::default()
+                }
+            },
+            // Missing (or unreadable) file: first run, use defaults.
+            Err(_) => Settings::default(),
+        };
         // Existing users have a saved `models`/`imageModels` list, so serde keeps
         // that list and the new built-in defaults never appear. Merge in any
         // pre-registered model that's missing, preserving the user's own
         // additions and ordering.
         settings.merge_default_models();
+        settings.sanitize();
         settings
     }
 
-    /// Append any built-in default model that isn't already in the list.
+    /// Append any built-in default model that isn't already in the list,
+    /// skipping ids the user explicitly removed (see `removed_models`).
     fn merge_default_models(&mut self) {
         for m in default_models() {
-            if !self.models.iter().any(|x| x == &m) {
+            if !self.removed_models.contains(&m) && !self.models.iter().any(|x| x == &m) {
                 self.models.push(m);
             }
         }
         for m in default_image_models() {
-            if !self.image_models.iter().any(|x| x == &m) {
+            if !self.removed_models.contains(&m) && !self.image_models.iter().any(|x| x == &m) {
                 self.image_models.push(m);
             }
         }
     }
 
+    /// Coerce out-of-range values (e.g. from a hand-edited file) back to safe
+    /// ones so the editor never renders with an unusable font.
+    fn sanitize(&mut self) {
+        self.editor_font_size = self.editor_font_size.clamp(12, 28);
+        if !matches!(self.editor_font_family.as_str(), "serif" | "sans" | "mono") {
+            self.editor_font_family = default_editor_font_family();
+        }
+    }
+
+    /// Written atomically (temp + rename, same pattern as the session autosave)
+    /// so a crash mid-write can't corrupt the settings file.
     pub fn save(&self, config_dir: &Path) -> AppResult<()> {
         std::fs::create_dir_all(config_dir)?;
         let path = config_dir.join(SETTINGS_FILE);
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 }
@@ -196,5 +308,133 @@ pub fn delete_api_key() -> AppResult<()> {
     match entry()?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(AppError::Keyring(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Unique per-test temp config dir (std-only; removed by each test).
+    fn temp_config_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aix-settings-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn corrupt_file_is_backed_up_and_defaults_returned() {
+        let dir = temp_config_dir("corrupt");
+        let path = dir.join(SETTINGS_FILE);
+        std::fs::write(&path, "{ not valid json !!!").unwrap();
+
+        let settings = Settings::load(&dir);
+        assert_eq!(settings.endpoint, DEFAULT_ENDPOINT);
+        assert_eq!(settings.model, DEFAULT_MODEL);
+
+        let bak = dir.join("settings.json.bak");
+        assert!(bak.exists(), "corrupt file should be renamed to .bak");
+        assert!(!path.exists(), "corrupt original should be gone");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "{ not valid json !!!"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_file_returns_defaults_without_backup() {
+        let dir = temp_config_dir("missing");
+        let settings = Settings::load(&dir);
+        assert_eq!(settings.endpoint, DEFAULT_ENDPOINT);
+        assert!(!dir.join("settings.json.bak").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_is_atomic_valid_json_and_leaves_no_tmp() {
+        let dir = temp_config_dir("save");
+        let settings = Settings::default();
+        settings.save(&dir).unwrap();
+
+        let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        let reparsed: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(reparsed.endpoint, settings.endpoint);
+        // camelCase JSON keys per the frontend schema contract.
+        assert!(text.contains("\"removedModels\""), "got: {text}");
+        assert!(text.contains("\"editorFontFamily\""), "got: {text}");
+        assert!(text.contains("\"editorFontSize\""), "got: {text}");
+        assert!(!dir.join("settings.json.tmp").exists(), ".tmp left behind");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merge_skips_tombstoned_default_models() {
+        let mut settings = Settings::default();
+        settings.models.clear();
+        settings.image_models.clear();
+        settings.removed_models = vec![
+            DEFAULT_MODEL.to_string(),
+            DEFAULT_IMAGE_MODEL.to_string(),
+        ];
+        settings.merge_default_models();
+        assert!(
+            !settings.models.iter().any(|m| m == DEFAULT_MODEL),
+            "tombstoned text model resurrected"
+        );
+        assert!(
+            !settings.image_models.iter().any(|m| m == DEFAULT_IMAGE_MODEL),
+            "tombstoned image model resurrected"
+        );
+        // Non-tombstoned defaults still merge in.
+        assert!(settings.models.iter().any(|m| m == "qwen/qwen3.6-flash"));
+    }
+
+    #[test]
+    fn language_from_locale_maps_known_codes() {
+        assert_eq!(language_from_locale("ja_JP"), Some("日本語"));
+        assert_eq!(language_from_locale("en_US.UTF-8"), Some("English"));
+        assert_eq!(language_from_locale("zh-Hans-CN"), Some("中文"));
+        assert_eq!(language_from_locale("ko_KR.UTF-8"), Some("한국어"));
+        assert_eq!(language_from_locale("FR_fr"), Some("Français"));
+    }
+
+    #[test]
+    fn language_from_locale_rejects_junk() {
+        assert_eq!(language_from_locale(""), None);
+        assert_eq!(language_from_locale("C"), None);
+        assert_eq!(language_from_locale("POSIX"), None);
+        assert_eq!(language_from_locale("xx_YY"), None);
+    }
+
+    #[test]
+    fn load_clamps_font_size_and_resets_unknown_family() {
+        let dir = temp_config_dir("fonts");
+        let mut settings = Settings::default();
+        settings.editor_font_size = 99;
+        settings.editor_font_family = "comic-sans".to_string();
+        settings.save(&dir).unwrap();
+        let loaded = Settings::load(&dir);
+        assert_eq!(loaded.editor_font_size, 28);
+        assert_eq!(loaded.editor_font_family, "serif");
+
+        settings.editor_font_size = 1;
+        settings.editor_font_family = "mono".to_string();
+        settings.save(&dir).unwrap();
+        let loaded = Settings::load(&dir);
+        assert_eq!(loaded.editor_font_size, 12);
+        assert_eq!(loaded.editor_font_family, "mono");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

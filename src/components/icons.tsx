@@ -87,6 +87,16 @@ export const SummaryIcon = (p: SVGProps<SVGSVGElement>) => (
   </svg>
 );
 
+// Three bulleted lines — rewrite a paragraph into bullet points.
+export const BulletListIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <circle cx="4.5" cy="6" r="1.2" fill="currentColor" stroke="none" />
+    <circle cx="4.5" cy="12" r="1.2" fill="currentColor" stroke="none" />
+    <circle cx="4.5" cy="18" r="1.2" fill="currentColor" stroke="none" />
+    <path d="M9 6h11M9 12h11M9 18h7" />
+  </svg>
+);
+
 export const ExpandIcon = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}>
     <path d="M12 4v16" />
@@ -263,5 +273,29 @@ export const EditIcon = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}>
     <path d="M4 20h4l10-10-4-4L4 16v4z" />
     <path d="M13.5 6.5l4 4" />
+  </svg>
+);
+
+// Scissors — split a slide at a paragraph.
+export const ScissorsIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <circle cx="6" cy="6" r="2.5" />
+    <circle cx="6" cy="18" r="2.5" />
+    <path d="M8.2 7.6L20 19M8.2 16.4L20 5" />
+  </svg>
+);
+
+// Speech bubble — per-paragraph review comments.
+export const CommentIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10z" />
+  </svg>
+);
+
+export const MergeIcon = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <path d="M8 4l4 4 4-4" />
+    <path d="M8 20l4-4 4 4" />
+    <path d="M12 8v8" />
   </svg>
 );

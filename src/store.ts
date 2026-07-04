@@ -6,6 +6,7 @@
 // paragraph — not the whole document.
 
 import { create } from "zustand";
+import { groupSlides } from "./slides";
 import type {
   AnalysisResult,
   Chunk,
@@ -13,6 +14,7 @@ import type {
   DocMode,
   Document,
   PersistedTab,
+  ReviewComment,
   Settings,
   SlideLayout,
 } from "./types";
@@ -51,6 +53,38 @@ function reindex(chunks: Chunk[]): Chunk[] {
 }
 
 /**
+ * Hash a chunk's content for summary-freshness tracking (djb2 over the UTF-16
+ * code units, kept unsigned, rendered as hex). Cheap, deterministic, and stable
+ * across save/reload — good enough to detect "the text changed since this
+ * summary was written"; not a cryptographic hash.
+ */
+export function hashContent(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; // h * 33 + c, unsigned 32-bit
+  }
+  return h.toString(16);
+}
+
+/**
+ * Ids of chunks whose `metadata.summary` no longer matches their content —
+ * i.e. the summary was written for an older version of the text (detected via
+ * `summaryHash`). A summary WITHOUT a hash is treated as fresh: legacy docs
+ * (summaries saved before hashing existed) must not trigger a surprise mass
+ * re-summarization the first time an AI action runs.
+ */
+export function staleSummaryChunkIds(doc: Document): string[] {
+  return doc.chunks
+    .filter((c) => {
+      if (!c.metadata.summary?.trim()) return false;
+      const hash = c.metadata.summaryHash;
+      if (!hash) return false; // legacy summary — treated fresh (see above)
+      return hash !== hashContent(c.content);
+    })
+    .map((c) => c.id);
+}
+
+/**
  * Rebuild the relationship graph from persisted chunk metadata (spec §5
  * `linkedChunks` + `summary`) so a saved analysis survives reopen. Returns null
  * when the document carries no relationship data. Node labels/edge relations are
@@ -58,11 +92,16 @@ function reindex(chunks: Chunk[]): Chunk[] {
  * click-to-jump targets are exact.
  */
 function rebuildAnalysis(doc: Document): AnalysisResult | null {
-  const textChunks = doc.chunks.filter((c) => c.metadata.chunkType === "text");
+  // Heading chunks participate too (parity with the Rust analyzer, which now
+  // emits heading nodes) — their labels come from the heading content.
+  const graphChunks = doc.chunks.filter(
+    (c) =>
+      c.metadata.chunkType === "text" || c.metadata.chunkType === "heading"
+  );
   // Only reconstruct when real relationships were persisted. A document that
   // merely has per-paragraph summaries (but was never analyzed) should not
   // resurrect a meaningless edge-less graph.
-  const hasRelations = textChunks.some(
+  const hasRelations = graphChunks.some(
     (c) => (c.metadata.linkedChunks?.length ?? 0) > 0
   );
   if (!hasRelations) return null;
@@ -70,7 +109,7 @@ function rebuildAnalysis(doc: Document): AnalysisResult | null {
   const ids = new Set(doc.chunks.map((c) => c.id));
   const firstWords = (s: string) =>
     s.trim().split(/\s+/).slice(0, 6).join(" ");
-  const nodes: AnalysisResult["nodes"] = textChunks.map((c) => {
+  const nodes: AnalysisResult["nodes"] = graphChunks.map((c) => {
     const summary = c.metadata.summary ?? "";
     return {
       id: c.id,
@@ -80,7 +119,7 @@ function rebuildAnalysis(doc: Document): AnalysisResult | null {
     };
   });
   const edges: AnalysisResult["edges"] = [];
-  for (const c of textChunks) {
+  for (const c of graphChunks) {
     for (const target of c.metadata.linkedChunks ?? []) {
       if (ids.has(target)) edges.push({ source: c.id, target, relation: "" });
     }
@@ -94,7 +133,7 @@ function rebuildAnalysis(doc: Document): AnalysisResult | null {
  * deleted paragraphs after a structural edit. Sentence nodes survive iff their
  * owning paragraph does.
  */
-function pruneAnalysis(
+export function pruneAnalysis(
   a: AnalysisResult | null | undefined,
   validIds: Set<string>
 ): AnalysisResult | null {
@@ -106,7 +145,47 @@ function pruneAnalysis(
   const edges = a.edges.filter(
     (e) => nodeIds.has(e.source) && nodeIds.has(e.target)
   );
-  return { nodes, edges };
+  // Spread keeps non-structural fields (e.g. analyzedAt) intact through a prune.
+  return { ...a, nodes, edges };
+}
+
+/**
+ * Whether `ids` names ≥2 existing TEXT chunks that are strictly adjacent in
+ * document order — the precondition for `mergeChunks` (and the SelectionBar's
+ * Merge button enablement).
+ */
+export function canMergeChunks(doc: Document, ids: string[]): boolean {
+  const idSet = new Set(ids);
+  if (idSet.size < 2) return false;
+  const indices: number[] = [];
+  for (const id of idSet) {
+    const idx = doc.chunks.findIndex((c) => c.id === id);
+    if (idx < 0 || doc.chunks[idx].metadata.chunkType !== "text") return false;
+    indices.push(idx);
+  }
+  indices.sort((a, b) => a - b);
+  return indices.every((v, i) => i === 0 || v === indices[i - 1] + 1);
+}
+
+// CJK ranges for the merge separator: kana, Han (+ext A / compat), hangul,
+// CJK punctuation and full-width forms — scripts that join without a space.
+const CJK_RE =
+  /[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\uff00-\uffef]/;
+
+/**
+ * Separator for one merge boundary: nothing when either side is empty, when a
+ * space would double up (either side already has boundary whitespace), or when
+ * the joint is CJK↔CJK; a single space when the previous piece ends in ASCII
+ * word/punctuation (Latin prose).
+ */
+function mergeSeparator(prev: string, next: string): string {
+  if (!prev || !next) return "";
+  const a = prev[prev.length - 1];
+  const b = next[0];
+  if (/\s/.test(a) || /\s/.test(b)) return ""; // never introduce double spaces
+  if (CJK_RE.test(a) && CJK_RE.test(b)) return ""; // CJK joins tight
+  if (/[\x21-\x7e]/.test(a)) return " "; // Latin prose boundary
+  return "";
 }
 
 /**
@@ -190,8 +269,11 @@ function applySnapshot(snap: TabSnapshot) {
     streamingText: snap.streamingText,
     busyChunks: snap.busyChunks,
     flashChunkId: null,
+    flashChunkIds: [],
     selectedChunkIds: [],
     lastAiEditChunkId: null,
+    // The queue indexes the OUTGOING document — meaningless for the incoming tab.
+    speechQueue: [],
   };
 }
 
@@ -213,6 +295,7 @@ interface AppState {
 
   focusedChunkId: string | null;
   flashChunkId: string | null; // transient highlight target (network-graph jump)
+  flashChunkIds: string[]; // transient multi-highlight (e.g. both endpoints of a graph edge)
   selectedChunkIds: string[]; // multi-select (e.g. for image generation)
   busyChunks: Record<string, boolean>;
   globalBusy: string | null; // label of an in-flight global operation
@@ -224,15 +307,30 @@ interface AppState {
   // utterance id so a stale `speech-done` event can't clear a newer playback.
   speakingChunkId: string | null;
   speakingUtterance: number | null;
+  // Multi-chunk read-aloud (item 14): chunk ids still to be spoken AFTER the
+  // current utterance. Transient and NOT part of TabSnapshot — reading is only
+  // meaningful for the visible document, so it is cleared on tab
+  // switch/close/load alongside the other transient per-view state.
+  speechQueue: string[];
 
   analysis: AnalysisResult | null;
   // True when the persisted graph no longer matches the edited document (A3) —
   // drives the NetworkPanel "out of date" badge.
   analysisStale: boolean;
   networkOpen: boolean;
+  // Review comments panel (right dock, like networkOpen — not per-tab). The
+  // target chunk is the one the panel's "add comment" composer points at (set
+  // when the panel is opened from a chunk's gutter comment button).
+  reviewPanelOpen: boolean;
+  reviewTargetChunkId: string | null;
   settingsOpen: boolean;
   draftOpen: boolean;
   helpOpen: boolean;
+  // Command palette (提案1 — ⌘K).
+  paletteOpen: boolean;
+  // The most recent export's warning report (提案2): exports used to surface
+  // warnings only as a 3.5s toast; the health bar keeps them reviewable.
+  lastExportReport: { format: string; warnings: string[]; at: number } | null;
 
   toasts: Toast[];
 
@@ -274,18 +372,24 @@ interface AppActions {
   splitChunk: (id: string, caret: number) => string | null;
   deleteChunk: (id: string) => void;
   mergeWithPrevious: (id: string) => string | null;
+  // Merge ≥2 adjacent text chunks into the first (item 3/4). Returns the merged
+  // chunk's id, or null when the selection fails `canMergeChunks`.
+  mergeChunks: (ids: string[]) => string | null;
   moveChunk: (id: string, dir: -1 | 1) => void;
   // Slide-level structural ops (slide editor).
   setChunkOrder: (orderedIds: string[]) => void;
   deleteChunks: (ids: string[]) => void;
   duplicateChunksAfter: (ids: string[]) => string[];
-  setChunkLayout: (id: string, layout: SlideLayout) => void;
+  setChunkLayout: (id: string, layout: SlideLayout | null) => void;
   setChunkSubtitle: (id: string, subtitle: boolean) => void;
   setSlideBody: (leadId: string, body: string[] | null) => void;
   replaceChunksWithTexts: (ids: string[], texts: string[]) => void;
+  splitSlideBefore: (chunkId: string) => string | null;
+  mergeSlideIntoPrevious: (headingChunkId: string) => string | null;
 
   setFocused: (id: string | null) => void;
   flashChunk: (id: string) => void;
+  flashChunks: (ids: string[]) => void;
   toggleSelectChunk: (id: string) => void;
   clearSelection: () => void;
   // In-flight op setters take an optional `tabId` so a background operation
@@ -298,6 +402,11 @@ interface AppActions {
   // Read-aloud lifecycle (UI3).
   beginSpeaking: (chunkId: string, utterance: number) => void;
   endSpeaking: (utterance?: number) => void;
+  // Multi-chunk read-aloud queue (item 14). `shiftSpeechQueue` pops the head
+  // (null when empty) — the api call itself lives in aiActions so these pure
+  // mechanics stay testable.
+  setSpeechQueue: (ids: string[]) => void;
+  shiftSpeechQueue: () => string | null;
 
   setSettings: (settings: Settings) => void;
   setHasApiKey: (has: boolean) => void;
@@ -307,9 +416,26 @@ interface AppActions {
   closeDraft: () => void;
   openHelp: () => void;
   closeHelp: () => void;
+  togglePalette: (open?: boolean) => void;
+  setLastExportReport: (format: string, warnings: string[]) => void;
 
   applyAnalysis: (result: AnalysisResult) => void;
   toggleNetwork: (open?: boolean) => void;
+  toggleReviewPanel: (open?: boolean) => void;
+  setReviewTarget: (id: string | null) => void;
+
+  // Review comments (per-chunk, persisted in metadata.comments). All undoable;
+  // comments never invalidate the relationship graph (marksStale:false).
+  addComment: (
+    chunkId: string,
+    text: string,
+    author?: "user" | "ai",
+    kind?: string
+  ) => string | null;
+  updateComment: (chunkId: string, commentId: string, text: string) => void;
+  deleteComment: (chunkId: string, commentId: string) => void;
+  toggleCommentResolved: (chunkId: string, commentId: string) => void;
+  clearAiComments: (kind?: string) => void;
 
   notify: (message: string, kind?: ToastKind) => void;
   dismissToast: (id: number) => void;
@@ -392,6 +518,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     hasApiKey: false,
     focusedChunkId: null,
     flashChunkId: null,
+    flashChunkIds: [],
     selectedChunkIds: [],
     busyChunks: {},
     globalBusy: null,
@@ -399,12 +526,17 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     streamingText: "",
     speakingChunkId: null,
     speakingUtterance: null,
+    speechQueue: [],
     analysis: null,
     analysisStale: false,
     networkOpen: false,
+    reviewPanelOpen: false,
+    reviewTargetChunkId: null,
     settingsOpen: false,
     draftOpen: false,
     helpOpen: false,
+    paletteOpen: false,
+    lastExportReport: null,
     toasts: [],
     past: [],
     future: [],
@@ -456,6 +588,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           lastEditChunkId: null,
           lastAiEditChunkId: null,
           flashChunkId: null,
+          flashChunkIds: [],
+          speechQueue: [],
           selectedChunkIds: [],
           // A fresh tab starts with no in-flight operations (B3).
           globalBusy: null,
@@ -542,6 +676,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           lastEditChunkId: null,
           lastAiEditChunkId: null,
           flashChunkId: null,
+          flashChunkIds: [],
+          speechQueue: [],
           selectedChunkIds: [],
           globalBusy: null,
           streamingChunkId: null,
@@ -556,12 +692,18 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     // Switch the current document between "editor" (prose) and "slide" (deck)
     // views. Both render the SAME chunk model — a slide is just the chunks under
     // a heading — so this only flips how they're presented; no content migration.
-    setMode: (mode) =>
-      set((s) =>
-        (s.doc.mode ?? "editor") === mode
-          ? {}
-          : { doc: { ...s.doc, mode }, dirty: true }
-      ),
+    setMode: (mode) => {
+      const prevMode = get().doc.mode ?? "editor";
+      if (prevMode === mode) return;
+      set((s) => ({ doc: { ...s.doc, mode }, dirty: true }));
+      // Slide→Editor didn't preserve your place (SlideEditor already derives
+      // the selected slide from focusedChunkId on the way in, so Editor→Slide
+      // was fine). flashChunk scrolls to and briefly highlights it, closing
+      // the gap the same way graph/review navigation already does.
+      if (prevMode === "slide" && mode === "editor" && get().focusedChunkId) {
+        get().flashChunk(get().focusedChunkId as string);
+      }
+    },
 
     // Live typing: coalesce into one undo step per continuous edit session on a
     // chunk. Replaces only the edited chunk object (others keep identity).
@@ -659,12 +801,22 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       // redo-safe like its metadata peers (B8) — the previous hand-rolled set()
       // cleared `future` but never pushed to `past`, so the edit was lost on
       // undo. A summary is metadata enrichment, so it doesn't invalidate the
-      // relationship graph (A3 → marksStale:false).
+      // relationship graph (A3 → marksStale:false). The content hash is stamped
+      // alongside so a later edit marks this summary stale (staleSummaryChunkIds).
       commit(
         (doc) =>
           mapChunks(doc, (chunks) =>
             chunks.map((c) =>
-              c.id === id ? { ...c, metadata: { ...c.metadata, summary } } : c
+              c.id === id
+                ? {
+                    ...c,
+                    metadata: {
+                      ...c.metadata,
+                      summary,
+                      summaryHash: hashContent(c.content),
+                    },
+                  }
+                : c
             )
           ),
         { marksStale: false }
@@ -864,6 +1016,58 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       return caretTarget;
     },
 
+    // Merge ≥2 adjacent text chunks into the first of them (item 3/4 —
+    // multi-paragraph / partial merge via the selection). Contents join with
+    // `mergeSeparator` per boundary; comments of all members are concatenated
+    // onto the survivor; its summary/summaryHash are cleared (the text changed);
+    // contentHistory stays the survivor's own. Undoable; prunes the graph of
+    // the removed ids.
+    mergeChunks: (ids) => {
+      const doc0 = get().doc;
+      if (!canMergeChunks(doc0, ids)) return null;
+      const idSet = new Set(ids);
+      const members = doc0.chunks.filter((c) => idSet.has(c.id)); // document order
+      const first = members[0];
+      let mergedContent = first.content;
+      for (const m of members.slice(1)) {
+        mergedContent += mergeSeparator(mergedContent, m.content) + m.content;
+      }
+      const mergedComments = members.flatMap((m) => m.metadata.comments ?? []);
+      const removed = new Set(members.slice(1).map((m) => m.id));
+      const validIds = new Set(
+        doc0.chunks.filter((c) => !removed.has(c.id)).map((c) => c.id)
+      );
+      commit((doc) => ({
+        ...mapChunks(doc, (cs) =>
+          reindex(
+            cs
+              .filter((c) => !removed.has(c.id))
+              .map((c) =>
+                c.id === first.id
+                  ? {
+                      ...c,
+                      content: mergedContent,
+                      metadata: {
+                        ...c.metadata,
+                        summary: undefined,
+                        summaryHash: undefined,
+                        comments: mergedComments.length ? mergedComments : undefined,
+                      },
+                    }
+                  : c
+              )
+          )
+        ),
+        analysis: pruneAnalysis(doc.analysis, validIds) ?? undefined,
+      }));
+      set({
+        focusedChunkId: first.id,
+        selectedChunkIds: [],
+        analysis: pruneAnalysis(get().analysis, validIds),
+      });
+      return first.id;
+    },
+
     // ----- slide-level structural ops (used by the slide editor) -----
     // Reorder the whole chunk list to match `orderedIds` (chunks not listed are
     // appended in their existing order, as a safety net). Undoable.
@@ -977,16 +1181,83 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       return orderedCloneIds;
     },
 
-    // Set an explicit slide-layout override on a slide's lead chunk. Layout is a
-    // slide-presentation attribute, unrelated to the relationship graph (A3).
+    // Split a slide at a body chunk: insert a new heading chunk immediately
+    // BEFORE it, so everything from that chunk down becomes a new slide
+    // (headings delimit slides — see groupSlides). Undoable; returns the new
+    // heading's id (null if the chunk doesn't exist).
+    splitSlideBefore: (chunkId) => {
+      if (!get().doc.chunks.some((c) => c.id === chunkId)) return null;
+      const heading: Chunk = { ...emptyChunk(0, "heading"), content: "New slide" };
+      heading.metadata = { ...heading.metadata, level: 1 };
+      commit((doc) =>
+        mapChunks(doc, (cs) => {
+          const idx = cs.findIndex((c) => c.id === chunkId);
+          if (idx < 0) return cs;
+          const next = [...cs];
+          next.splice(idx, 0, heading);
+          return reindex(next);
+        })
+      );
+      set({ focusedChunkId: heading.id });
+      return heading.id;
+    },
+
+    // Merge a slide into the previous one by DEMOTING its heading to a text
+    // chunk (content preserved, level removed) — with the delimiter gone, the
+    // slide's chunks fuse into the slide before it. Undoable; a toast-less null
+    // no-op when the chunk isn't a heading. The demoted chunk's layout override
+    // is dropped too: the merged slide keeps the PREVIOUS slide's layout, and a
+    // stale mid-slide override would shadow an Auto host (resolveLayout reads
+    // the first override found).
+    mergeSlideIntoPrevious: (headingChunkId) => {
+      const chunk = get().doc.chunks.find((c) => c.id === headingChunkId);
+      if (!chunk || chunk.metadata.chunkType !== "heading") return null;
+      commit((doc) =>
+        mapChunks(doc, (chunks) =>
+          chunks.map((c) =>
+            c.id === headingChunkId
+              ? {
+                  ...c,
+                  metadata: {
+                    ...c.metadata,
+                    chunkType: "text",
+                    level: undefined,
+                    layout: undefined,
+                  },
+                }
+              : c
+          )
+        )
+      );
+      return headingChunkId;
+    },
+
+    // Set an explicit slide-layout override on a slide's HOST chunk (heading,
+    // else first chunk), or clear it (pass null) to go back to auto-picking from
+    // the slide's content — without this there was no way back to "Auto" once a
+    // layout had been chosen once. The override must be UNIQUE per slide:
+    // `resolveLayout` reads the first override found on ANY of the slide's
+    // chunks, so a stale `metadata.layout` on a later chunk (e.g. a former host
+    // demoted mid-slide) would keep winning and make "Auto"/a new pick look
+    // dead — every other chunk of the slide is therefore cleared too (null
+    // clears all of them). Layout is a slide-presentation attribute, unrelated
+    // to the relationship graph (A3).
     setChunkLayout: (id, layout) =>
       commit(
         (doc) =>
-          mapChunks(doc, (chunks) =>
-            chunks.map((c) =>
-              c.id === id ? { ...c, metadata: { ...c.metadata, layout } } : c
-            )
-          ),
+          mapChunks(doc, (chunks) => {
+            const slide = groupSlides(chunks).find((s) =>
+              s.items.some((c) => c.id === id)
+            );
+            const slideIds = new Set((slide?.items ?? []).map((c) => c.id));
+            if (slideIds.size === 0) slideIds.add(id);
+            return chunks.map((c) => {
+              if (!slideIds.has(c.id)) return c;
+              const next = c.id === id ? layout ?? undefined : undefined;
+              if (c.metadata.layout === next) return c; // keep identity (§4.1)
+              return { ...c, metadata: { ...c.metadata, layout: next } };
+            });
+          }),
         { marksStale: false }
       ),
 
@@ -1078,6 +1349,23 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         if (get().flashChunkId === id) set({ flashChunkId: null });
       }, 1600);
     },
+    flashChunks: (ids) => {
+      // Multi-target variant of flashChunk (e.g. both endpoints of a graph
+      // edge). Same dead-id guard, one shared 1600ms clear.
+      const valid = new Set(get().doc.chunks.map((c) => c.id));
+      const hits = [...new Set(ids)].filter((id) => valid.has(id));
+      if (hits.length === 0) {
+        get().notify(
+          "Those paragraphs no longer exist — re-analyze to refresh the graph.",
+          "info"
+        );
+        return;
+      }
+      set({ flashChunkIds: hits, focusedChunkId: hits[0] });
+      setTimeout(() => {
+        if (get().flashChunkIds === hits) set({ flashChunkIds: [] });
+      }, 1600);
+    },
     toggleSelectChunk: (id) =>
       set((s) => ({
         selectedChunkIds: s.selectedChunkIds.includes(id)
@@ -1116,6 +1404,17 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         if (utterance !== undefined && s.speakingUtterance !== utterance) return {};
         return { speakingChunkId: null, speakingUtterance: null };
       }),
+    // Multi-chunk read-aloud queue (item 14). Pure list mechanics — the actual
+    // speak_text call lives in aiActions (advanceSpeechQueue), keeping these
+    // testable without Tauri.
+    setSpeechQueue: (ids) => set({ speechQueue: ids }),
+    shiftSpeechQueue: () => {
+      const q = get().speechQueue;
+      if (q.length === 0) return null;
+      const [head, ...rest] = q;
+      set({ speechQueue: rest });
+      return head;
+    },
 
     setSettings: (settings) => set({ settings }),
     setHasApiKey: (has) => set({ hasApiKey: has }),
@@ -1125,9 +1424,16 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     closeDraft: () => set({ draftOpen: false }),
     openHelp: () => set({ helpOpen: true }),
     closeHelp: () => set({ helpOpen: false }),
+    togglePalette: (open) =>
+      set((s) => ({ paletteOpen: open ?? !s.paletteOpen })),
+    setLastExportReport: (format, warnings) =>
+      set({ lastExportReport: { format, warnings, at: Date.now() } }),
 
     applyAnalysis: (result) =>
       set((state) => {
+        // Stamp when this graph was computed — drives the freshness UI
+        // ("analyzed 5 min ago" in ChunkAiMenu / NetworkPanel).
+        const stamped: AnalysisResult = { ...result, analyzedAt: Date.now() };
         // Persist the graph into the document model: each edge becomes a
         // `linkedChunks` entry on its source chunk, and node summaries fill in
         // `metadata.summary`. This honours spec §5 and lets the graph survive a
@@ -1156,23 +1462,33 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           const linksChanged =
             nextLinks.length !== prevLinks.length ||
             nextLinks.some((t, i) => t !== prevLinks[i]);
-          const nextSummary = summaryById[c.id] ?? c.metadata.summary;
+          const fromAnalysis = summaryById[c.id];
+          const nextSummary = fromAnalysis ?? c.metadata.summary;
           const summaryChanged = nextSummary !== c.metadata.summary;
-          if (!linksChanged && !summaryChanged) return c;
+          // The analysis just summarized the chunk's CURRENT content, so
+          // re-stamp the freshness hash even when the summary text happens to
+          // be identical to the previous one.
+          const nextHash =
+            fromAnalysis !== undefined
+              ? hashContent(c.content)
+              : c.metadata.summaryHash;
+          const hashChanged = nextHash !== c.metadata.summaryHash;
+          if (!linksChanged && !summaryChanged && !hashChanged) return c;
           return {
             ...c,
             metadata: {
               ...c.metadata,
               linkedChunks: linksChanged ? nextLinks : prevLinks,
               summary: nextSummary,
+              summaryHash: nextHash,
             },
           };
         });
         return {
           // Persist the full graph on the document so it survives save/reopen
           // (single source of truth; also keep linkedChunks for the §5 model).
-          doc: { ...state.doc, chunks, analysis: result },
-          analysis: result,
+          doc: { ...state.doc, chunks, analysis: stamped },
+          analysis: stamped,
           // Snapshot so Analyze is a discrete, undoable step (B4)…
           past: [...state.past, state.doc].slice(-MAX_HISTORY),
           dirty: true,
@@ -1184,6 +1500,138 @@ export const useStore = create<AppState & AppActions>((set, get) => {
 
     toggleNetwork: (open) =>
       set((s) => ({ networkOpen: open ?? !s.networkOpen })),
+
+    toggleReviewPanel: (open) =>
+      set((s) => {
+        const next = open ?? !s.reviewPanelOpen;
+        // Closing the panel drops the composer target so a stale "comment on
+        // paragraph X" composer can't greet the next open.
+        return next
+          ? { reviewPanelOpen: true }
+          : { reviewPanelOpen: false, reviewTargetChunkId: null };
+      }),
+
+    setReviewTarget: (id) => set({ reviewTargetChunkId: id }),
+
+    // ----- review comments (persisted in chunk metadata; spec mismatch §2) -----
+    addComment: (chunkId, text, author = "user", kind) => {
+      if (!get().doc.chunks.some((c) => c.id === chunkId)) return null;
+      const comment: ReviewComment = {
+        id: localId(),
+        text,
+        createdAt: Date.now(),
+        author,
+        kind,
+      };
+      commit(
+        (doc) =>
+          mapChunks(doc, (chunks) =>
+            chunks.map((c) =>
+              c.id === chunkId
+                ? {
+                    ...c,
+                    metadata: {
+                      ...c.metadata,
+                      comments: [...(c.metadata.comments ?? []), comment],
+                    },
+                  }
+                : c
+            )
+          ),
+        { marksStale: false }
+      );
+      return comment.id;
+    },
+
+    updateComment: (chunkId, commentId, text) =>
+      commit(
+        (doc) =>
+          mapChunks(doc, (chunks) =>
+            chunks.map((c) =>
+              c.id === chunkId
+                ? {
+                    ...c,
+                    metadata: {
+                      ...c.metadata,
+                      comments: (c.metadata.comments ?? []).map((cm) =>
+                        cm.id === commentId ? { ...cm, text } : cm
+                      ),
+                    },
+                  }
+                : c
+            )
+          ),
+        { marksStale: false }
+      ),
+
+    deleteComment: (chunkId, commentId) =>
+      commit(
+        (doc) =>
+          mapChunks(doc, (chunks) =>
+            chunks.map((c) =>
+              c.id === chunkId
+                ? {
+                    ...c,
+                    metadata: {
+                      ...c.metadata,
+                      comments: (c.metadata.comments ?? []).filter(
+                        (cm) => cm.id !== commentId
+                      ),
+                    },
+                  }
+                : c
+            )
+          ),
+        { marksStale: false }
+      ),
+
+    toggleCommentResolved: (chunkId, commentId) =>
+      commit(
+        (doc) =>
+          mapChunks(doc, (chunks) =>
+            chunks.map((c) =>
+              c.id === chunkId
+                ? {
+                    ...c,
+                    metadata: {
+                      ...c.metadata,
+                      comments: (c.metadata.comments ?? []).map((cm) =>
+                        cm.id === commentId
+                          ? { ...cm, resolved: !cm.resolved }
+                          : cm
+                      ),
+                    },
+                  }
+                : c
+            )
+          ),
+        { marksStale: false }
+      ),
+
+    // Remove AI-authored comments (optionally only one kind) before an AI pass
+    // regenerates them. User comments are never touched; a doc with nothing to
+    // clear is a no-op (no undo step burned). Untouched chunks keep identity.
+    clearAiComments: (kind) => {
+      const matches = (cm: ReviewComment) =>
+        cm.author === "ai" && (kind === undefined || cm.kind === kind);
+      const hasAny = get().doc.chunks.some((c) =>
+        (c.metadata.comments ?? []).some(matches)
+      );
+      if (!hasAny) return;
+      commit(
+        (doc) =>
+          mapChunks(doc, (chunks) =>
+            chunks.map((c) => {
+              const comments = c.metadata.comments;
+              if (!comments?.length) return c;
+              const kept = comments.filter((cm) => !matches(cm));
+              if (kept.length === comments.length) return c; // keep identity (§4.1)
+              return { ...c, metadata: { ...c.metadata, comments: kept } };
+            })
+          ),
+        { marksStale: false }
+      );
+    },
 
     notify: (message, kind = "info") =>
       set((s) => {

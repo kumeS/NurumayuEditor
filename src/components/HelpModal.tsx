@@ -67,7 +67,7 @@ const STEP_ICONS = [
 // match the app interface, which is English-only.
 const HELP_I18N: Record<HelpLang, HelpContent> = {
   English: {
-    heading: "How to write with aixTextEditor",
+    heading: "How to write with NurumayuFacet",
     apiTitle: "Before you start — set an API key",
     apiIntro:
       "AI features use any OpenAI-compatible endpoint; the default is OpenRouter, which offers free models.",
@@ -109,7 +109,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
   },
 
   日本語: {
-    heading: "aixTextEditor で書くには",
+    heading: "NurumayuFacet で書くには",
     apiTitle: "始める前に — API キーを設定する",
     apiIntro:
       "AI 機能は OpenAI-compatible なエンドポイントであればどれでも利用できます。既定では、無料モデルを提供する OpenRouter を使用します。",
@@ -152,7 +152,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
   },
 
   中文: {
-    heading: "如何使用 aixTextEditor 写作",
+    heading: "如何使用 NurumayuFacet 写作",
     apiTitle: "开始之前 — 设置 API 密钥",
     apiIntro:
       "AI 功能可使用任何 OpenAI-compatible 端点；默认使用 OpenRouter，它提供免费模型。",
@@ -193,7 +193,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
   },
 
   Español: {
-    heading: "Cómo escribir con aixTextEditor",
+    heading: "Cómo escribir con NurumayuFacet",
     apiTitle: "Antes de empezar — configura una clave de API",
     apiIntro:
       "Las funciones de IA usan cualquier endpoint compatible con OpenAI; el predeterminado es OpenRouter, que ofrece modelos gratuitos.",
@@ -236,7 +236,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
   },
 
   Français: {
-    heading: "Comment écrire avec aixTextEditor",
+    heading: "Comment écrire avec NurumayuFacet",
     apiTitle: "Avant de commencer — définissez une clé API",
     apiIntro:
       "Les fonctions d'IA utilisent n'importe quel point de terminaison OpenAI-compatible ; par défaut, il s'agit d'OpenRouter, qui propose des modèles gratuits.",

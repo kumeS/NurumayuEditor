@@ -1,36 +1,36 @@
-# ── Dependencies ─────────────────────────────────────────────
-node_modules/
+# Claude Harness Kit — repository .gitignore (public)
+#
+# This kit repo contains only documentation, rules, skills, and CI/PR
+# templates — so this file mostly keeps OS/editor junk and local-only state
+# out of the published history. Note: `.claude/` (rules & skills) IS part of
+# the kit and must stay tracked — no pattern here may match it.
 
-# ── Build output (large; regenerated) ────────────────────────
-dist/
-dist-ssr/
-src-tauri/target/
-
-# ── Secrets / local env — NEVER commit these ─────────────────
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-*.p12
-*.mobileprovision
-
-# ── Logs ─────────────────────────────────────────────────────
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-# ── OS / editor cruft ────────────────────────────────────────
+# ── OS junk ──────────────────────────────────────────────
 .DS_Store
-*.local
+._*
+Thumbs.db
+Desktop.ini
+
+# ── Editors / IDEs ───────────────────────────────────────
 .vscode/
 .idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+*.swp
+*.swo
+*~
+
+# ── Stray tool artifacts ─────────────────────────────────
+.Rhistory
+*.log
+
+# ── Claude Code local state (machine-local, never publish) ──
+.claude/settings.local.json
+.claude
+.gitignore
+
+# ── Build/dependency dirs (if examples or tooling are ever added) ──
+node_modules/
+target/
+dist/
+
+# ── Packaging artifacts ──────────────────────────────────
+*.zip

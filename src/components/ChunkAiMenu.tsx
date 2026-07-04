@@ -4,14 +4,16 @@
 import { useEffect, useRef, useState } from "react";
 import {
   runChunkAction,
+  bulletizeChunks,
   generateDiagramFromChunk,
   generatePresentationFromChunk,
 } from "../aiActions";
-import { useStore } from "../store";
+import { staleSummaryChunkIds, useStore } from "../store";
 import type { ChunkType } from "../types";
 import { promptDialog } from "./PromptModal";
 import Tooltip from "./Tooltip";
 import {
+  BulletListIcon,
   ConcentrateIcon,
   DetailIcon,
   ExpandIcon,
@@ -35,6 +37,16 @@ const PROOFREAD_STYLES = [
   { label: "Persuasive", value: "persuasive and compelling" },
 ];
 
+/** Compact relative time for the freshness footer ("analyzed 5 min ago"). */
+function relTime(ts: number): string {
+  const mins = Math.round((Date.now() - ts) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.round(hours / 24)} d ago`;
+}
+
 interface Props {
   chunkId: string;
   chunkType: ChunkType;
@@ -45,6 +57,19 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const defaultLang = useStore((s) => s.settings?.defaultTargetLanguage ?? "English");
+  // Bulletize replaces this chunk (a structural edit), so it runs under the
+  // document-wide busy flag rather than this chunk's own — block it whenever
+  // ANY AI op is in flight rather than risk two structural edits racing.
+  const globalBusy = useStore((s) => s.globalBusy);
+  // Freshness footer: when the graph was computed + whether it's out of date.
+  const analyzedAt = useStore((s) => s.doc.analysis?.analyzedAt);
+  const analysisStale = useStore((s) => s.analysisStale);
+  // Computed only while the popover is open (it hashes every summarized
+  // chunk); excludes this chunk to mirror what runChunkAction will refresh.
+  const staleCount = open
+    ? staleSummaryChunkIds(useStore.getState().doc).filter((id) => id !== chunkId)
+        .length
+    : 0;
   const isText = chunkType === "text";
   const isHeading = chunkType === "heading";
 
@@ -92,6 +117,11 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   const onSummarize = async () => {
     close();
     await runChunkAction(chunkId, "summarize");
+  };
+
+  const onBulletize = async () => {
+    close();
+    await bulletizeChunks([chunkId]);
   };
 
   const onExpand = async () => {
@@ -151,7 +181,32 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   };
 
   const item =
-    "flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-accent/10 hover:text-accent";
+    "flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-accent/10 hover:text-accent disabled:opacity-40 disabled:hover:bg-transparent";
+  // 提案4: the same boxed-cluster pattern as the SlideEditor design group — a
+  // bordered rounded box with a tiny uppercase label per action family.
+  const group = "rounded-md border border-gray-200 bg-gray-50/60 p-1";
+  const groupLabel =
+    "px-2 pb-0.5 pt-1 text-[10px] font-semibold uppercase tracking-wider text-ink-faint";
+
+  // Freshness/status footer (live-context visibility): when the document was
+  // last analyzed + how many context summaries the next run will refresh.
+  const footer = (isText || isHeading) &&
+    (analyzedAt !== undefined || staleCount > 0) && (
+      <div className="space-y-0.5 border-t border-gray-100 px-2.5 pb-1 pt-1.5 text-xs">
+        {analyzedAt !== undefined && (
+          <div className={analysisStale ? "text-amber-600" : "text-ink-faint"}>
+            analyzed {relTime(analyzedAt)}
+            {analysisStale ? " · graph out of date" : ""}
+          </div>
+        )}
+        {staleCount > 0 && (
+          <div className="text-ink-faint">
+            {staleCount} context {staleCount === 1 ? "summary" : "summaries"} will
+            refresh on run
+          </div>
+        )}
+      </div>
+    );
 
   return (
     <div ref={rootRef} className="relative">
@@ -168,62 +223,90 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
       </Tooltip>
 
       {open && (
-        <div className="absolute left-0 top-8 z-30 w-52 rounded-lg border border-gray-200 bg-white p-1 shadow-lg">
+        <div className="absolute left-0 top-8 z-30 w-56 rounded-lg border border-gray-200 bg-white p-1 shadow-lg">
           {isText && (
-            <>
-              <button className={item} onClick={onTranslate}>
-                <LanguagesIcon /> Translate…
-              </button>
-              <button className={item} onClick={onProofread}>
-                <WandIcon /> Proofread…
-              </button>
-              <button className={item} onClick={onHarmonize}>
-                <ConcentrateIcon /> Revise with context
-              </button>
-              <button className={item} onClick={onExpand}>
-                <ExpandIcon /> Expand
-              </button>
-              <button className={item} onClick={onDetail}>
-                <DetailIcon /> Add detail
-              </button>
-              <button className={item} onClick={onConcentrate}>
-                <ConcentrateIcon /> Concentrate
-              </button>
-              <button className={item} onClick={onFocus}>
-                <FocusIcon /> Focus
-              </button>
-              <button className={item} onClick={onSummarize}>
-                <SummaryIcon /> Summarize
-              </button>
-              <div className="my-1 border-t border-gray-100" />
-              <button className={item} onClick={onDiagram}>
-                <FlowIcon /> Generate diagram…
-              </button>
-              <button className={item} onClick={onPresentation}>
-                <ImageIcon /> Presentation figure
-              </button>
-              <div className="my-1 border-t border-gray-100" />
-              <button className={item} onClick={onCustom}>
-                <SparklesIcon /> Custom instruction…
-              </button>
-            </>
+            <div className="space-y-1">
+              <div className={group}>
+                <div className={groupLabel}>Rewrite</div>
+                <button className={item} onClick={onExpand}>
+                  <ExpandIcon /> Expand
+                </button>
+                <button className={item} onClick={onDetail}>
+                  <DetailIcon /> Add detail
+                </button>
+                <button className={item} onClick={onConcentrate}>
+                  <ConcentrateIcon /> Concentrate
+                </button>
+                <button className={item} onClick={onFocus}>
+                  <FocusIcon /> Focus
+                </button>
+                <button className={item} onClick={onHarmonize}>
+                  <ConcentrateIcon /> Revise with context
+                </button>
+              </div>
+              <div className={group}>
+                <div className={groupLabel}>Language</div>
+                <button className={item} onClick={onTranslate}>
+                  <LanguagesIcon /> Translate…
+                </button>
+                <button className={item} onClick={onProofread}>
+                  <WandIcon /> Proofread…
+                </button>
+              </div>
+              <div className={group}>
+                <div className={groupLabel}>Summarize</div>
+                <button className={item} onClick={onSummarize}>
+                  <SummaryIcon /> Summarize
+                </button>
+                <Tooltip label="Rewrites this paragraph in place as bullet points — replaces its text (⌘/Ctrl+Z to undo).">
+                  <button className={item} onClick={onBulletize} disabled={!!globalBusy}>
+                    <BulletListIcon /> Bulletize
+                  </button>
+                </Tooltip>
+              </div>
+              <div className={group}>
+                <div className={groupLabel}>Generate</div>
+                <button className={item} onClick={onDiagram}>
+                  <FlowIcon /> Generate diagram…
+                </button>
+                <button className={item} onClick={onPresentation}>
+                  <ImageIcon /> Presentation figure
+                </button>
+              </div>
+              <div className={group}>
+                <div className={groupLabel}>Custom</div>
+                <button className={item} onClick={onCustom}>
+                  <SparklesIcon /> Custom instruction…
+                </button>
+              </div>
+              {footer}
+            </div>
           )}
           {isHeading && (
-            <>
-              <button className={item} onClick={onTranslate}>
-                <LanguagesIcon /> Translate…
-              </button>
-              <button className={item} onClick={onProofread}>
-                <WandIcon /> Proofread / rewrite…
-              </button>
-              <button className={item} onClick={onPresentation}>
-                <ImageIcon /> Presentation figure
-              </button>
-              <div className="my-1 border-t border-gray-100" />
-              <button className={item} onClick={onCustom}>
-                <SparklesIcon /> Custom instruction…
-              </button>
-            </>
+            <div className="space-y-1">
+              <div className={group}>
+                <div className={groupLabel}>Language</div>
+                <button className={item} onClick={onTranslate}>
+                  <LanguagesIcon /> Translate…
+                </button>
+                <button className={item} onClick={onProofread}>
+                  <WandIcon /> Proofread / rewrite…
+                </button>
+              </div>
+              <div className={group}>
+                <div className={groupLabel}>Generate</div>
+                <button className={item} onClick={onPresentation}>
+                  <ImageIcon /> Presentation figure
+                </button>
+              </div>
+              <div className={group}>
+                <div className={groupLabel}>Custom</div>
+                <button className={item} onClick={onCustom}>
+                  <SparklesIcon /> Custom instruction…
+                </button>
+              </div>
+              {footer}
+            </div>
           )}
           {!isText && !isHeading && (
             <div className="px-2.5 py-1.5 text-sm text-ink-faint">

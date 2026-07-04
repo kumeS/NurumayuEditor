@@ -67,6 +67,43 @@ pub struct ChunkMetadata {
     /// linked editor paragraphs — a reversible "detach" from the prose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slide_body: Option<Vec<String>>,
+    /// For diagram chunks: a PNG data URL of the rendered graph, injected by the
+    /// frontend into EXPORT payloads only so PPTX/RTF can embed the picture
+    /// (the mermaid source in `content` stays the canonical value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_image: Option<String>,
+    /// Review comments attached to this chunk (frontend-owned; Rust only
+    /// persists them through save/load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<Vec<ReviewComment>>,
+    /// Hex hash of the chunk's content at the time `summary` was written, so
+    /// the frontend can tell a stale summary from a fresh one (it computes the
+    /// hash; Rust only persists it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_hash: Option<String>,
+    /// Optional ordering index for a slide's images (lower renders first; ties
+    /// broken by document order) — see the multi-image grid in `pptx.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+}
+
+/// A review comment on a chunk (frontend-owned; persisted only). Mirrors the
+/// TypeScript `ReviewComment` 1:1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewComment {
+    pub id: String,
+    pub text: String,
+    /// Creation time in ms since the Unix epoch.
+    #[serde(default)]
+    pub created_at: u64,
+    /// "user" | "ai".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<bool>,
 }
 
 fn default_chunk_type() -> String {
@@ -86,6 +123,10 @@ impl Default for ChunkMetadata {
             layout: None,
             subtitle: false,
             slide_body: None,
+            rendered_image: None,
+            comments: None,
+            summary_hash: None,
+            slot: None,
         }
     }
 }
@@ -155,8 +196,9 @@ impl Chunk {
     }
 }
 
-/// Authoring mode, fixed at creation: "editor" (prose document) or "slide"
-/// (a deck). Persisted so a saved deck reopens as a deck.
+/// View mode: "editor" (prose document) or "slide" (a deck) — switchable at
+/// any time from the frontend toolbar. Persisted so a document reopens in the
+/// view it was last saved in.
 pub const DOC_MODE_EDITOR: &str = "editor";
 /// The "slide" mode literal — set on the frontend; kept here as the documented
 /// contract for the field's valid values.
@@ -305,15 +347,11 @@ impl Document {
             // (and a dirty reopen) for an otherwise-valid document.
             a.edges.retain(|e| e.source != e.target);
             let before_nodes = a.nodes.len();
-            let before_edges = a.edges.len();
             a.nodes.retain(|n| match n.kind.as_str() {
                 "sentence" => n.parent.as_ref().map(|p| valid.contains(p)).unwrap_or(false),
                 _ => valid.contains(&n.id),
             });
-            let node_ids: HashSet<String> = a.nodes.iter().map(|n| n.id.clone()).collect();
-            a.edges
-                .retain(|e| node_ids.contains(&e.source) && node_ids.contains(&e.target));
-            let pruned = (before_nodes - a.nodes.len()) + (before_edges - a.edges.len());
+            let pruned = (before_nodes - a.nodes.len()) + a.drop_dangling_edges();
             if pruned > 0 {
                 notes.push(format!(
                     "Removed {pruned} relationship-graph node(s)/edge(s) referencing missing paragraphs."
@@ -437,6 +475,24 @@ pub struct AnalysisResult {
     pub nodes: Vec<AnalysisNode>,
     #[serde(default)]
     pub edges: Vec<AnalysisEdge>,
+    /// When the analysis ran, in ms since the Unix epoch (absent on older files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_at: Option<u64>,
+}
+
+impl AnalysisResult {
+    /// Drop edges whose endpoints aren't in the current node set, returning how
+    /// many were removed. This is THE dangling-edge rule (item 52) — shared by
+    /// the load-boundary repair (`Document::normalize` step 5) and the
+    /// post-parse hygiene in `ai::analyze_document`, which previously carried
+    /// their own copies. The frontend twin is `pruneAnalysis` in store.ts.
+    pub fn drop_dangling_edges(&mut self) -> usize {
+        let node_ids: HashSet<&str> = self.nodes.iter().map(|n| n.id.as_str()).collect();
+        let before = self.edges.len();
+        self.edges
+            .retain(|e| node_ids.contains(e.source.as_str()) && node_ids.contains(e.target.as_str()));
+        before - self.edges.len()
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +544,7 @@ mod tests {
                 AnalysisEdge { source: "c1".into(), target: "ghost".into(), relation: "".into() },
                 AnalysisEdge { source: "c1".into(), target: "c1".into(), relation: "".into() },
             ],
+            analyzed_at: None,
         });
         doc.normalize();
         // self-link + ghost link dropped; only the valid "c2" link remains.

@@ -2,6 +2,7 @@
 // merge) live in ChunkView; these are the document-level ones.
 
 import { useEffect } from "react";
+import { confirmDiscard } from "./confirm";
 import { saveNative, openNative } from "./fileActions";
 import { useStore } from "./store";
 
@@ -21,6 +22,20 @@ export function useShortcuts() {
       } else if (key === "t") {
         e.preventDefault();
         useStore.getState().newTab();
+      } else if (key === "k") {
+        // Command palette (提案1).
+        e.preventDefault();
+        useStore.getState().togglePalette();
+      } else if (key === "w") {
+        // Close the active tab, honouring the shared unsaved-changes dialog
+        // (item 18). The store refuses to close the last tab.
+        e.preventDefault();
+        void (async () => {
+          const s = useStore.getState();
+          if (s.tabOrder.length <= 1) return;
+          if (s.dirty && !(await confirmDiscard("tab"))) return;
+          useStore.getState().closeTab(s.activeTabId);
+        })();
       } else if (key === "z" && !e.shiftKey) {
         e.preventDefault();
         useStore.getState().undo();

@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
-const USER_AGENT: &str = "aixTextEditor/1.2 (+https://github.com/kumeS/AIX_Text_Editor)";
+const USER_AGENT: &str = "NurumayuFacet/1.3 (+https://github.com/kumeS/NurumayuFacet)";
 const MAX_REDIRECTS: usize = 5;
 
 /// Classify a *resolved* IP as one we must never fetch from when following a

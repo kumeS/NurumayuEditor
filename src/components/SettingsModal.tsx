@@ -4,6 +4,7 @@
 
 import { type ReactNode, useEffect, useState } from "react";
 import { api } from "../api";
+import { FONT_STACKS } from "../fonts";
 import { useStore } from "../store";
 import type { Settings } from "../types";
 import { CloseIcon } from "./icons";
@@ -32,6 +33,9 @@ const DEFAULTS: Settings = {
   defaultTargetLanguage: "English",
   writingTone: "",
   temperature: 0.3,
+  editorFontFamily: "serif",
+  editorFontSize: 17,
+  removedModels: [],
 };
 
 // Common languages for the default-language picker.
@@ -113,16 +117,25 @@ export default function SettingsModal() {
       ...f,
       [listKey]: f[listKey].includes(id) ? f[listKey] : [...f[listKey], id],
       [activeKey]: id, // select the newly added model
+      // Re-adding a model lifts its tombstone (item 69).
+      removedModels: (f.removedModels ?? []).filter((m) => m !== id),
     }));
   };
   const removeModelFrom = (listKey: ListKey, activeKey: ActiveKey, id: string) => {
     setForm((f) => {
       const list = f[listKey].filter((m) => m !== id);
       const safe = list.length ? list : [f[activeKey]];
+      // Tombstone the removed id (item 69): the backend re-merges its built-in
+      // defaults on every load, so without this a deleted built-in model would
+      // silently reappear next launch. Harmless for custom ids.
+      const removedModels = (f.removedModels ?? []).includes(id)
+        ? f.removedModels ?? []
+        : [...(f.removedModels ?? []), id];
       return {
         ...f,
         [listKey]: safe,
         [activeKey]: f[activeKey] === id ? safe[0] : f[activeKey],
+        removedModels,
       };
     });
   };
@@ -360,6 +373,54 @@ export default function SettingsModal() {
                 openrouter.ai/models</strong> — image model ids change often.
               </>
             )}
+          </div>
+
+          <div>
+            <label className={labelCls}>Editor font</label>
+            <div className="flex items-center gap-4">
+              <select
+                value={form.editorFontFamily ?? "serif"}
+                onChange={(e) =>
+                  update(
+                    "editorFontFamily",
+                    e.target.value as Settings["editorFontFamily"]
+                  )
+                }
+                className={`${field} w-40`}
+              >
+                <option value="serif">Serif</option>
+                <option value="sans">Sans</option>
+                <option value="mono">Mono</option>
+              </select>
+              <div className="w-44">
+                <label className="block text-xs text-ink-faint">
+                  Size: {form.editorFontSize ?? 17}px
+                </label>
+                <input
+                  type="range"
+                  min={12}
+                  max={28}
+                  step={1}
+                  value={form.editorFontSize ?? 17}
+                  onChange={(e) => update("editorFontSize", Number(e.target.value))}
+                  className="w-full accent-accent"
+                />
+              </div>
+            </div>
+            <p
+              className="mt-1 truncate rounded-md border border-gray-200 bg-gray-50/60 px-3 py-1.5 text-ink-soft"
+              style={{
+                fontFamily: FONT_STACKS[form.editorFontFamily ?? "serif"],
+                fontSize: `${form.editorFontSize ?? 17}px`,
+              }}
+            >
+              Aa — The quick brown fox / 素早い茶色の狐
+            </p>
+            <p className="mt-1 text-xs text-ink-faint">
+              Applies to body paragraphs in the editor (提案5 accessibility).
+              Larger sizes help low-vision readers; Sans/Mono can be easier for
+              dyslexic readers.
+            </p>
           </div>
 
           <div className="flex gap-4">

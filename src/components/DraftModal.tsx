@@ -19,6 +19,16 @@ const LENGTHS: { label: string; value: number | null }[] = [
   { label: "Very long (~3000 words)", value: 3000 },
 ];
 
+// Rust truncates the combined reference at this many chars (ai.rs
+// generate_draft_stream) — surfaced here instead of failing silently (§5-2).
+const REFERENCE_CHAR_LIMIT = 12000;
+
+/** One attached reference (a read file or a fetched URL), shown as a chip row. */
+interface RefSource {
+  label: string;
+  text: string;
+}
+
 export default function DraftModal() {
   const open_ = useStore((s) => s.draftOpen);
   const close = useStore((s) => s.closeDraft);
@@ -27,7 +37,11 @@ export default function DraftModal() {
 
   const [theme, setTheme] = useState("");
   const [lengthIdx, setLengthIdx] = useState(0);
+  // Reference material: the paste textarea is ONE source kind; attached files
+  // and fetched URLs are separate, individually removable sources (item 59) —
+  // no longer blind-concatenated into the textarea.
   const [reference, setReference] = useState("");
+  const [sources, setSources] = useState<RefSource[]>([]);
   const [url, setUrl] = useState("");
   const [working, setWorking] = useState<null | "file" | "url">(null);
 
@@ -36,6 +50,7 @@ export default function DraftModal() {
       setTheme("");
       setLengthIdx(0);
       setReference("");
+      setSources([]);
       setUrl("");
       setWorking(null);
     }
@@ -46,17 +61,13 @@ export default function DraftModal() {
   const field =
     "w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-accent";
 
-  const appendReference = (chunk: string, source: string) => {
+  const addSource = (chunk: string, source: string) => {
     const piece = chunk.trim();
     if (!piece) {
       notify(`No readable text found in ${source}.`, "info");
       return;
     }
-    setReference((r) =>
-      r.trim()
-        ? `${r.trim()}\n\n--- ${source} ---\n${piece}`
-        : `--- ${source} ---\n${piece}`
-    );
+    setSources((prev) => [...prev, { label: source, text: piece }]);
     notify(`Added reference from ${source}.`, "success");
   };
 
@@ -73,7 +84,7 @@ export default function DraftModal() {
       setWorking("file");
       const text = await api.readReferenceFile(selected);
       const name = selected.split(/[\\/]/).pop() ?? "file";
-      appendReference(text, name);
+      addSource(text, name);
     } catch (e) {
       notify(typeof e === "string" ? e : String(e), "error");
     } finally {
@@ -87,7 +98,7 @@ export default function DraftModal() {
     try {
       setWorking("url");
       const text = await api.fetchUrlText(u);
-      appendReference(text, u);
+      addSource(text, u);
       setUrl("");
     } catch (e) {
       notify(typeof e === "string" ? e : String(e), "error");
@@ -96,6 +107,15 @@ export default function DraftModal() {
     }
   };
 
+  // Pasted text first (no header, as before), then each source under its
+  // "--- {source} ---" separator — the same format the backend always received.
+  const combinedReference = [
+    reference.trim(),
+    ...sources.map((s) => `--- ${s.label} ---\n${s.text}`),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
   const submit = () => {
     if (!theme.trim()) {
       notify("Enter a theme to draft about.", "info");
@@ -103,7 +123,7 @@ export default function DraftModal() {
     }
     const words = LENGTHS[lengthIdx]?.value ?? undefined;
     close();
-    void draftDocument(theme, words ?? undefined, reference.trim() || undefined);
+    void draftDocument(theme, words ?? undefined, combinedReference || undefined);
   };
 
   return (
@@ -167,6 +187,38 @@ export default function DraftModal() {
               rows={4}
               className={`${field} resize-y`}
             />
+            {sources.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {sources.map((s, i) => (
+                  <div
+                    key={`${s.label}-${i}`}
+                    className="flex items-center gap-2 rounded-md border border-gray-200 bg-gray-50/60 px-2 py-1 text-xs text-ink-soft"
+                  >
+                    <span className="min-w-0 flex-1 truncate" title={s.label}>
+                      {s.label}
+                    </span>
+                    <span className="shrink-0 text-ink-faint">
+                      {s.text.length.toLocaleString()} chars
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${s.label}`}
+                      onClick={() =>
+                        setSources((prev) => prev.filter((_, j) => j !== i))
+                      }
+                      className="shrink-0 text-ink-faint hover:text-red-500"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {combinedReference.length > REFERENCE_CHAR_LIMIT && (
+              <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700">
+                Only about the first 12,000 characters will be used by the AI.
+              </p>
+            )}
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <button
                 type="button"

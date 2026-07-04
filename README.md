@@ -2,23 +2,23 @@
 
 <br/>
 
-<img src="src-tauri/icons/128x128@2x.png" alt="aixTextEditor icon" width="160" />
+<img src="src-tauri/icons/128x128@2x.png" alt="NurumayuFacet icon" width="160" />
 
 <br/>
 
-# ─── ✦ &nbsp; a i x T e x t E d i t o r &nbsp; ✦ ───
+# NurumayuFacet
 
 <h3>
-  <em>🧠 AI &nbsp;×&nbsp; 📝 Chunks &nbsp;—&nbsp; The Next-Generation Writing Experience</em>
+  <em>Write it. Present it. One file.</em>
 </h3>
 
 <br/>
 
-[![Version](https://img.shields.io/badge/🚀_v1.2.0-Release-0078D4?style=for-the-badge&logoColor=white)](https://github.com/kumeS/aixTextEditor/releases)
+[![Version](https://img.shields.io/badge/🚀_v1.3.0-Release-0078D4?style=for-the-badge&logoColor=white)](https://github.com/kumeS/NurumayuFacet/releases)
 &nbsp;
 [![License](https://img.shields.io/badge/📜_Artistic--2.0-License-2EA44F?style=for-the-badge)](LICENSE)
 &nbsp;
-[![Platform](https://img.shields.io/badge/🍎_macOS-Supported-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/kumeS/aixTextEditor/releases)
+[![Platform](https://img.shields.io/badge/🍎_macOS-Supported-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/kumeS/NurumayuFacet/releases)
 
 [![Tauri](https://img.shields.io/badge/⚡_Tauri-v2-FFC131?style=for-the-badge&logo=tauri&logoColor=white)](https://v2.tauri.app)
 &nbsp;
@@ -32,7 +32,9 @@
 
 ---
 
-<h2>📝 Every Paragraph is a Chunk.&nbsp; AI Understands Every Chunk.</h2>
+<h2>Every document is already a slide deck.</h2>
+
+<em>One source. Two facets — the page and the stage.</em>
 
 ---
 
@@ -44,16 +46,16 @@
 <table>
 <tr>
 <td align="center" width="33%">
-<h3>🚀 Streaming Draft</h3>
-<p>Enter a theme → watch a fully structured<br/>first draft generate <strong>in real time</strong></p>
+<h3>🪄 One file, two faces</h3>
+<p>Write a document — it's <strong>already a deck</strong>.<br/>The same chunks are your page and your slides.</p>
 </td>
 <td align="center" width="33%">
-<h3>🎨 AI Image Generation</h3>
-<p>Turn any paragraph into a visual —<br/><strong>images generated from your words</strong></p>
+<h3>🧠 AI that knows every chunk</h3>
+<p>Per-paragraph AI with full-document<br/>context — <strong>translate, proofread, expand, draft</strong>.</p>
 </td>
 <td align="center" width="33%">
-<h3>🔗 Relationship Graph</h3>
-<p>Map the logical structure between<br/>paragraphs with <strong>interactive networks</strong></p>
+<h3>🔗 Relationship graph</h3>
+<p>Map the logic between paragraphs and<br/><strong>catch unsupported claims</strong> before you present.</p>
 </td>
 </tr>
 </table>
@@ -61,14 +63,15 @@
 
 <br/>
 
-> ### ✨ What is aixTextEditor?
+> ### ✨ What is NurumayuFacet?
 >
-> A **radically new** text editor where every paragraph lives as an independent **chunk** — think Jupyter Notebook cells, but for writing.
+> **NurumayuFacet is a writing app where every document is already a slide deck.**
 >
-> Each chunk is a self-contained unit for editing **and** AI-powered operations:
-> **translate** · **proofread** · **summarize** · **expand** · **generate diagrams** · **generate images** · **analyze relationships** — all executed with full awareness of surrounding context.
+> Every paragraph lives as an independent **chunk** — think Jupyter Notebook cells, but for writing. One ordered list of chunks is projected two ways: as a **document** you edit, and as a **slide deck** you present. Change the writing, and the slides follow — same file, no export step, no second tool.
 >
-> _Supercharge your writing — papers, reports, technical docs — **with AI, one chunk at a time.**_
+> Each chunk is also a self-contained unit for AI: **translate · proofread · summarize · expand · generate diagrams · generate images · analyze relationships** — all with full awareness of the surrounding context.
+>
+> _Write papers, reports, talks, decks — **one document, every way it needs to be seen.**_
 
 <br/>
 
@@ -77,17 +80,17 @@
 ### 1. The writing canvas
 
 <div align="center">
-  <img src="docs/01.png" alt="aixTextEditor main window — a clean, distraction-free writing canvas with a minimal toolbar" width="560" />
+  <img src="docs/01.png" alt="NurumayuFacet main window — a clean, distraction-free writing canvas with a minimal toolbar" width="560" />
 </div>
 
-> **A distraction-free, chunk-based canvas.** Every document is an ordered list of _chunks_ — paragraphs, headings, diagrams, images. The toolbar keeps the essentials one click away (**Open / Save**, **Import / Export**, **Undo / Redo**, **Draft by AI**, **Analyze**, **Help**) while the page itself stays quiet so you can focus on writing.
+> **A distraction-free, chunk-based canvas.** Every document is an ordered list of _chunks_ — paragraphs, headings, diagrams, images. The toolbar keeps the essentials one click away (**Open / Save**, **Import / Export**, **Undo / Redo**, **Draft by AI**, **Analyze**, **Editor / Slides**, **Help**) while the page itself stays quiet so you can focus on writing.
 
 **Quick start**
 
 1. Launch the app — a fresh **Untitled Document** opens automatically.
 2. Click the title to rename it, or just start typing in the first paragraph.
 3. Press **➕ Add paragraph** (or `⌘/Ctrl+Shift+Enter` to split at the caret) to grow the document chunk by chunk. Begin a line with `# `, `## ` or `### ` to turn it into a heading.
-4. Need another document? Open a new tab with the tab-bar **＋** or `⌘/Ctrl+T` — each tab keeps its own file, history and analysis.
+4. Flip to **Slides** any time (toolbar toggle) — the same chunks become a deck. Need another document? Open a new tab with the tab-bar **＋** or `⌘/Ctrl+T` — each tab keeps its own file, history and analysis.
 
 <br/>
 
@@ -102,9 +105,9 @@
 **Tutorial — follow along**
 
 1. **Draft the whole document.** Click **Draft by AI**, type a theme (here, _“BTC trend”_), pick an approximate length, and optionally attach reference text, a file (`.txt/.md/.rtf/.pdf`) or a URL. Hit **Draft** and the AI **streams** a structured first draft — headings + paragraphs — into a new tab (_“Draft created — 8 chunks”_).
-2. **Refine paragraph by paragraph.** Focus any paragraph and open the **✨** menu in the left gutter: **Translate**, **Proofread**, **Revise with context**, **Expand**, **Add detail**, **Concentrate**, **Focus**, **Summarize**, **Generate diagram**, or a **Custom instruction**. Each action reads the surrounding chunks so the result stays coherent.
+2. **Refine paragraph by paragraph.** Focus any paragraph and open the **✨** menu in the left gutter: **Translate**, **Proofread**, **Revise with context**, **Expand**, **Add detail**, **Concentrate**, **Focus**, **Summarize**, **Bulletize**, **Generate diagram**, or a **Custom instruction**. Each action reads the surrounding chunks so the result stays coherent.
 3. **Review the change.** Edits appear as an inline **diff** (_What changed vs previous_) — strikethrough for removals, highlight for additions. Keep it, hit **Revert**, or undo with `⌘/Ctrl+Z`.
-4. **Iterate** across chunks until it reads the way you want, then **Save** as `.aix` (lossless) or **Export** to `.txt/.md/.rtf`.
+4. **Iterate** across chunks until it reads the way you want, then **Save** as `.aix` (lossless), flip to **Slides** to present, or **Export** to `.txt/.md/.rtf/.pdf/.pptx`.
 
 > 💡 **Tip:** `⌘/Ctrl+Enter` runs a quick **Proofread** on the focused paragraph — the fastest way to tidy a single chunk.
 
@@ -130,19 +133,26 @@
 
 | Area | What it does |
 | --- | --- |
+| **Document ⟷ Slides** | One document, two faces. The same chunks render as an editable **document** and as a **slide deck** — flip with the toolbar toggle; switching preserves your place and loses nothing. Slides are a projection of the writing, not a separate file. |
 | **Multiple tabs** | Open and edit several documents at once. New tab via the tab-bar **＋** or `⌘/Ctrl+T`; each tab keeps its own document, file path, undo/redo history and analysis. |
-| **Chunk editing** | Document = an ordered list of chunks. Split (`⌘/Ctrl+Shift+Enter`), merge (Backspace at start), reorder (↑/↓), add/delete, and move between chunks with the Up/Down arrows. |
+| **Chunk editing** | Document = an ordered list of chunks. Split (`⌘/Ctrl+Shift+Enter`), merge (Backspace at start, or select 2+ adjacent paragraphs → **Merge**), reorder (↑/↓), add/delete, and move between chunks with the Up/Down arrows. |
 | **Chunk types** | **Text**, **Heading** (`#`/`##`/`###`, levels 1–3), **Diagram** (Mermaid), and **Image**. Type `# `/`## `/`### ` at the start of a paragraph to turn it into a heading. |
-| **Context-aware AI** | The nearest preceding/following text chunks are sent as context so generated text stays coherent. |
-| **Per-chunk AI menu (✨)** | **Translate** (choose language), **Proofread** (choose a style: Academic / Formal / Concise / Plain / Persuasive / custom), **Expand**, **Add detail**, **Concentrate**, **Focus**, **Summarize**, **Generate diagram**, **Custom instruction**. `⌘/Ctrl+Enter` runs Proofread. |
+| **Context-aware AI** | Every action sees the section heading, the neighboring paragraphs, and a whole-document map. Paragraph summaries are hash-checked and **auto-refreshed before each run** when their text changed, so the AI's understanding tracks the live document (not the last button press). |
+| **Per-chunk AI menu (✨)** | **Translate** (choose language), **Proofread** (choose a style: Academic / Formal / Concise / Plain / Persuasive / custom), **Expand**, **Add detail**, **Concentrate**, **Focus**, **Summarize**, **Bulletize** (rewrite as bullet points, in place), **Generate diagram**, **Custom instruction**. `⌘/Ctrl+Enter` runs Proofread. |
 | **Draft (streaming)** | Generate a full structured first draft from a theme; it **streams into a new tab in real time**, split into heading + paragraph chunks. |
 | **Diagrams** | The model emits **Mermaid** code, rendered inline as SVG; diagram chunks keep an editable code area. |
 | **Image generation** | Generate an image from a single paragraph (right-gutter button), or select multiple paragraphs (checkbox → floating **Generate image**) to combine them. Images are inserted as **image chunks** and can be reordered. Uses a separate image model (see Settings). |
-| **Relationship graph** | **Analyze** builds a two-level network — **paragraph** nodes plus per-**sentence** nodes — with typed relations (cause, evidence, elaboration, contrast, …), drawn with **Cytoscape** (sentences nested under their paragraph). Click a node to jump to its paragraph. The graph is saved inside the `.aix` file. |
-| **Import / Export** | One **Import / Export** menu (choose after clicking): import/export `.txt`, `.md`, `.rtf`. Native **`.aix`** format (Save/Open) preserves the full document — chunks, metadata and the analysis graph. |
+| **Relationship graph** | **Analyze** builds a two-level network — **paragraph** nodes plus per-**sentence** nodes — with typed relations (cause, evidence, elaboration, contrast, …), drawn with **Cytoscape** (sentences nested under their paragraph). Click a node to jump to its paragraph; click an edge to flash both endpoints. Relations are color-coded with a legend, and the panel shows when the analysis ran. The graph is saved inside the `.aix` file. |
+| **Import / Export** | One **Import / Export** menu: import `.txt`/`.md`/`.rtf`; export `.txt`, `.md`, `.rtf` (with embedded images & diagram snapshots), `.pdf`, `.pptx`. Native **`.aix`** format (Save/Open) preserves the full document — chunks, metadata, comments and the analysis graph — written atomically. |
 | **Native menu** | The macOS/Windows menu bar (File / Edit / AI / Window) mirrors the in-app toolbar; its custom items drive the same actions. |
 | **Security** | The API key is stored in the **OS keychain** (macOS Keychain / Windows Credential Manager / Linux Secret Service) — never written to disk in plaintext, never sent to the frontend. All network calls happen in Rust. |
 | **Resilience** | Free models are rate-limited; API calls retry on HTTP 429 / transient 5xx with exponential backoff, and surface actionable errors. |
+| **Review comments** | Per-paragraph comments in a right-docked panel (add/edit/resolve/delete, persisted in `.aix`). **AI review** writes targeted comments; **Check integrity** uses the relationship graph to flag unsupported claims and contradictions. |
+| **Read aloud** | Read one paragraph, a selection, or the whole document from the cursor (toolbar **Read/Stop**); the voice follows your default output language. macOS `say`-based. |
+| **Command palette** | `⌘/Ctrl+K` — search and run every major action (export, analyze, review, read aloud, tabs, settings…). |
+| **Health bar** | A persistent status strip: save state, word count, AI freshness, stale-summary count, and the last export's warnings (kept reviewable, not just a toast). |
+| **Editor font** | Serif / Sans / Mono and 12–28px body size (Settings → Editor font). |
+| **Slides** | Slide mode with 5 layouts (auto or manual, incl. **AI layout** suggestion), multi-image grids (up to 6 per slide, preview = export), placeholder slots, split/merge slides, overflow badges, and PPTX export with a warning report. |
 | **Performance** | Per-chunk selectors (only the edited paragraph re-renders), async ops with loading indicators, lazy-loaded Mermaid/Cytoscape. |
 
 ## Settings
@@ -173,12 +183,13 @@ Open with the gear icon or `⌘/Ctrl+,`:
 | `⌘/Ctrl + S` / `O` | Save / Open `.aix` document |
 | `⌘/Ctrl + Z` / `Shift+Z` | Undo / Redo |
 | `⌘/Ctrl + ,` | Settings |
+| `⌘/Ctrl + K` | Command palette |
 
 ## Architecture
 
 ### 🔀 High-level data flow
 
-aixTextEditor is deliberately split into a **stateful authoring workbench** in
+NurumayuFacet is deliberately split into a **stateful authoring workbench** in
 React and a **capability boundary** in Rust. The frontend decides _what the user is
 doing_; the backend owns everything that touches the outside world — files, the
 network, the OS keychain, native menus and speech.
@@ -281,8 +292,8 @@ flowchart LR
   text or JSON; image actions extract a generated image URL/data payload and
   insert it as an image chunk.
 - **Files are format adapters, not the source of truth.** `.aix` is the lossless
-  document format. `.txt`, `.md`, `.rtf` and `.pptx` are exports/imports derived
-  from the chunk graph.
+  document format. `.txt`, `.md`, `.rtf`, `.pdf` and `.pptx` are exports/imports
+  derived from the chunk graph.
 - **Remote input is filtered.** Reference URLs and remote image/document fetches
   go through `net.rs`, which restricts schemes, hosts, response size and timeout
   before data reaches AI prompts or PPTX generation.
@@ -296,27 +307,37 @@ flowchart LR
 src/                     React frontend
   types.ts               TS mirror of the Rust model (camelCase)
   api.ts                 Typed invoke() wrappers (+ streaming Channel)
-  store.ts               Zustand store: tabs, chunks, undo/redo, selection, autosave
-  aiActions.ts           AI orchestration (context, busy state, tab-race guards)
+  store.ts               Zustand store: tabs, chunks, undo/redo, selection,
+                         comments, speech queue, autosave
+  aiActions.ts           AI orchestration (context freshness, review/integrity,
+                         busy state, tab-race guards, read-aloud)
   fileActions.ts         New/Open/Import/Export/Draft/PPTX (dialog → Rust I/O)
   slides.ts              Deck derivation (mirrors deck.rs) for the Slide view
+  mermaidRender.ts       Shared Mermaid loader + validate + offscreen SVG/PNG
+  fonts.ts               Editor font stacks (Settings → Editor font)
+  confirm.ts             Shared unsaved-changes dialog (quit / close tab)
   caret.ts               Visual-line caret detection (chunk Up/Down navigation)
-  useShortcuts.ts        Global keyboard shortcuts
+  useShortcuts.ts        Global keyboard shortcuts (⌘K palette, ⌘W close tab…)
   components/            TabBar, Toolbar, Editor, SlideEditor, ChunkView,
-                         ChunkAiMenu, MermaidChunk, NetworkPanel, SettingsModal,
-                         PromptModal, SelectionBar, Toasts, ErrorBoundary, icons
+                         ChunkAiMenu, MermaidChunk, NetworkPanel, ReviewPanel,
+                         CommandPalette, HealthBar, SettingsModal, PromptModal,
+                         SelectionBar, Toasts, ErrorBoundary, icons
 src-tauri/src/           Rust backend
   lib.rs                 Tauri builder: commands, native menu, window lifecycle
   models.rs              Document / Chunk / ChunkMetadata / Analysis* (serde)
   commands.rs            Tauri command surface
   ai.rs                  LlmProvider trait + OpenRouter impl (SSE streaming,
-                         image generation) + prompts
-  deck.rs + pptx.rs      Document → Deck → hand-written .pptx (OOXML)
-  fileio.rs              txt/md/rtf import-export, paragraph + heading chunking
+                         image generation, retries) + prompts
+  deck.rs + pptx.rs      Document → Deck → hand-written .pptx (OOXML,
+                         multi-image grids, diagram snapshots)
+  fileio.rs              txt/md/rtf import-export (RTF picture embedding),
+                         paragraph + heading chunking, atomic writes
+  pdf.rs                 Headless PDF export (system-font discovery, CJK-aware)
+  imageio.rs             Shared image decode/size/fetch (pptx + rtf)
   net.rs                 SSRF-guarded, size-capped remote fetch
-  settings.rs            Settings JSON + OS keychain (keyring)
+  settings.rs            Settings JSON + OS keychain (keyring), locale detection
   menu.rs                Native application menu (emits events to the frontend)
-  cli.rs                 Headless CLI (capabilities / info / export)
+  cli.rs                 Headless CLI (capabilities / info / show / export)
   error.rs               Unified AppError
 ```
 
@@ -331,26 +352,35 @@ snapshots, so existing chunk actions operate unchanged.
 ### Install (recommended) — Homebrew
 
 ```bash
-brew tap kumeS/tap https://github.com/kumeS/aixTextEditor   # one-time: the formula lives in this repo
-brew install kumeS/tap/aixtexteditor
+brew tap kumeS/tap https://github.com/kumeS/NurumayuFacet   # one-time: the formula lives in this repo
+brew install kumeS/tap/nurumayufacet
 ```
 
 > The `brew tap … <url>` line is required because the formula ships inside the app's
 > own repo rather than a separate `homebrew-tap` repo. (If you later create a
 > `kumeS/homebrew-tap` repo containing the formula, `brew install
-> kumeS/tap/aixtexteditor` works on its own, with no `brew tap` step.)
+> kumeS/tap/nurumayufacet` works on its own, with no `brew tap` step.)
 
-This **builds aixTextEditor from source on your Mac**, so there is no notarization
+This **builds NurumayuFacet from source on your Mac**, so there is no notarization
 / *"app is damaged"* Gatekeeper prompt, and the binary matches your own CPU (Apple
 Silicon or Intel). Homebrew installs Node and Rust automatically (Xcode Command
 Line Tools required); the first build takes a few minutes.
 
-Launch it from Spotlight as **aixTextEditor**, or:
+Launch it from Spotlight as **NurumayuFacet**, or:
 
 ```bash
-aixtexteditor                                                    # CLI launcher
+nurumayufacet                                            # CLI launcher
 # …or add it to /Applications:
-ln -sfn "$(brew --prefix)/opt/aixtexteditor/aixTextEditor.app" /Applications/
+ln -sfn "$(brew --prefix)/opt/nurumayufacet/NurumayuFacet.app" /Applications/
+```
+
+The same binary is a headless CLI for agents and scripts:
+
+```bash
+nurumayufacet capabilities                 # machine-readable self-description (JSON)
+nurumayufacet info document.aix [--json]   # structure; --json includes full chunk content
+nurumayufacet show document.aix <chunkId>  # one chunk's raw content (diagram source, text…)
+nurumayufacet export document.aix out.pdf  # txt / md / rtf / pdf / pptx
 ```
 
 On first run, open **Settings** (gear icon, or `⌘/Ctrl+,`) and paste your
@@ -360,11 +390,11 @@ https://openrouter.ai/models. The key is stored in the macOS keychain, never on
 disk in plaintext.
 
 > **Prebuilt `.dmg` alternative.** A `.dmg` is also published on the
-> [Releases](https://github.com/kumeS/aixTextEditor/releases) page (and via the
-> Homebrew **cask** [`Casks/aix-text-editor.rb`](Casks/aix-text-editor.rb)). That
+> [Releases](https://github.com/kumeS/NurumayuFacet/releases) page (and via the
+> Homebrew **cask** [`Casks/nurumayufacet.rb`](Casks/nurumayufacet.rb)). That
 > build is *not notarized*, so macOS quarantines it on download — after installing,
 > clear the flag once with
-> `xattr -dr com.apple.quarantine "/Applications/aixTextEditor.app"`. The
+> `xattr -dr com.apple.quarantine "/Applications/NurumayuFacet.app"`. The
 > source build above avoids this entirely.
 
 ### Building from source manually (optional)
@@ -386,8 +416,29 @@ npm run tauri build    # → .app / .dmg under src-tauri/target/release/bundle/
 - **The document round-trips losslessly only in the native `.aix` format.**
   Plain-text exports (`.txt`/`.md`/`.rtf`) are inherently flat: a blank line
   inside one paragraph chunk is indistinguishable from a chunk break on
-  re-import, and images export as a placeholder. Markdown does round-trip
-  headings and promotes a leading `# Heading` back to the document title.
+  re-import. `.txt` exports images/diagrams as placeholders by design; `.rtf`
+  embeds PNG/JPEG images and diagram snapshots (GIF/BMP stay placeholders);
+  Markdown keeps editable ` ```mermaid ` fences and round-trips headings,
+  promoting a leading `# Heading` back to the document title.
+- Diagram snapshots in RTF/PPTX are rendered by the app at export time — CLI
+  exports can't render Mermaid headlessly and will say so in a warning.
+- CLI PDF export needs a Unicode TTF font on the system (it looks for Arial
+  Unicode and common Noto/DejaVu paths); the GUI's PDF export uses the OS
+  print dialog and is unaffected.
+- Canceling an in-flight AI action stops it from changing the document, but the
+  HTTP request itself isn't aborted server-side (planned for v2.x).
+
+## About the name
+
+**Facet** is the product; **Nurumayu** is the project (studio) it ships under —
+"NurumayuFacet", the way *Cultured Code* ships *Things* or *Tapbots* ships
+*Ivory*. The name is the idea: one document has many **facets** — the page you
+write and the stage you present — and each export (PDF, PPTX, Markdown) is
+another facet of the same source.
+
+The native document format keeps the **`.aix`** extension, and the internal
+bundle identifier (`com.aix.texteditor`) is unchanged, so documents and saved
+settings from earlier versions keep working unchanged.
 
 ## License
 

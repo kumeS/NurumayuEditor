@@ -10,7 +10,7 @@
 //! §3.1, "context-aware editing") so the model produces logically coherent text.
 
 use crate::error::{AppError, AppResult};
-use crate::models::{AnalysisResult, Document, CHUNK_TYPE_TEXT};
+use crate::models::{AnalysisResult, Document, CHUNK_TYPE_HEADING, CHUNK_TYPE_TEXT};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -41,6 +41,63 @@ impl OpenRouterProvider {
     }
 }
 
+/// POST `payload` to `endpoint` with the standard OpenRouter headers, retrying
+/// transient failures. Free OpenRouter models share tight rate limits and
+/// frequently return 429 (or transient 5xx) under load, and a laptop's network
+/// can blip mid-request — so retry a few times with backoff, honouring
+/// Retry-After, before handing the final response (or error) back to the
+/// caller for its own status/error mapping.
+async fn send_with_retry(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    payload: &serde_json::Value,
+) -> AppResult<reqwest::Response> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let sent = client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {api_key}"))
+            // OpenRouter attribution headers (optional but recommended).
+            .header("HTTP-Referer", "https://github.com/kumeS/NurumayuFacet")
+            .header("X-Title", "NurumayuFacet")
+            .json(payload)
+            .send()
+            .await;
+
+        let res = match sent {
+            Ok(res) => res,
+            // Network-level failures (DNS, connect, timeout) are transient too.
+            Err(_) if attempt < MAX_ATTEMPTS => {
+                let wait = (1u64 << (attempt - 1)).min(5);
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                continue;
+            }
+            Err(e) => return Err(AppError::from(e)),
+        };
+
+        let status = res.status();
+
+        // 429 (rate limit) and 5xx are transient — retry with backoff.
+        if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_ATTEMPTS {
+            let retry_after = res
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            // Honour Retry-After, else exponential backoff; cap so the UI
+            // never hangs for long.
+            let wait = retry_after.unwrap_or(1u64 << (attempt - 1)).min(5);
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+
+        return Ok(res);
+    }
+}
+
 impl LlmProvider for OpenRouterProvider {
     async fn complete(&self, system: &str, user: &str) -> AppResult<String> {
         let client = reqwest::Client::new();
@@ -53,44 +110,12 @@ impl LlmProvider for OpenRouterProvider {
             ]
         });
 
-        // Free OpenRouter models share tight rate limits and frequently return
-        // 429 (or transient 5xx) under load. Retry a few times with backoff,
-        // honouring Retry-After, before surfacing an actionable error.
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut attempt: u32 = 0;
-        let body: serde_json::Value = loop {
-            attempt += 1;
-            let res = client
-                .post(&self.config.endpoint)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                // OpenRouter attribution headers (optional but recommended).
-                .header("HTTP-Referer", "https://github.com/kumeS/AIX_Text_Editor")
-                .header("X-Title", "aixTextEditor")
-                .json(&payload)
-                .send()
-                .await?;
+        let res = send_with_retry(&client, &self.config.endpoint, &self.config.api_key, &payload)
+            .await?;
+        let status = res.status();
+        let body: serde_json::Value = res.json().await?;
 
-            let status = res.status();
-
-            // 429 (rate limit) and 5xx are transient — retry with backoff.
-            if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_ATTEMPTS {
-                let retry_after = res
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u64>().ok());
-                // Honour Retry-After, else exponential backoff; cap so the UI
-                // never hangs for long.
-                let wait = retry_after.unwrap_or(1u64 << (attempt - 1)).min(5);
-                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                continue;
-            }
-
-            let body: serde_json::Value = res.json().await?;
-            if status.is_success() {
-                break body;
-            }
-
+        if !status.is_success() {
             let provider_msg = body["error"]["message"]
                 .as_str()
                 .or_else(|| body["error"].as_str())
@@ -113,7 +138,7 @@ impl LlmProvider for OpenRouterProvider {
                 code => format!("API {code}: {provider_msg}"),
             };
             return Err(AppError::Network(msg));
-        };
+        }
 
         let out = body["choices"][0]["message"]["content"]
             .as_str()
@@ -140,21 +165,21 @@ impl OpenRouterProvider {
         mut on_delta: F,
     ) -> AppResult<String> {
         let client = reqwest::Client::new();
-        let res = client
-            .post(&self.config.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("HTTP-Referer", "https://github.com/kumeS/AIX_Text_Editor")
-            .header("X-Title", "aixTextEditor")
-            .json(&json!({
-                "model": self.config.model,
-                "temperature": self.config.temperature,
-                "stream": true,
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": user }
-                ]
-            }))
-            .send()
+        let payload = json!({
+            "model": self.config.model,
+            "temperature": self.config.temperature,
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ]
+        });
+
+        // Retries (429/5xx/network) happen inside `send_with_retry`, i.e. only
+        // BEFORE the first delta has been forwarded to the caller. Once the
+        // stream is being consumed, a failure is returned as-is — replaying a
+        // partially-delivered stream would show the user duplicated text.
+        let res = send_with_retry(&client, &self.config.endpoint, &self.config.api_key, &payload)
             .await?;
 
         let status = res.status();
@@ -473,9 +498,15 @@ pub async fn generate_diagram(
         .filter(|s| !s.trim().is_empty())
         .map(|s| format!(" Additional instruction: {s}."))
         .unwrap_or_default();
+    // The hard constraints below exist to reduce Mermaid PARSE failures — the
+    // most common breakages are unquoted labels with punctuation and
+    // parentheses/brackets inside flowchart node text.
     let system = format!(
-        "You are a diagramming assistant. Convert the user's text into a single valid Mermaid.js diagram \
-         (flowchart, sequence, class, or mind map — choose what best fits the content). Output ONLY raw \
+        "You are a diagramming assistant. Convert the user's text into a single valid Mermaid.js diagram. \
+         Prefer 'flowchart TD' unless another diagram type (sequence, class, or mind map) clearly fits \
+         the content better. To keep the code parseable by Mermaid: wrap every node label that contains \
+         spaces or punctuation in double quotes (e.g. A[\"label text\"]), never put parentheses or \
+         brackets inside flowchart node text, and keep the diagram under about 40 nodes. Output ONLY raw \
          Mermaid code. Do NOT wrap it in Markdown code fences and do NOT add any explanation.{extra}"
     );
     let raw = provider.complete(&system, text.trim()).await?;
@@ -487,19 +518,13 @@ pub async fn generate_diagram(
 /// image is found, rather than silently producing a blank image.
 pub async fn generate_image(config: &LlmConfig, prompt: &str) -> AppResult<String> {
     let client = reqwest::Client::new();
-    let res = client
-        .post(&config.endpoint)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("HTTP-Referer", "https://github.com/kumeS/AIX_Text_Editor")
-        .header("X-Title", "aixTextEditor")
-        .json(&json!({
-            "model": config.model,
-            "messages": [{ "role": "user", "content": prompt }],
-            // Ask image-capable models (e.g. Gemini "Nano Banana") for image output.
-            "modalities": ["image", "text"]
-        }))
-        .send()
-        .await?;
+    let payload = json!({
+        "model": config.model,
+        "messages": [{ "role": "user", "content": prompt }],
+        // Ask image-capable models (e.g. Gemini "Nano Banana") for image output.
+        "modalities": ["image", "text"]
+    });
+    let res = send_with_retry(&client, &config.endpoint, &config.api_key, &payload).await?;
 
     let status = res.status();
     let body: serde_json::Value = res.json().await?;
@@ -631,49 +656,113 @@ pub async fn generate_draft_stream<F: FnMut(&str)>(
     provider.complete_stream(&system, &user, on_delta).await
 }
 
-fn extract_json(s: &str) -> &str {
-    let start = s.find('{');
-    let end = s.rfind('}');
-    match (start, end) {
-        (Some(a), Some(b)) if b > a => &s[a..=b],
-        _ => s,
+/// Slice out the FIRST balanced top-level JSON object in `s`, skipping over
+/// braces that live inside string literals (and escaped quotes within them) —
+/// a naive first-`{`/last-`}` scan breaks as soon as the model appends prose
+/// containing a `}` after the JSON. Returns `None` when no balanced object
+/// exists. Scanning bytes is safe: `{`/`}`/`"`/`\` never occur inside a
+/// multibyte UTF-8 sequence, so every match is a char boundary.
+fn find_balanced_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in s.as_bytes().iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Pull the JSON object out of a model response that may wrap it in code
+/// fences, a bare "json" language tag, or surrounding prose. Falls back to the
+/// fence-stripped input when no balanced object is found, so the serde error
+/// downstream still shows what the model actually said.
+fn extract_json(s: &str) -> String {
+    let stripped = strip_code_fences(s);
+    // Some models emit the language tag without a fence ("json\n{...}").
+    let body = stripped
+        .trim_start()
+        .strip_prefix("json")
+        .map(str::trim_start)
+        .unwrap_or(&stripped);
+    match find_balanced_object(body) {
+        Some(obj) => obj.to_string(),
+        None => stripped,
     }
 }
 
-/// Analyze the whole document and extract a relationship graph between chunks.
-pub async fn analyze_document(config: &LlmConfig, doc: &Document) -> AppResult<AnalysisResult> {
-    let provider = OpenRouterProvider::new(config.clone());
-
-    // Only feed prose paragraphs to the analyzer; diagrams and headings carry no
-    // paragraph-level relations (and headings aren't restored as graph nodes on
-    // reload, so including them here would make the live/reopened graph diverge).
+/// Build the paragraph listing fed to the analyzer: one entry per text chunk
+/// and per heading chunk (annotated with its level so the model can tell
+/// section titles apart from prose); diagrams and images carry no
+/// paragraph-level relations and are excluded, as are whitespace-only chunks.
+fn analysis_listing(doc: &Document) -> String {
     let mut listing = String::new();
     for chunk in doc.chunks.iter() {
-        if chunk.metadata.chunk_type != CHUNK_TYPE_TEXT {
+        let is_heading = chunk.metadata.chunk_type == CHUNK_TYPE_HEADING;
+        if chunk.metadata.chunk_type != CHUNK_TYPE_TEXT && !is_heading {
             continue;
         }
         let snippet: String = chunk.content.chars().take(800).collect();
         if snippet.trim().is_empty() {
             continue;
         }
-        listing.push_str(&format!("- id: {}\n  text: {}\n", chunk.id, snippet.replace('\n', " ")));
+        if is_heading {
+            let level = chunk.metadata.level.unwrap_or(1);
+            listing.push_str(&format!(
+                "- id: {} (heading level {level})\n  text: {}\n",
+                chunk.id,
+                snippet.replace('\n', " ")
+            ));
+        } else {
+            listing.push_str(&format!("- id: {}\n  text: {}\n", chunk.id, snippet.replace('\n', " ")));
+        }
     }
+    listing
+}
 
+/// Analyze the whole document and extract a relationship graph between chunks.
+pub async fn analyze_document(config: &LlmConfig, doc: &Document) -> AppResult<AnalysisResult> {
+    let provider = OpenRouterProvider::new(config.clone());
+
+    let listing = analysis_listing(doc);
     if listing.trim().is_empty() {
-        return Ok(AnalysisResult { nodes: vec![], edges: vec![] });
+        return Ok(AnalysisResult { nodes: vec![], edges: vec![], analyzed_at: None });
     }
 
     let system = "You are a discourse-analysis engine for academic writing. Given a list of paragraphs \
-         (each with an id), build a relationship network at TWO levels.\n\
+         (each with an id; entries marked \"(heading level n)\" are section titles), build a relationship \
+         network at TWO levels.\n\
          1) PARAGRAPH nodes: one per provided paragraph. Set kind=\"paragraph\", id = the paragraph id, \
-         label = a 3-6 word topic, summary = one sentence.\n\
+         label = a 3-6 word topic, summary = one sentence. Heading entries are section titles: still emit \
+         them as kind=\"paragraph\" nodes carrying the heading text, and connect each section heading to \
+         the paragraphs it governs (relation \"elaboration\", or a more specific type where one clearly \
+         fits).\n\
          2) SENTENCE nodes: split each paragraph into its sentences and create one node per sentence. Set \
          kind=\"sentence\", parent = the owning paragraph id, id = \"<paragraphId>#s<n>\" (n starts at 1 per \
          paragraph), label = a 3-6 word gist, summary = the sentence text.\n\
          Then add EDGES describing the logical relationship between nodes — between paragraphs, between \
-         sentences, and across levels where relevant. Each edge MUST set \"relation\" to the relationship \
-         type as a property (e.g. cause, effect, evidence, claim, elaboration, contrast, condition, \
-         example, definition, sequence).\n\
+         sentences, and across levels where relevant. Each edge MUST set \"relation\" to EXACTLY one of: \
+         cause, effect, evidence, claim, elaboration, contrast, condition, example, definition, sequence.\n\
          Respond with STRICT JSON only, no markdown, of the exact shape: \
          {\"nodes\":[{\"id\":\"...\",\"kind\":\"paragraph|sentence\",\"parent\":\"<paragraph id or omit>\",\
          \"label\":\"...\",\"summary\":\"...\"}],\
@@ -684,22 +773,150 @@ pub async fn analyze_document(config: &LlmConfig, doc: &Document) -> AppResult<A
     let user = format!("Paragraphs:\n{listing}");
     let raw = provider.complete(system, &user).await?;
     let json_str = extract_json(&raw);
-    let mut result: AnalysisResult = serde_json::from_str(json_str).map_err(|e| {
-        AppError::Other(format!("Could not parse analysis JSON from model: {e}"))
-    })?;
+    let mut result: AnalysisResult = match serde_json::from_str(&json_str) {
+        Ok(r) => r,
+        Err(first_err) => {
+            // One strict-JSON retry: models occasionally wrap the JSON in prose
+            // or emit trailing commentary. Feed the parse error back so the
+            // model can correct the exact problem; a second failure surfaces
+            // the usual error.
+            let strict_system = format!(
+                "{system}\n\nYour previous response could not be parsed as JSON ({first_err}). \
+                 Respond with STRICT JSON only — no prose, no markdown."
+            );
+            let raw = provider.complete(&strict_system, &user).await?;
+            let json_str = extract_json(&raw);
+            serde_json::from_str(&json_str).map_err(|e| {
+                AppError::Other(format!("Could not parse analysis JSON from model: {e}"))
+            })?
+        }
+    };
 
-    // Default any node the model left without a kind to "paragraph", and drop
-    // edges whose endpoints aren't real nodes (keeps the graph consistent).
+    normalize_analysis(&mut result);
+    Ok(result)
+}
+
+/// Post-parse fixes for a freshly-parsed analysis: default any node the model
+/// left without a kind to "paragraph", normalize edge relations toward the
+/// canonical closed set ("Cause " → "cause"; unknown values are left as-is —
+/// the renderer falls back to grey for them), and drop edges whose endpoints
+/// aren't real nodes (keeps the graph consistent).
+fn normalize_analysis(result: &mut AnalysisResult) {
     for n in result.nodes.iter_mut() {
         if n.kind.trim().is_empty() {
             n.kind = "paragraph".to_string();
         }
     }
-    let node_ids: std::collections::HashSet<&str> =
-        result.nodes.iter().map(|n| n.id.as_str()).collect();
-    result
-        .edges
-        .retain(|e| node_ids.contains(e.source.as_str()) && node_ids.contains(e.target.as_str()));
+    for e in result.edges.iter_mut() {
+        e.relation = e.relation.trim().to_lowercase();
+    }
+    // Shared dangling-edge rule (item 52) — the same helper the load-boundary
+    // repair (Document::normalize step 5) uses, so the two sites can't drift.
+    result.drop_dangling_edges();
+}
 
-    Ok(result)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AnalysisEdge, AnalysisNode, Chunk, Document, CHUNK_TYPE_IMAGE};
+
+    #[test]
+    fn extract_json_plain_object() {
+        let s = r#"{"nodes":[],"edges":[]}"#;
+        assert_eq!(extract_json(s), s);
+    }
+
+    #[test]
+    fn extract_json_fenced_block() {
+        let s = "```json\n{\"nodes\":[],\"edges\":[]}\n```";
+        assert_eq!(extract_json(s), r#"{"nodes":[],"edges":[]}"#);
+    }
+
+    #[test]
+    fn extract_json_bare_language_tag() {
+        // Some models emit the language tag without a fence.
+        assert_eq!(extract_json("json\n{\"a\":1}"), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn extract_json_prose_with_braces_in_strings() {
+        // The JSON itself contains braces and escaped quotes inside string
+        // literals, and the trailing prose contains a bare '}' — a naive
+        // first-'{'/last-'}' scan would slice through the prose.
+        let s = "Sure! Here is the graph:\n\
+                 {\"label\":\"set {x} and \\\"y\\\"\",\"n\":1}\n\
+                 Hope that helps — note the stray } above.";
+        let out = extract_json(s);
+        assert_eq!(out, "{\"label\":\"set {x} and \\\"y\\\"\",\"n\":1}");
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+    }
+
+    #[test]
+    fn extract_json_unbalanced_garbage_falls_through() {
+        let s = "{\"a\": \"never closed";
+        assert!(find_balanced_object(s).is_none());
+        // extract_json falls back to the fence-stripped input so the serde
+        // error downstream still shows what the model actually said.
+        let out = extract_json(s);
+        assert_eq!(out, s);
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_err());
+    }
+
+    #[test]
+    fn normalize_analysis_lowercases_relations_and_drops_dangling_edges() {
+        let mut result = AnalysisResult {
+            nodes: vec![
+                AnalysisNode {
+                    id: "a".into(),
+                    label: "A".into(),
+                    summary: String::new(),
+                    kind: String::new(),
+                    parent: None,
+                },
+                AnalysisNode {
+                    id: "b".into(),
+                    label: "B".into(),
+                    summary: String::new(),
+                    kind: "sentence".into(),
+                    parent: Some("a".into()),
+                },
+            ],
+            edges: vec![
+                AnalysisEdge { source: "a".into(), target: "b".into(), relation: " Cause ".into() },
+                AnalysisEdge { source: "a".into(), target: "ghost".into(), relation: "evidence".into() },
+            ],
+            analyzed_at: None,
+        };
+        normalize_analysis(&mut result);
+        // Missing kind defaults to "paragraph"; explicit kinds survive.
+        assert_eq!(result.nodes[0].kind, "paragraph");
+        assert_eq!(result.nodes[1].kind, "sentence");
+        // Relation is trimmed + lowercased; the dangling edge is dropped.
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].relation, "cause");
+    }
+
+    #[test]
+    fn analysis_listing_includes_headings_and_skips_non_prose() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 2, "Methods"));
+        doc.chunks.push(Chunk::new_text(1, "First paragraph."));
+        doc.chunks.push(Chunk::new_text(2, "   ")); // whitespace-only → skipped
+        doc.chunks.push(Chunk::new_diagram(3, "flowchart TD", "mermaid"));
+        let mut img = Chunk::new_text(4, "data:image/png;base64,AAAA");
+        img.metadata.chunk_type = CHUNK_TYPE_IMAGE.to_string();
+        doc.chunks.push(img);
+
+        let listing = analysis_listing(&doc);
+        assert!(listing.contains(&format!(
+            "- id: {} (heading level 2)\n  text: Methods\n",
+            doc.chunks[0].id
+        )));
+        assert!(listing.contains(&format!(
+            "- id: {}\n  text: First paragraph.\n",
+            doc.chunks[1].id
+        )));
+        // Only the heading and the text paragraph made it in.
+        assert_eq!(listing.matches("- id:").count(), 2);
+    }
 }

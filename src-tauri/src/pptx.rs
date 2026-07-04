@@ -8,8 +8,8 @@
 //! is chosen upstream in `deck::document_to_deck`.
 
 use crate::error::{AppError, AppResult};
+use crate::imageio::{decode_image, fit, image_ext};
 use crate::models::{Chunk, Deck, Slide, CHUNK_TYPE_TEXT};
-use base64::Engine;
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -19,10 +19,18 @@ const SLIDE_W: i64 = 12_192_000; // 16:9
 const SLIDE_H: i64 = 6_858_000;
 const MARGIN: i64 = 685_800; // 0.75 in
 const BODY_Y: i64 = 1_600_200;
-
-/// Upper bound on a single fetched remote image (A4): a hostile or accidentally
-/// huge URL can't exhaust memory during export.
-const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+// Height reserved for an explicit subtitle's own shape on every non-section
+// layout (section has its own, differently-sized Subtitle box already). Body/
+// image content starts BODY_Y + SUBTITLE_H down when a subtitle is present —
+// mirrors the frontend, where the subtitle is a separate full-width element
+// in normal document flow, ABOVE the bullets/image, not merged into them.
+const SUBTITLE_H: i64 = 700_000;
+/// Gutter between grid cells when a slide shows multiple images: 114300 EMU
+/// (0.125 in) == exactly 12px in the frontend's 1280×720 preview frame, per the
+/// multi-image grid contract shared with `SlideEditor.tsx`.
+const IMAGE_GRID_GAP: i64 = 114_300;
+/// At most this many visuals render per slide; extras are counted and warned.
+const MAX_VISUALS: usize = 6;
 
 /// Outcome of an export: how many slides were written and any non-fatal notes
 /// (e.g. images that couldn't be embedded, diagram chunks not yet supported).
@@ -33,48 +41,21 @@ pub struct PptxReport {
     pub warnings: Vec<String>,
 }
 
-/// Resolve remote (`http(s)://`) image-chunk URLs to inline data URLs by
-/// fetching the bytes, so the (synchronous) writer can embed them. Image chunks
-/// can hold a remote URL (some image models return a hosted URL rather than a
-/// data URL — see `ai::extract_image_url`). On failure the content is cleared so
-/// the writer skips it and reports it as a dropped image.
-pub async fn resolve_remote_images(deck: &mut Deck) {
-    for slide in &mut deck.slides {
-        for chunk in &mut slide.chunks {
-            if !chunk.is_image() {
-                continue;
-            }
-            let url = chunk.content.trim();
-            if url.starts_with("http://") || url.starts_with("https://") {
-                // On failure the content is cleared → counted as a dropped image.
-                chunk.content = fetch_as_data_url(url).await.unwrap_or_default();
-            }
-        }
-    }
-}
-
-async fn fetch_as_data_url(url: &str) -> AppResult<String> {
-    // `net::safe_fetch` enforces http(s)-only, SSRF host filtering, per-hop
-    // redirect re-validation, a size cap and a timeout (A4/A5).
-    let bytes = crate::net::safe_fetch(url, MAX_IMAGE_BYTES, 30).await?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    // The mime here is cosmetic — `image_ext` re-sniffs the magic bytes on write.
-    Ok(format!("data:image/png;base64,{b64}"))
-}
-
 /// Build the `.pptx` bytes for a deck, plus any non-fatal warnings. Call
-/// `resolve_remote_images` first so remote image URLs become embeddable.
+/// `imageio::resolve_remote_images` first so remote image URLs become embeddable.
 pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
     let n = deck.slides.len();
 
     // Tally what the layout can't carry yet, so the caller can surface it. Image
     // outcomes (failed fetch / unsupported format / extras) and bullet overflow
-    // are recorded per-slide in `build_slide`; diagrams are counted up front.
+    // are recorded per-slide in `build_slide`; diagrams without a rendered
+    // snapshot are counted up front (the frontend injects `renderedImage` at
+    // export time; a snapshot-carrying diagram joins its slide's visuals).
     let diagrams: usize = deck
         .slides
         .iter()
         .flat_map(|s| &s.chunks)
-        .filter(|c| c.is_diagram())
+        .filter(|c| c.is_diagram() && !has_rendered_image(c))
         .count();
     let mut stats = ExportStats::default();
     let mut buf = Cursor::new(Vec::new());
@@ -157,8 +138,14 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
     }
     if stats.extra_images > 0 {
         warnings.push(format!(
-            "{} extra image(s) were left out — only one image per slide is supported for now.",
+            "{} extra image(s) were left out — only the first 6 images per slide are exported.",
             stats.extra_images
+        ));
+    }
+    if stats.layout_dropped > 0 {
+        warnings.push(format!(
+            "{} image(s) were left out — their slide's layout has no image area.",
+            stats.layout_dropped
         ));
     }
     if stats.overflow_slides > 0 {
@@ -169,7 +156,7 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
     }
     if diagrams > 0 {
         warnings.push(format!(
-            "{diagrams} diagram(s) were left out — diagram export to PPTX is coming in a later update."
+            "{diagrams} diagram(s) had no rendered snapshot and were left out — export from the app (not the CLI) to include them."
         ));
     }
     Ok((buf.into_inner(), warnings))
@@ -192,14 +179,24 @@ struct ExportStats {
     fetch_failed: usize,
     /// Image chunks in a format PowerPoint can't embed (WEBP/SVG/unknown).
     unsupported_format: usize,
-    /// Images dropped because the slide already had one (one image per slide).
+    /// Visuals dropped because the slide already showed `MAX_VISUALS` of them.
     extra_images: usize,
+    /// Visuals dropped because the slide's layout has no image area.
+    layout_dropped: usize,
     /// Slides whose estimated bullet text likely overflows the body box.
     overflow_slides: usize,
 }
 
 fn is_text(c: &Chunk) -> bool {
     c.metadata.chunk_type == CHUNK_TYPE_TEXT
+}
+
+/// A diagram chunk carrying a rendered snapshot (see `ChunkMetadata::rendered_image`).
+fn has_rendered_image(c: &Chunk) -> bool {
+    c.metadata
+        .rendered_image
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
 }
 
 fn build_slide(
@@ -235,14 +232,66 @@ fn build_slide(
             .map(|c| c.content.clone())
             .collect(),
     };
-    let imgs: Vec<&Chunk> = slide.chunks.iter().filter(|c| c.is_image()).collect();
+    // The slide's "visuals": image chunks with non-empty content, plus diagram
+    // chunks carrying a rendered snapshot (`renderedImage`, injected by the
+    // frontend at export time), ordered by (slot ?? MAX) then document order
+    // (stable sort). MUST stay identical to the preview grid in
+    // `SlideEditor.tsx` — an empty content string (e.g. a remote fetch that
+    // already failed and was cleared — see `decode_image`) is NOT a visual, so
+    // it never reserves a blank image region the frontend doesn't show.
+    let mut visuals: Vec<(&Chunk, &str)> = slide
+        .chunks
+        .iter()
+        .filter_map(|c| {
+            if c.is_image() && !c.content.trim().is_empty() {
+                Some((c, c.content.as_str()))
+            } else if c.is_diagram() {
+                c.metadata
+                    .rendered_image
+                    .as_deref()
+                    .filter(|r| !r.trim().is_empty())
+                    .map(|r| (c, r))
+            } else {
+                None
+            }
+        })
+        .collect();
+    visuals.sort_by_key(|(c, _)| c.metadata.slot.unwrap_or(u32::MAX));
+    // Image chunks whose content is empty aren't visuals but must still be
+    // surfaced as failures, not silently lost (A7).
+    let empty_images = slide
+        .chunks
+        .iter()
+        .filter(|c| c.is_image() && c.content.trim().is_empty())
+        .count();
+    let has_visuals = !visuals.is_empty();
+    // Non-section layouts push their content down by a fixed subtitle-box
+    // height when an explicit subtitle is set (mirrors the frontend, where
+    // the subtitle is its own full-width element in normal document flow,
+    // ABOVE the bullets/image — not merged into their box). `section` has its
+    // own separately-sized Subtitle box below and ignores this.
+    let content_y = BODY_Y + if subtitle_text.is_some() { SUBTITLE_H } else { 0 };
+    let content_avail_h = SLIDE_H - content_y - MARGIN;
 
     // A7: estimate whether the bullets overflow the body box (bullet layouts
     // only). A char-count heuristic — approximate, but enough to warn the user
-    // that text may be clipped so they can split the slide.
+    // that text may be clipped so they can split the slide. Only counts a
+    // layout's narrower/shorter box when it's actually rendered that way (i.e.
+    // a visual shows) — see the no-visual fallback in the layout match below,
+    // which renders full-width instead.
     if slide.layout != "section" {
-        let cpl = if slide.layout == "title-image" { 60 } else { 110 };
-        let mut lines: usize = bullet_texts
+        let (cpl, base_max_lines): (usize, usize) = match slide.layout.as_str() {
+            "title-image" | "title-image-left" if has_visuals => (60, 14),
+            "image-top" if has_visuals => (110, 6),
+            _ => (110, 14),
+        };
+        // Scale down proportionally to how much a subtitle box shrank this
+        // layout's available height, instead of a flat +1 line — the subtitle
+        // no longer shares the bullets' own box, so it no longer costs the
+        // bullets a line of THEIR box; it costs them a share of the height.
+        let base_avail = SLIDE_H - BODY_Y - MARGIN;
+        let max_lines = ((base_max_lines as i64) * content_avail_h / base_avail).max(1) as usize;
+        let lines: usize = bullet_texts
             .iter()
             .map(|t| {
                 let n = t.trim().chars().count();
@@ -253,24 +302,12 @@ fn build_slide(
                 }
             })
             .sum();
-        if subtitle_text.is_some() {
-            lines += 1;
-        }
-        if lines > 14 {
+        if lines > max_lines {
             stats.overflow_slides += 1;
         }
     }
 
-    // The bullet body, with an optional leading subtitle line on content layouts.
     let bullets_only: String = bullet_texts.iter().map(|t| bullet_para(t)).collect();
-    let body_with_subtitle = || -> String {
-        let mut b = String::new();
-        if let Some(sub) = &subtitle_text {
-            b.push_str(&subtitle_para(sub));
-        }
-        b.push_str(&bullets_only);
-        b
-    };
 
     match slide.layout.as_str() {
         "section" => {
@@ -301,78 +338,250 @@ fn build_slide(
                 ));
             }
         }
-        "title-image" => {
+        "title-image" | "title-image-left" => {
             if let Some(h) = &heading {
                 shapes.push_str(&title_box(sid, h));
                 sid += 1;
             }
-            let body_cx = (SLIDE_W - 2 * MARGIN) * 55 / 100;
-            shapes.push_str(&text_box(
-                sid,
-                "Body",
-                MARGIN,
-                BODY_Y,
-                body_cx,
-                SLIDE_H - BODY_Y - MARGIN,
-                &body_with_subtitle(),
-            ));
-            sid += 1;
-            // Only the first image fits this layout; count any extras as dropped.
-            if imgs.len() > 1 {
-                stats.extra_images += imgs.len() - 1;
+            sid = push_subtitle_box(&mut shapes, sid, &subtitle_text);
+            if !has_visuals {
+                // No visual shows yet — render full-width, same as
+                // "title-content". Mirrors the frontend (`SlideContent`), which
+                // only reserves the image column when a visual actually shows,
+                // so preview and export never disagree about a blank column. A
+                // present-but-content-empty image chunk still gets counted
+                // below so its failure is surfaced, not silently dropped (A7).
+                shapes.push_str(&text_box(
+                    sid,
+                    "Body",
+                    MARGIN,
+                    content_y,
+                    SLIDE_W - 2 * MARGIN,
+                    content_avail_h,
+                    &bullets_only,
+                ));
+            } else {
+                let body_cx = (SLIDE_W - 2 * MARGIN) * 55 / 100;
+                let gap = 400_050;
+                let image_cx = SLIDE_W - 2 * MARGIN - body_cx - gap;
+                // "-left" mirrors the box positions; sizes stay the same either way.
+                let (body_x, image_x) = if slide.layout == "title-image-left" {
+                    (MARGIN + image_cx + gap, MARGIN)
+                } else {
+                    (MARGIN, MARGIN + body_cx + gap)
+                };
+                shapes.push_str(&text_box(
+                    sid,
+                    "Body",
+                    body_x,
+                    content_y,
+                    body_cx,
+                    content_avail_h,
+                    &bullets_only,
+                ));
+                sid += 1;
+                let region = Rect { x: image_x, y: content_y, cx: image_cx, cy: content_avail_h };
+                let (pic_shapes, embedded, _sid) =
+                    embed_visuals(&visuals, sid, region, false, media_counter, stats);
+                shapes.push_str(&pic_shapes);
+                images.extend(embedded);
             }
-            if let Some(img) = imgs.first() {
-                match decode_image(&img.content) {
-                    // Empty/cleared content = a remote fetch that failed earlier.
-                    None => stats.fetch_failed += 1,
-                    Some(bytes) => match image_ext(&bytes) {
-                        None => stats.unsupported_format += 1,
-                        Some((ext, _kind)) => {
-                            *media_counter += 1;
-                            let rid = "rId2".to_string(); // single image rel per slide
-                            let file = format!("image{}.{}", media_counter, ext);
-                            // Fit inside the right-hand box, preserving aspect ratio.
-                            let box_x = MARGIN + body_cx + 400_050;
-                            let box_y = BODY_Y;
-                            let box_cx = SLIDE_W - MARGIN - box_x;
-                            let box_cy = SLIDE_H - BODY_Y - MARGIN;
-                            let (x, y, cx, cy) = fit(&bytes, box_x, box_y, box_cx, box_cy);
-                            shapes.push_str(&picture(sid, &rid, x, y, cx, cy));
-                            images.push(SlideImage { rid, file, bytes });
-                        }
-                    },
-                }
+        }
+        "image-top" => {
+            if let Some(h) = &heading {
+                shapes.push_str(&title_box(sid, h));
+                sid += 1;
+            }
+            sid = push_subtitle_box(&mut shapes, sid, &subtitle_text);
+            if !has_visuals {
+                // Same no-visual(-showing) fallback as title-image(-left) above.
+                shapes.push_str(&text_box(
+                    sid,
+                    "Body",
+                    MARGIN,
+                    content_y,
+                    SLIDE_W - 2 * MARGIN,
+                    content_avail_h,
+                    &bullets_only,
+                ));
+            } else {
+                let image_cy = content_avail_h * 45 / 100;
+                let gap = 160_020;
+                let body_y = content_y + image_cy + gap;
+                let body_cy = SLIDE_H - MARGIN - body_y;
+                let region = Rect { x: MARGIN, y: content_y, cx: SLIDE_W - 2 * MARGIN, cy: image_cy };
+                let (pic_shapes, embedded, next_sid) =
+                    embed_visuals(&visuals, sid, region, true, media_counter, stats);
+                shapes.push_str(&pic_shapes);
+                sid = next_sid;
+                images.extend(embedded);
+                shapes.push_str(&text_box(
+                    sid,
+                    "Body",
+                    MARGIN,
+                    body_y,
+                    SLIDE_W - 2 * MARGIN,
+                    body_cy,
+                    &bullets_only,
+                ));
             }
         }
         _ => {
-            // "title-content": title (+ optional subtitle) + full-width bullets
+            // "title-content": title (+ optional subtitle box) + full-width bullets
             if let Some(h) = &heading {
                 shapes.push_str(&title_box(sid, h));
                 sid += 1;
             }
+            sid = push_subtitle_box(&mut shapes, sid, &subtitle_text);
             shapes.push_str(&text_box(
                 sid,
                 "Body",
                 MARGIN,
-                BODY_Y,
+                content_y,
                 SLIDE_W - 2 * MARGIN,
-                SLIDE_H - BODY_Y - MARGIN,
-                &body_with_subtitle(),
+                content_avail_h,
+                &bullets_only,
             ));
         }
     }
 
-    // Images on a layout that doesn't render them (a section/title-content slide
-    // whose layout was overridden) are dropped — surface that rather than lose
-    // them silently (A7).
-    if slide.layout != "title-image" && !imgs.is_empty() {
-        stats.extra_images += imgs.len();
+    // Visuals on a layout that doesn't render them (a section/title-content
+    // slide) are dropped — surface that rather than lose them silently (A7).
+    // Image-capable layouts instead surface their content-empty image chunks
+    // (a remote fetch that already failed) as failed downloads.
+    let renders_image = matches!(
+        slide.layout.as_str(),
+        "title-image" | "title-image-left" | "image-top"
+    );
+    if renders_image {
+        stats.fetch_failed += empty_images;
+    } else {
+        stats.layout_dropped += visuals.len() + empty_images;
     }
 
     let sp_tree = format!(
         r#"<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>{shapes}"#
     );
     (sp_tree, images)
+}
+
+/// An EMU box (position + size) — groups the 4 geometry args that every
+/// layout's image/text boxes pass around, so functions placing a shape don't
+/// need one parameter per coordinate.
+#[derive(Clone, Copy)]
+struct Rect {
+    x: i64,
+    y: i64,
+    cx: i64,
+    cy: i64,
+}
+
+/// How many columns × rows the image region splits into for `n` visuals
+/// (n ≤ `MAX_VISUALS`). `band` is true for the wide image-top strip, false for
+/// the tall side column of title-image(-left). MUST stay identical to the
+/// preview grid in `SlideEditor.tsx` (multi-image grid contract).
+fn grid_dims(band: bool, n: usize) -> (usize, usize) {
+    if band {
+        match n {
+            1 => (1, 1),
+            2 => (2, 1),
+            3 | 4 => (2, 2),
+            _ => (3, 2),
+        }
+    } else {
+        match n {
+            1 => (1, 1),
+            2 => (1, 2),
+            3 | 4 => (2, 2),
+            _ => (2, 3),
+        }
+    }
+}
+
+/// The `idx`-th (row-major) cell of `region` split into `cols` × `rows` with an
+/// `IMAGE_GRID_GAP` gutter between cells.
+fn grid_cell(region: Rect, cols: usize, rows: usize, idx: usize) -> Rect {
+    let (cols_i, rows_i) = (cols as i64, rows as i64);
+    let cw = (region.cx - (cols_i - 1) * IMAGE_GRID_GAP) / cols_i;
+    let ch = (region.cy - (rows_i - 1) * IMAGE_GRID_GAP) / rows_i;
+    let (col, row) = ((idx % cols) as i64, (idx / cols) as i64);
+    Rect {
+        x: region.x + col * (cw + IMAGE_GRID_GAP),
+        y: region.y + row * (ch + IMAGE_GRID_GAP),
+        cx: cw,
+        cy: ch,
+    }
+}
+
+/// Embed a slide's visuals inside `region`, subdividing it into the grid the
+/// multi-image contract prescribes and aspect-fitting each image inside its
+/// cell (`fit`). Shared by every image-capable layout (title-image,
+/// title-image-left, image-top) so their region geometry is the only thing
+/// that differs between them. Visuals beyond `MAX_VISUALS` are counted as
+/// dropped extras; an undecodable/unsupported visual is counted and produces
+/// no shape (A7 — always surfaced, never silently dropped), leaving its cell
+/// empty. Returns the `<p:pic>` shapes XML, the media assets to write (each
+/// with its own per-slide rel id: rId2, rId3, ...), and the next free shape id.
+fn embed_visuals(
+    visuals: &[(&Chunk, &str)],
+    mut sid: u32,
+    region: Rect,
+    band: bool,
+    media_counter: &mut usize,
+    stats: &mut ExportStats,
+) -> (String, Vec<SlideImage>, u32) {
+    if visuals.len() > MAX_VISUALS {
+        stats.extra_images += visuals.len() - MAX_VISUALS;
+    }
+    let shown = visuals.len().min(MAX_VISUALS);
+    let (cols, rows) = grid_dims(band, shown);
+    let mut shapes = String::new();
+    let mut images: Vec<SlideImage> = Vec::new();
+    for (idx, (_chunk, payload)) in visuals.iter().take(MAX_VISUALS).enumerate() {
+        let Some(bytes) = decode_image(payload) else {
+            stats.fetch_failed += 1;
+            continue;
+        };
+        let Some((ext, _kind)) = image_ext(&bytes) else {
+            stats.unsupported_format += 1;
+            continue;
+        };
+        *media_counter += 1;
+        // rId1 is the slide-layout rel; images take rId2, rId3, ... per slide.
+        let rid = format!("rId{}", 2 + images.len());
+        let file = format!("image{}.{}", media_counter, ext);
+        let cell = grid_cell(region, cols, rows, idx);
+        let (x, y, cx, cy) = fit(&bytes, cell.x, cell.y, cell.cx, cell.cy);
+        shapes.push_str(&picture(sid, &rid, x, y, cx, cy));
+        sid += 1;
+        images.push(SlideImage { rid, file, bytes });
+    }
+    (shapes, images, sid)
+}
+
+/// Push a full-width Subtitle shape right after the title, when an explicit
+/// subtitle is set; returns the next free shape id (unchanged when there's no
+/// subtitle). Shared by every non-section layout — `section` has its own,
+/// differently-positioned Subtitle box (see the "section" match arm) and
+/// doesn't call this. The subtitle is its OWN shape rather than folded into
+/// the bullets' text box so it renders full-width, above the bullets/image,
+/// matching the frontend's normal document flow.
+fn push_subtitle_box(shapes: &mut String, sid: u32, subtitle: &Option<String>) -> u32 {
+    match subtitle {
+        None => sid,
+        Some(sub) => {
+            shapes.push_str(&text_box(
+                sid,
+                "Subtitle",
+                MARGIN,
+                BODY_Y,
+                SLIDE_W - 2 * MARGIN,
+                SUBTITLE_H,
+                &subtitle_para(sub),
+            ));
+            sid + 1
+        }
+    }
 }
 
 // ----- shape / run builders -------------------------------------------------
@@ -455,118 +664,6 @@ fn picture(id: u32, rid: &str, x: i64, y: i64, cx: i64, cy: i64) -> String {
     format!(
         r#"<p:pic><p:nvPicPr><p:cNvPr id="{id}" name="Image {id}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>"#
     )
-}
-
-// ----- images ---------------------------------------------------------------
-
-/// Decode an image chunk's `content` (a `data:...;base64,` URL, or bare base64).
-fn decode_image(content: &str) -> Option<Vec<u8>> {
-    let b64 = match content.find("base64,") {
-        Some(i) => &content[i + "base64,".len()..],
-        None => content,
-    };
-    let b64 = b64.trim();
-    if b64.is_empty() {
-        return None; // e.g. a remote image whose fetch failed (content cleared)
-    }
-    base64::engine::general_purpose::STANDARD.decode(b64).ok()
-}
-
-/// Detect file extension + content kind from magic bytes, limited to the raster
-/// formats PowerPoint embeds reliably (PNG/JPEG/GIF/BMP). Returns `None` for
-/// anything else (WEBP, SVG, unknown) so the caller skips it and warns, instead
-/// of writing mismatched bytes under a `.png` name that opens as a broken image
-/// (B5).
-fn image_ext(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
-    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
-        Some(("png", "image/png"))
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some(("jpeg", "image/jpeg"))
-    } else if bytes.starts_with(b"GIF8") {
-        // GIF87a and GIF89a both begin "GIF8".
-        Some(("gif", "image/gif"))
-    } else if bytes.starts_with(&[0x42, 0x4D]) {
-        Some(("bmp", "image/bmp"))
-    } else {
-        None
-    }
-}
-
-/// Pixel dimensions for PNG / JPEG, used to preserve aspect ratio on export.
-fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    // PNG: 8-byte sig, then IHDR with width@16 height@20 (big-endian).
-    if bytes.len() >= 24 && bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-        if w > 0 && h > 0 {
-            return Some((w, h));
-        }
-    }
-    // JPEG: walk segment markers to a Start-Of-Frame (SOFn).
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        let mut i = 2;
-        while i + 9 < bytes.len() {
-            if bytes[i] != 0xFF {
-                i += 1;
-                continue;
-            }
-            let marker = bytes[i + 1];
-            // SOF0..SOF15 carry the frame size, excluding DHT/JPG/DAC/RST/markers.
-            let is_sof = (0xC0..=0xCF).contains(&marker)
-                && marker != 0xC4
-                && marker != 0xC8
-                && marker != 0xCC;
-            if is_sof {
-                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
-                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
-                if w > 0 && h > 0 {
-                    return Some((w, h));
-                }
-                return None;
-            }
-            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
-            if len < 2 {
-                break;
-            }
-            i += 2 + len;
-        }
-    }
-    // GIF: logical-screen width@6 / height@8 (little-endian u16).
-    if bytes.len() >= 10 && bytes.starts_with(b"GIF8") {
-        let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
-        let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
-        if w > 0 && h > 0 {
-            return Some((w, h));
-        }
-    }
-    // BMP: BITMAPINFOHEADER width@18 / height@22 (little-endian i32; height may
-    // be negative for a top-down bitmap).
-    if bytes.len() >= 26 && bytes.starts_with(&[0x42, 0x4D]) {
-        let w = i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]);
-        // `unsigned_abs` (not `abs`) so a crafted height of i32::MIN doesn't
-        // overflow/panic on attacker-controlled image bytes.
-        let h = i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]).unsigned_abs();
-        if w > 0 && h > 0 {
-            return Some((w as u32, h));
-        }
-    }
-    None
-}
-
-/// Fit an image inside a box (EMU), preserving aspect ratio and centering it.
-/// Returns `(x, y, cx, cy)`.
-fn fit(bytes: &[u8], box_x: i64, box_y: i64, box_cx: i64, box_cy: i64) -> (i64, i64, i64, i64) {
-    let (iw, ih) = image_size(bytes).unwrap_or((16, 9));
-    let (iw, ih) = (iw as i64, ih as i64);
-    // Compare aspect ratios via cross-multiplication (avoid float).
-    let (cx, cy) = if iw * box_cy > ih * box_cx {
-        (box_cx, box_cx * ih / iw) // width-bound
-    } else {
-        (box_cy * iw / ih, box_cy) // height-bound
-    };
-    let x = box_x + (box_cx - cx) / 2;
-    let y = box_y + (box_cy - cy) / 2;
-    (x, y, cx, cy)
 }
 
 // ----- per-slide XML --------------------------------------------------------
@@ -669,7 +766,7 @@ const THEME: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 fn core_xml(title: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>{title}</dc:title><dc:creator>aixTextEditor</dc:creator><cp:lastModifiedBy>aixTextEditor</cp:lastModifiedBy></cp:coreProperties>"#,
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>{title}</dc:title><dc:creator>NurumayuFacet</dc:creator><cp:lastModifiedBy>NurumayuFacet</cp:lastModifiedBy></cp:coreProperties>"#,
         title = esc(title)
     )
 }
@@ -677,7 +774,7 @@ fn core_xml(title: &str) -> String {
 fn app_xml(n_slides: usize) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>aixTextEditor</Application><Slides>{n}</Slides><PresentationFormat>Widescreen</PresentationFormat></Properties>"#,
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>NurumayuFacet</Application><Slides>{n}</Slides><PresentationFormat>Widescreen</PresentationFormat></Properties>"#,
         n = n_slides
     )
 }
@@ -736,17 +833,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fit_preserves_aspect_within_box() {
-        // 480x270 (16:9) PNG header bytes are enough for image_size.
-        let mut png = vec![0x89, b'P', b'N', b'G', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        png.extend_from_slice(&480u32.to_be_bytes());
-        png.extend_from_slice(&270u32.to_be_bytes());
-        let (_, _, cx, cy) = fit(&png, 0, 0, 4_000_000, 4_000_000);
-        // width-bound: cy/cx should be ~270/480
-        assert!((cx as f64 * 270.0 / 480.0 - cy as f64).abs() < 2.0);
-    }
-
     // ----- B1: control-character stripping -----
 
     #[test]
@@ -789,41 +875,9 @@ mod tests {
         }
     }
 
-    // ----- B5: image format detection -----
-
-    #[test]
-    fn image_ext_recognizes_embeddable_formats() {
-        assert_eq!(image_ext(&[0x89, 0x50, 0x4E, 0x47, 1, 2]), Some(("png", "image/png")));
-        assert_eq!(image_ext(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(("jpeg", "image/jpeg")));
-        assert_eq!(image_ext(b"GIF89a..."), Some(("gif", "image/gif")));
-        assert_eq!(image_ext(b"GIF87a..."), Some(("gif", "image/gif")));
-        assert_eq!(image_ext(&[0x42, 0x4D, 1, 2]), Some(("bmp", "image/bmp")));
-    }
-
-    #[test]
-    fn image_ext_skips_unsupported() {
-        // WEBP (RIFF....WEBP), SVG-ish text, and junk are not embeddable.
-        let webp = [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50];
-        assert_eq!(image_ext(&webp), None);
-        assert_eq!(image_ext(b"<svg xmlns=..."), None);
-        assert_eq!(image_ext(&[0, 1, 2, 3]), None);
-    }
-
-    #[test]
-    fn image_size_parses_gif_and_bmp() {
-        let mut gif = b"GIF89a".to_vec();
-        gif.extend_from_slice(&4u16.to_le_bytes()); // width
-        gif.extend_from_slice(&2u16.to_le_bytes()); // height
-        assert_eq!(image_size(&gif), Some((4, 2)));
-
-        let mut bmp = vec![0x42u8, 0x4D];
-        bmp.extend_from_slice(&[0u8; 16]); // up to offset 18
-        bmp.extend_from_slice(&4i32.to_le_bytes()); // width @18
-        bmp.extend_from_slice(&2i32.to_le_bytes()); // height @22
-        assert_eq!(image_size(&bmp), Some((4, 2)));
-    }
-
     // ----- B5 / A7: embed + warning integration -----
+    // (image_ext / image_size / fit unit tests moved to `imageio.rs` with the
+    // functions themselves.)
 
     fn data_url(mime: &str, bytes: &[u8]) -> String {
         use base64::Engine;
@@ -870,11 +924,128 @@ mod tests {
     }
 
     #[test]
-    fn two_images_warns_extra_and_embeds_one() {
+    fn two_images_both_embed_with_distinct_rel_ids() {
         let mut doc = Document::new("D");
         doc.chunks.push(Chunk::new_heading(0, 1, "Pic"));
         doc.chunks.push(image_chunk(1, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
         doc.chunks.push(image_chunk(2, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        let deck = document_to_deck(&doc);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let media = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .filter(|n| n.starts_with("ppt/media/"))
+            .count();
+        assert_eq!(media, 2, "both images should embed");
+        use std::io::Read;
+        let mut rels = String::new();
+        zip.by_name("ppt/slides/_rels/slide1.xml.rels")
+            .unwrap()
+            .read_to_string(&mut rels)
+            .unwrap();
+        assert!(rels.contains(r#"Id="rId2""#) && rels.contains(r#"Id="rId3""#),
+            "each image needs its own rel id: {rels}");
+    }
+
+    /// The `(x, y)` of each `<p:pic>`'s `<a:off>`, in document order.
+    fn pic_offsets(xml: &str) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        let mut rest = xml;
+        while let Some(start) = rest.find("<p:pic>") {
+            let end = rest[start..].find("</p:pic>").map(|i| start + i).unwrap();
+            let block = &rest[start..end];
+            let x0 = block.find(r#"<a:off x=""#).unwrap() + r#"<a:off x=""#.len();
+            let x1 = block[x0..].find('"').unwrap() + x0;
+            let y0 = block[x1..].find(r#"y=""#).unwrap() + x1 + 3;
+            let y1 = block[y0..].find('"').unwrap() + y0;
+            out.push((block[x0..x1].parse().unwrap(), block[y0..y1].parse().unwrap()));
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn two_images_stack_vertically_in_the_side_column() {
+        // Column region, n=2 → 1 col × 2 rows: identical images land at the
+        // same x, one cell pitch (cell height + gap) apart vertically.
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Pic"));
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        doc.chunks.push(image_chunk(2, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        doc.chunks.push(image_chunk(3, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        let xml = slide1_xml(&doc);
+        let pics = pic_offsets(&xml);
+        assert_eq!(pics.len(), 2, "both pictures should render: {xml}");
+        let avail_h = SLIDE_H - BODY_Y - MARGIN;
+        let cell_h = (avail_h - IMAGE_GRID_GAP) / 2;
+        assert_eq!(pics[0].0, pics[1].0, "stacked cells share the same x: {pics:?}");
+        assert_eq!(
+            pics[1].1 - pics[0].1,
+            cell_h + IMAGE_GRID_GAP,
+            "second image should sit one cell pitch below the first: {pics:?}"
+        );
+    }
+
+    #[test]
+    fn three_images_form_a_two_by_two_grid_row_major() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Pics"));
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        for i in 0..3 {
+            doc.chunks.push(image_chunk(i + 2, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        }
+        let xml = slide1_xml(&doc);
+        let pics = pic_offsets(&xml);
+        assert_eq!(pics.len(), 3, "all three pictures should render: {xml}");
+        // Row-major: first two share the top row; the third starts the second
+        // row back in the first column (the fourth cell stays empty).
+        assert_eq!(pics[0].1, pics[1].1, "row 1 shares a y: {pics:?}");
+        assert!(pics[1].0 > pics[0].0, "second image sits in column 2: {pics:?}");
+        assert!(pics[2].1 > pics[0].1, "third image starts row 2: {pics:?}");
+        assert_eq!(pics[2].0, pics[0].0, "third image returns to column 1: {pics:?}");
+    }
+
+    #[test]
+    fn diagram_with_rendered_snapshot_embeds_as_an_image() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Graph");
+        h.metadata.layout = Some("title-image".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "explains the graph"));
+        let mut d = Chunk::new_diagram(2, "graph TD; A-->B;", "mermaid");
+        d.metadata.rendered_image = Some(data_url("image/png", b"\x89PNG\r\n\x1a\n"));
+        doc.chunks.push(d);
+        let deck = document_to_deck(&doc);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "a snapshot-carrying diagram must not warn: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let parts: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(parts.iter().any(|n| n == "ppt/media/image1.png"), "snapshot not embedded: {parts:?}");
+    }
+
+    #[test]
+    fn diagram_without_snapshot_warns_about_the_missing_render() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Graph"));
+        doc.chunks.push(Chunk::new_diagram(1, "graph TD; A-->B;", "mermaid"));
+        let deck = document_to_deck(&doc);
+        let (_bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(
+            warnings.iter().any(|w| w.contains("rendered snapshot")),
+            "expected a no-snapshot diagram warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn seven_visuals_embed_six_and_warn() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Wall"));
+        for i in 0..7 {
+            doc.chunks.push(image_chunk(i + 1, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        }
         let deck = document_to_deck(&doc);
         let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
@@ -882,8 +1053,38 @@ mod tests {
             .map(|i| zip.by_index(i).unwrap().name().to_string())
             .filter(|n| n.starts_with("ppt/media/"))
             .count();
-        assert_eq!(media, 1, "exactly one image should embed");
-        assert!(warnings.iter().any(|w| w.contains("extra")), "expected an extra-image warning: {warnings:?}");
+        assert_eq!(media, 6, "only the first 6 visuals embed");
+        assert!(
+            warnings.iter().any(|w| w.contains("first 6")),
+            "expected an extras warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn slot_orders_visuals_before_document_order() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Pic"));
+        let mut png = image_chunk(1, data_url("image/png", b"\x89PNG\r\n\x1a\n"));
+        png.metadata.slot = Some(2);
+        let mut gif = image_chunk(2, data_url("image/gif", b"GIF89a\x04\x00\x02\x00\x80\x00\x00"));
+        gif.metadata.slot = Some(1);
+        doc.chunks.push(png);
+        doc.chunks.push(gif);
+        let deck = document_to_deck(&doc);
+        let (bytes, _w) = deck_to_pptx(&deck).expect("build");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        use std::io::Read;
+        let mut rels = String::new();
+        zip.by_name("ppt/slides/_rels/slide1.xml.rels")
+            .unwrap()
+            .read_to_string(&mut rels)
+            .unwrap();
+        // The gif (slot 1) renders first despite coming second in the document,
+        // so it takes the first image rel (rId2) and the first media slot.
+        assert!(
+            rels.contains(r#"Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.gif""#),
+            "slot order should beat document order: {rels}"
+        );
     }
 
     fn slide1_xml(doc: &Document) -> String {
@@ -935,5 +1136,210 @@ mod tests {
         let deck = document_to_deck(&doc);
         let (_b, warnings) = deck_to_pptx(&deck).expect("build");
         assert!(warnings.iter().any(|w| w.contains("cut off")), "expected an overflow warning: {warnings:?}");
+    }
+
+    // ----- new layouts: title-image-left / image-top, and the no-image WYSIWYG fix -----
+
+    fn full_body_cx() -> i64 {
+        SLIDE_W - 2 * MARGIN
+    }
+
+    /// The `<p:sp>...</p:sp>` block for the shape named `name`, so assertions
+    /// can check ITS geometry specifically — a bare `xml.contains(...)` can be
+    /// satisfied by an unrelated shape (e.g. the Title box, which happens to
+    /// share the full-slide-width cx with a correctly-full-width Body box).
+    fn shape_xml<'a>(xml: &'a str, name: &str) -> &'a str {
+        let marker = format!(r#"name="{name}""#);
+        let start = xml.find(&marker).unwrap_or_else(|| panic!("no shape named {name}: {xml}"));
+        let end = xml[start..].find("</p:sp>").map(|i| start + i).unwrap();
+        &xml[start..end]
+    }
+
+    #[test]
+    fn title_image_without_an_image_renders_full_width_not_a_blank_column() {
+        // Regression: the layout used to reserve the narrow 55% body box even
+        // when the slide had no image chunk at all, leaving dead space on the
+        // right in the exported file while the live preview (which only
+        // narrows when an image chunk exists) showed full width. Both must
+        // agree. Scoped to the Body shape itself — the Title box always spans
+        // the full width regardless of the Body box's own (bug's) width, so a
+        // whole-document substring check would pass even with the bug back.
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "No picture yet");
+        h.metadata.layout = Some("title-image".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        let xml = slide1_xml(&doc);
+        let body = shape_xml(&xml, "Body");
+        assert!(
+            body.contains(&format!(r#"cx="{}""#, full_body_cx())),
+            "expected a full-width Body box: {body}"
+        );
+    }
+
+    #[test]
+    fn title_image_left_places_image_on_the_left() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Left image");
+        h.metadata.layout = Some("title-image-left".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        doc.chunks
+            .push(image_chunk(2, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].layout, "title-image-left");
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        assert!(
+            (0..zip.len())
+                .map(|i| zip.by_index(i).unwrap().name().to_string())
+                .any(|n| n == "ppt/media/image1.png"),
+            "image not embedded"
+        );
+        use std::io::Read;
+        let mut xml = String::new();
+        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        // The picture shape itself (not just the title, which also starts at
+        // MARGIN) must be flush against the left margin.
+        let pic_start = xml.find("<p:pic>").expect("no picture shape");
+        let pic_end = xml[pic_start..].find("</p:pic>").map(|i| pic_start + i).unwrap();
+        let pic_xml = &xml[pic_start..pic_end];
+        assert!(pic_xml.contains(&format!(r#"x="{MARGIN}""#)), "image should be flush left: {pic_xml}");
+        // The bullet body sits to the image's right (a larger x-offset). Mirror
+        // the exact formula build_slide uses, not an approximation.
+        let body_cx = full_body_cx() * 55 / 100;
+        let gap = 400_050;
+        let image_cx = full_body_cx() - body_cx - gap;
+        let body_x = MARGIN + image_cx + gap;
+        assert!(
+            xml.contains(&format!(r#"name="Body"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="{body_x}""#)),
+            "expected the Body text box to start at x={body_x}: {xml}"
+        );
+    }
+
+    #[test]
+    fn image_top_stacks_image_above_bullets() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Banner image");
+        h.metadata.layout = Some("image-top".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "explains the picture above"));
+        doc.chunks
+            .push(image_chunk(2, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        let deck = document_to_deck(&doc);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        use std::io::Read;
+        let mut xml = String::new();
+        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        assert!(xml.contains("<p:pic>"), "image not embedded: {xml}");
+        assert!(xml.contains("explains the picture above"), "bullet missing: {xml}");
+        // The image band starts at the top of the body area (y = BODY_Y); the
+        // bullet text box starts further down, below the image band — i.e. the
+        // image is stacked ABOVE the bullets, not beside them.
+        let avail = SLIDE_H - BODY_Y - MARGIN;
+        let image_cy = avail * 45 / 100;
+        let body_y = BODY_Y + image_cy + 160_020;
+        assert!(xml.contains(&format!(r#"y="{BODY_Y}""#)), "image band should start at BODY_Y: {xml}");
+        assert!(xml.contains(&format!(r#"y="{body_y}""#)), "bullet box should start below the image band: {xml}");
+    }
+
+    #[test]
+    fn unknown_legacy_layout_falls_back_gracefully() {
+        // normalize() resets unknown layout strings to auto-pick before export
+        // ever sees them (models.rs known_layouts); document_to_deck's own
+        // fallback (the `_` match arm) covers any value that slips through.
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "T"));
+        doc.chunks.push(Chunk::new_text(1, "body"));
+        let mut deck = document_to_deck(&doc);
+        deck.slides[0].layout = "some-future-layout".to_string();
+        let (_bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    // ----- subtitle is its own full-width shape, not folded into the bullets -----
+    // (WYSIWYG parity fix: SlideEditor.tsx has always rendered the subtitle as a
+    // separate element above the bullets/image; pptx.rs used to fold it into the
+    // SAME box as the bullets, disagreeing with the preview on both position and
+    // width whenever a slide had both a subtitle and an image.)
+
+    #[test]
+    fn subtitle_is_a_separate_shape_from_the_bullets_on_title_content() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Topic");
+        h.metadata.layout = Some("title-content".to_string());
+        doc.chunks.push(h);
+        let mut sub = Chunk::new_text(1, "The subtitle");
+        sub.metadata.subtitle = true;
+        doc.chunks.push(sub);
+        doc.chunks.push(Chunk::new_text(2, "A bullet"));
+        let xml = slide1_xml(&doc);
+        let subtitle_shape = shape_xml(&xml, "Subtitle");
+        assert!(subtitle_shape.contains("The subtitle"), "subtitle text missing from its own shape: {subtitle_shape}");
+        let body_shape = shape_xml(&xml, "Body");
+        assert!(!body_shape.contains("The subtitle"), "subtitle should not be folded into the Body box: {body_shape}");
+        assert!(body_shape.contains("A bullet"), "bullet missing from Body: {body_shape}");
+    }
+
+    #[test]
+    fn subtitle_stays_full_width_and_above_the_image_on_title_image_left() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Topic");
+        h.metadata.layout = Some("title-image-left".to_string());
+        doc.chunks.push(h);
+        let mut sub = Chunk::new_text(1, "The subtitle");
+        sub.metadata.subtitle = true;
+        doc.chunks.push(sub);
+        doc.chunks.push(Chunk::new_text(2, "A bullet"));
+        doc.chunks
+            .push(image_chunk(3, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        let xml = slide1_xml(&doc);
+        let subtitle_shape = shape_xml(&xml, "Subtitle");
+        // Full slide width, not the narrowed 55% bullets column.
+        assert!(
+            subtitle_shape.contains(&format!(r#"cx="{}""#, full_body_cx())),
+            "subtitle should span the full width: {subtitle_shape}"
+        );
+        assert!(
+            subtitle_shape.contains(&format!(r#"y="{BODY_Y}""#)),
+            "subtitle should sit right under the title, above the bullets/image row: {subtitle_shape}"
+        );
+        let body_shape = shape_xml(&xml, "Body");
+        assert!(!body_shape.contains("The subtitle"), "subtitle should not be folded into the Body box: {body_shape}");
+        // The bullets/image row starts BELOW the subtitle box.
+        let content_y = BODY_Y + SUBTITLE_H;
+        assert!(
+            body_shape.contains(&format!(r#"y="{content_y}""#)),
+            "Body box should start below the subtitle: {body_shape}"
+        );
+    }
+
+    #[test]
+    fn image_chunk_with_empty_content_renders_full_width_and_warns() {
+        // has_image gates on non-empty CONTENT (matching the frontend's
+        // `slideImage()` truthiness check), not mere chunk existence — an
+        // image chunk that exists but has empty content (e.g. a remote fetch
+        // that already failed) must not reserve a blank image column.
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Topic");
+        h.metadata.layout = Some("title-image".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        doc.chunks.push(image_chunk(2, String::new()));
+        let deck = document_to_deck(&doc);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.iter().any(|w| w.contains("downloaded")), "expected a failed-image warning: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        use std::io::Read;
+        let mut xml = String::new();
+        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        let body = shape_xml(&xml, "Body");
+        assert!(
+            body.contains(&format!(r#"cx="{}""#, full_body_cx())),
+            "expected a full-width Body box, not a blank image column: {body}"
+        );
     }
 }

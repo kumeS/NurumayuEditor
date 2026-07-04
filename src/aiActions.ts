@@ -3,13 +3,16 @@
 // Rust command, applies the result to the store, and surfaces errors as toasts.
 
 import { api } from "./api";
-import { useStore } from "./store";
-import type { AiAction, Chunk } from "./types";
+import { validateMermaid } from "./mermaidRender";
+import { groupSlides, slideBullets, slideImages, slideTitle } from "./slides";
+import { staleSummaryChunkIds, useStore } from "./store";
+import type { AiAction, Chunk, SlideLayout } from "./types";
 
-// T1 — whole-document context assembly. Caps keep the prompt bounded on long docs.
-const DOC_MAP_MAX_LINES = 60;
-const DOC_MAP_MAX_CHARS = 3000;
+// T1 — whole-document context assembly.
 const LINKED_MAX_CHARS = 2500;
+// Chunks with no summary contribute this many leading content chars to the doc
+// map instead, so the outline covers EVERY chunk (nothing silently omitted).
+const MAP_SNIPPET_CHARS = 120;
 
 /**
  * Assemble the context an AI action gets for a chunk. Beyond the immediate
@@ -57,11 +60,13 @@ function gatherContext(chunkId: string): {
     }
   }
 
-  // A compact whole-document outline: headings + any per-chunk summaries.
+  // A whole-document outline covering EVERY chunk (live context): headings as
+  // #/##/### lines, summarized chunks as their summary, and chunks WITHOUT a
+  // summary as their first ~120 content chars — so nothing is silently missing
+  // from the map the model sees.
   const lines: string[] = [];
-  let mapChars = 0;
   let hasContext = false;
-  for (let i = 0; i < chunks.length && lines.length < DOC_MAP_MAX_LINES; i++) {
+  for (let i = 0; i < chunks.length; i++) {
     if (i === idx) {
       lines.push("- «the paragraph you are editing»");
       continue;
@@ -73,11 +78,18 @@ function gatherContext(chunkId: string): {
       line = `${lvl} ${c.content.trim()}`;
     } else if (c.metadata.summary && c.metadata.summary.trim()) {
       line = `- ${c.metadata.summary.trim()}`;
+    } else {
+      const text = c.content.trim().replace(/\s+/g, " ");
+      if (text) {
+        line = `- ${
+          text.length > MAP_SNIPPET_CHARS
+            ? `${text.slice(0, MAP_SNIPPET_CHARS)}…`
+            : text
+        }`;
+      }
     }
     if (line) {
-      if (mapChars + line.length > DOC_MAP_MAX_CHARS) break;
       lines.push(line);
-      mapChars += line.length;
       hasContext = true;
     }
   }
@@ -137,10 +149,148 @@ function chunkStillActive(chunkId: string): boolean {
   return useStore.getState().doc.chunks.some((c) => c.id === chunkId);
 }
 
+// ---- Frontend cancel (item 22) --------------------------------------------
+// Chunk ids whose in-flight AI action the user stopped. NOTE: the HTTP request
+// itself is NOT aborted backend-side (v2.x) — the Rust command runs to
+// completion; cancelling stops painting stream deltas and discards the final
+// result when it arrives. The id is cleared when a NEW action starts on the
+// chunk, so a cancel never suppresses a later run.
+const canceledChunks = new Set<string>();
+
+/** Stop the in-flight AI action on a chunk and clear its busy/streaming UI. */
+export function cancelChunkAction(chunkId: string): void {
+  canceledChunks.add(chunkId);
+  const st = useStore.getState();
+  // The Stop affordance only renders on the ACTIVE tab's chunk, so clearing
+  // the active tab's in-flight state here is safe.
+  if (st.streamingChunkId === chunkId) st.endChunkStream();
+  st.setBusyChunk(chunkId, false);
+}
+
 /**
- * Slide AI: rewrite a slide's prose into concise bullet points. Takes the
- * slide's text-chunk ids, asks the model for short bullets, and replaces those
- * chunks with one text chunk per bullet (each bullet = its own slide line).
+ * Parse an LLM reply into bullet strings, tolerantly: strips code fences,
+ * drops preamble/postamble lines (blank or ending with ':'), and accepts '-',
+ * '•', '*', '–' and numbered ("1." / "1)") markers. If NOTHING in the reply is
+ * bullet-shaped, every remaining non-empty line is used instead — a model that
+ * answered without markers still yields usable bullets.
+ */
+export function parseBulletLines(raw: string): string[] {
+  const lines = raw
+    .split("\n")
+    .filter((l) => !/^\s*```/.test(l)) // drop code-fence delimiters
+    .map((l) => l.trim());
+  const bullets: string[] = [];
+  for (const line of lines) {
+    const m = /^(?:[-•*–]\s*|\d+[.)]\s+)(.+)$/.exec(line);
+    if (m && m[1].trim()) bullets.push(m[1].trim());
+  }
+  if (bullets.length) return bullets;
+  // Fallback: no bullet markers at all — keep the content lines, still
+  // dropping blanks and lead-in/lead-out lines like "Here are the bullets:".
+  return lines.filter((l) => l && !l.endsWith(":"));
+}
+
+/**
+ * Tolerantly extract the first JSON object from an LLM reply (mirrors the Rust
+ * extractor): strip code-fence lines, find the first '{', then scan to its
+ * balanced closing '}' — string-aware, so braces inside JSON strings (and
+ * escaped quotes) don't fool the depth counter. Returns the parsed value, or
+ * null when no parseable object is present.
+ */
+export function extractJsonObject(raw: string): unknown {
+  const text = raw
+    .split("\n")
+    .filter((l) => !/^\s*```/.test(l)) // drop code-fence delimiters
+    .join("\n");
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Live context (T2): re-summarize chunks whose `metadata.summary` no longer
+ * matches their content (hash mismatch — see `staleSummaryChunkIds`), so the
+ * doc map fed to the next AI action reflects the CURRENT text. Sequential, via
+ * the same non-streaming call the per-chunk Summarize action uses (deliberately
+ * NOT recursing through runChunkAction). Unchanged chunks are never touched —
+ * the hash equality short-circuits them. A failed chunk keeps its stale
+ * summary; one info toast covers all failures.
+ */
+async function refreshStaleSummaries(
+  excludeId: string | null,
+  tab: string
+): Promise<void> {
+  const st = useStore.getState();
+  if (!aiReady()) return;
+  const staleIds = staleSummaryChunkIds(st.doc).filter((id) => id !== excludeId);
+  if (staleIds.length === 0) return;
+  let failed = false;
+  try {
+    for (let i = 0; i < staleIds.length; i++) {
+      const cur = useStore.getState();
+      if (cur.activeTabId !== tab) break; // switched tabs — stop refreshing
+      const c = cur.doc.chunks.find((x) => x.id === staleIds[i]);
+      if (!c || !c.content.trim()) continue;
+      cur.setGlobalBusy(
+        `Refreshing AI context (${i + 1}/${staleIds.length})…`,
+        tab
+      );
+      try {
+        const summary = await api.aiProcess({
+          action: "summarize",
+          text: c.content,
+          outputLanguage: cur.settings?.defaultTargetLanguage,
+          tone: cur.settings?.writingTone || undefined,
+        });
+        if (useStore.getState().activeTabId !== tab) break;
+        // setChunkSummary re-stamps summaryHash, marking the chunk fresh.
+        useStore.getState().setChunkSummary(staleIds[i], summary);
+      } catch {
+        failed = true; // continue with the stale summary
+      }
+    }
+  } finally {
+    useStore.getState().setGlobalBusy(null, tab);
+  }
+  if (failed) {
+    useStore
+      .getState()
+      .notify("Some context summaries could not be refreshed", "info");
+  }
+}
+
+/**
+ * Rewrite one or more paragraphs' prose into concise bullet points, IN PLACE —
+ * replaces the given chunks with one text chunk per bullet (each bullet = its
+ * own paragraph/slide line). Unlike `summarizeSlide`, this edits the shared
+ * document text itself (also visible in Editor mode for a slide-mode doc), so
+ * it's a per-paragraph action (ChunkAiMenu) rather than a slide-toolbar one —
+ * keeping it separate from the non-destructive "Summarize → slide" avoids the
+ * two reading as one confusingly-overlapping feature.
  */
 export async function bulletizeChunks(ids: string[]): Promise<void> {
   const s = useStore.getState();
@@ -156,7 +306,7 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
     .filter((c) => idSet.has(c.id) && c.metadata.chunkType === "text" && c.content.trim())
     .map((c) => c.content.trim());
   if (!texts.length) {
-    s.notify("This slide has no text to bulletize.", "info");
+    s.notify("Nothing to bulletize.", "info");
     return;
   }
 
@@ -176,10 +326,7 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
       s.notify("Switched tabs — bulletize discarded.", "info");
       return;
     }
-    const lines = result
-      .split("\n")
-      .map((l) => l.replace(/^\s*[-•*]\s*/, "").trim())
-      .filter(Boolean);
+    const lines = parseBulletLines(result);
     if (!lines.length) {
       s.notify("The model returned no bullets.", "info");
       return;
@@ -221,10 +368,15 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
     const result = await api.aiProcess({
       action: "custom",
       text: texts.join("\n\n"),
+      // Item 25: presentation-MEANING bullets, not prose compression — a slide
+      // states its message first, then what backs it up.
       instruction:
-        "Summarize the text into 3 to 6 concise presentation bullet points. Output ONLY the " +
-        "bullets, one per line, each starting with '- '. Short phrases (not full sentences). " +
-        "Keep the meaning faithful; do not invent facts. No title, no preamble.",
+        "Turn the text into presentation slide bullets that carry the slide's meaning. " +
+        "The FIRST bullet states the slide's key claim or message; the following bullets give " +
+        "the supporting points. Use 3 to 6 bullets. Each bullet is a short parallel phrase of " +
+        "at most about 8 words — not a full sentence, no trailing period. Stay faithful to the " +
+        "text; do not invent facts. Output ONLY the bullets, one per line, each starting with " +
+        "'- '. No title, no preamble.",
       outputLanguage: s.settings?.defaultTargetLanguage,
       tone: s.settings?.writingTone || undefined,
     });
@@ -232,10 +384,7 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
       s.notify("Switched tabs — summary discarded.", "info");
       return;
     }
-    const lines = result
-      .split("\n")
-      .map((l) => l.replace(/^\s*[-•*]\s*/, "").trim())
-      .filter(Boolean);
+    const lines = parseBulletLines(result);
     if (!lines.length) {
       s.notify("The model returned no summary.", "info");
       return;
@@ -249,18 +398,99 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
   }
 }
 
+/**
+ * Slide AI (v1.2): ask the model to pick the best LAYOUT for a slide — the text
+ * is never touched; only the layout changes. Sends the slide's title, bullets
+ * and image count, asks for exactly one layout token, parses tolerantly (first
+ * known layout name in the reply), and applies it via `setChunkLayout` on the
+ * slide's layout host (`hostChunkId`) — so it behaves exactly like a manual
+ * pick, including undo and the picker's override/"Auto" state.
+ */
+export async function suggestSlideLayout(hostChunkId: string): Promise<void> {
+  const s = useStore.getState();
+  if (!hostChunkId) return;
+  if (!aiReady()) {
+    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.openSettings();
+    return;
+  }
+  const slide = groupSlides(s.doc.chunks).find((g) =>
+    g.items.some((c) => c.id === hostChunkId)
+  );
+  if (!slide) return;
+  const bullets = slideBullets(slide);
+  const text = [
+    `Title: ${slideTitle(slide, s.doc.title) || "(none)"}`,
+    `Images on the slide: ${slideImages(slide).length}`,
+    `Bullets (${bullets.length}):`,
+    ...bullets.map((b) => `- ${b}`),
+  ].join("\n");
+  const tab = s.activeTabId;
+  s.setGlobalBusy("Suggesting layout…", tab);
+  try {
+    // No outputLanguage/tone: the reply must be a bare layout token, not prose.
+    const result = await api.aiProcess({
+      action: "custom",
+      text,
+      instruction:
+        "Choose the best presentation slide layout for the slide described by the text " +
+        "(its title, image count and bullet points). Respond with exactly one token: " +
+        "section | title-content | title-image | title-image-left | image-top",
+    });
+    if (useStore.getState().activeTabId !== tab || !chunkStillActive(hostChunkId)) {
+      s.notify("Switched away — layout suggestion discarded.", "info");
+      return;
+    }
+    // Tolerant parse: the FIRST known layout name in the reply. Longest names
+    // are probed first so "title-image-left" isn't read as "title-image" (the
+    // strict `<` keeps the longer match at the same position).
+    const known: SlideLayout[] = [
+      "title-image-left",
+      "title-image",
+      "image-top",
+      "title-content",
+      "section",
+    ];
+    const lower = result.toLowerCase();
+    let layout: SlideLayout | null = null;
+    let at = Infinity;
+    for (const l of known) {
+      const idx = lower.indexOf(l);
+      if (idx >= 0 && idx < at) {
+        layout = l;
+        at = idx;
+      }
+    }
+    if (!layout) {
+      s.notify("The model didn't name a layout — nothing changed.", "info");
+      return;
+    }
+    useStore.getState().setChunkLayout(hostChunkId, layout);
+    s.notify(`Layout set to ${layout} (pick Auto to clear it).`, "success");
+  } catch (e) {
+    s.notify(message(e), "error");
+  } finally {
+    useStore.getState().setGlobalBusy(null, tab);
+  }
+}
+
 /** Translate / proofread / summarize / custom on a single chunk. */
 export async function runChunkAction(
   chunkId: string,
   action: AiAction,
-  opts: { targetLanguage?: string; instruction?: string; style?: string } = {}
+  opts: {
+    targetLanguage?: string;
+    instruction?: string;
+    style?: string;
+    /** Internal: editSelection refreshes context ONCE up front, not per chunk. */
+    skipContextRefresh?: boolean;
+  } = {}
 ): Promise<void> {
   const s = useStore.getState();
   const tab = s.activeTabId; // B3: scope live-stream mutations to the originating tab
-  const { chunk, before, after, sectionHeading, documentMap, linkedContent } =
-    gatherContext(chunkId);
-  if (!chunk) return;
-  if (!chunk.content.trim() && action !== "custom") {
+  const target = s.doc.chunks.find((c) => c.id === chunkId);
+  if (!target) return;
+  if (!target.content.trim() && action !== "custom") {
     s.notify("This paragraph is empty.", "info");
     return;
   }
@@ -269,6 +499,19 @@ export async function runChunkAction(
     s.openSettings();
     return;
   }
+  canceledChunks.delete(chunkId); // a new action supersedes an earlier Stop
+
+  // Live context: bring out-of-date summaries up to date BEFORE building the
+  // doc map, so the outline reflects the current text. The target chunk is
+  // excluded (its map line is the «editing» marker, not its summary), and the
+  // summarize action skips this — it's about to write the summary itself.
+  if (action !== "summarize" && !opts.skipContextRefresh) {
+    await refreshStaleSummaries(chunkId, tab);
+  }
+
+  const { chunk, before, after, sectionHeading, documentMap, linkedContent } =
+    gatherContext(chunkId);
+  if (!chunk) return;
 
   const request = {
     action,
@@ -298,13 +541,21 @@ export async function runChunkAction(
       ? await api.aiProcessStream(request, (text) => {
           // Only paint while the originating tab is still active AND this is the
           // chunk being streamed — so a backgrounded op can't hijack another
-          // tab's live streaming UI (B3).
+          // tab's live streaming UI (B3) — and the user hasn't hit Stop.
           const st = useStore.getState();
-          if (st.activeTabId === tab && st.streamingChunkId === chunkId) {
+          if (
+            st.activeTabId === tab &&
+            st.streamingChunkId === chunkId &&
+            !canceledChunks.has(chunkId)
+          ) {
             st.updateChunkStream(text);
           }
         })
       : await api.aiProcess(request);
+    if (canceledChunks.has(chunkId)) {
+      s.notify("Stopped — result discarded.", "info");
+      return;
+    }
     if (!chunkStillActive(chunkId)) {
       s.notify("Switched away from that paragraph — result discarded.", "info");
       return;
@@ -322,7 +573,8 @@ export async function runChunkAction(
       );
     }
   } catch (e) {
-    s.notify(message(e), "error");
+    // A stopped action's late failure isn't news the user needs.
+    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
     // B3: clear the stream + busy state on the tab that OWNED this op, whatever
     // tab is active now — routeTabPatch updates the originating tab's snapshot
@@ -351,17 +603,40 @@ export async function generateDiagramFromChunk(
     return;
   }
 
+  canceledChunks.delete(chunkId);
   s.setBusyChunk(chunkId, true, tab);
   try {
-    const code = await api.aiGenerateDiagram(chunk.content, instruction);
+    let code = await api.aiGenerateDiagram(chunk.content, instruction);
+    // Items 27/53: validate the Mermaid BEFORE inserting; one corrective retry
+    // that feeds the parse error back to the model.
+    let parseError = await validateMermaid(code);
+    if (parseError && !canceledChunks.has(chunkId)) {
+      const corrective =
+        `${instruction ? `${instruction}\n\n` : ""}` +
+        `The previous attempt failed to parse with: ${parseError}. ` +
+        "Return corrected, valid Mermaid only.";
+      code = await api.aiGenerateDiagram(chunk.content, corrective);
+      parseError = await validateMermaid(code);
+    }
+    if (canceledChunks.has(chunkId)) {
+      s.notify("Stopped — diagram discarded.", "info");
+      return;
+    }
     if (!chunkStillActive(chunkId)) {
       s.notify("Switched away from that paragraph — diagram discarded.", "info");
+      return;
+    }
+    if (parseError) {
+      // Behaviour change: previously the broken code was inserted anyway and
+      // could only ever render as an error box — now nothing is inserted and
+      // the parse error is surfaced instead.
+      s.notify(`The generated diagram is not valid Mermaid: ${parseError}`, "error");
       return;
     }
     useStore.getState().insertDiagramAfter(chunkId, code);
     s.notify("Diagram generated below the paragraph.", "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
     useStore.getState().setBusyChunk(chunkId, false, tab);
   }
@@ -381,9 +656,14 @@ export async function generateImageFromChunk(chunkId: string): Promise<void> {
     s.openSettings();
     return;
   }
+  canceledChunks.delete(chunkId);
   s.setBusyChunk(chunkId, true, tab);
   try {
     const url = await api.aiGenerateImage(chunk.content);
+    if (canceledChunks.has(chunkId)) {
+      s.notify("Stopped — image discarded.", "info");
+      return;
+    }
     if (!chunkStillActive(chunkId)) {
       s.notify("Switched away from that paragraph — image discarded.", "info");
       return;
@@ -391,7 +671,7 @@ export async function generateImageFromChunk(chunkId: string): Promise<void> {
     useStore.getState().insertImageAfter(chunkId, url, chunk.content);
     s.notify("Image generated below the paragraph.", "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
     useStore.getState().setBusyChunk(chunkId, false, tab);
   }
@@ -468,9 +748,14 @@ export async function generatePresentationFromChunk(chunkId: string): Promise<vo
     return;
   }
   const prompt = presentationPrompt(chunk.content);
+  canceledChunks.delete(chunkId);
   s.setBusyChunk(chunkId, true, tab);
   try {
     const url = await api.aiGenerateImage(prompt);
+    if (canceledChunks.has(chunkId)) {
+      s.notify("Stopped — figure discarded.", "info");
+      return;
+    }
     if (!chunkStillActive(chunkId)) {
       s.notify("Switched away from that paragraph — figure discarded.", "info");
       return;
@@ -478,7 +763,7 @@ export async function generatePresentationFromChunk(chunkId: string): Promise<vo
     useStore.getState().insertImageAfter(chunkId, url, prompt);
     s.notify("Presentation figure generated below the paragraph.", "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
     useStore.getState().setBusyChunk(chunkId, false, tab);
   }
@@ -503,9 +788,14 @@ export async function regenerateImageChunk(chunkId: string): Promise<void> {
     s.openSettings();
     return;
   }
+  canceledChunks.delete(chunkId);
   s.setBusyChunk(chunkId, true, tab);
   try {
     const url = await api.aiGenerateImage(prompt);
+    if (canceledChunks.has(chunkId)) {
+      s.notify("Stopped — regenerated image discarded.", "info");
+      return;
+    }
     if (!chunkStillActive(chunkId)) {
       s.notify("Switched away — regenerated image discarded.", "info");
       return;
@@ -515,7 +805,7 @@ export async function regenerateImageChunk(chunkId: string): Promise<void> {
     useStore.getState().replaceChunkContent(chunkId, url);
     s.notify("New image version generated.", "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
     useStore.getState().setBusyChunk(chunkId, false, tab);
   }
@@ -549,12 +839,18 @@ export async function editSelection(instruction: string): Promise<void> {
     return;
   }
   const tab = s.activeTabId;
+  // Live context: refresh out-of-date summaries ONCE up front (not per chunk) —
+  // every paragraph edited in this pass shares the same refreshed doc map.
+  await refreshStaleSummaries(null, tab);
   s.setGlobalBusy(`Editing ${ordered.length} paragraphs…`, tab);
   let done = 0;
   try {
     for (const c of ordered) {
       if (useStore.getState().activeTabId !== tab) break;
-      await runChunkAction(c.id, "custom", { instruction: text });
+      await runChunkAction(c.id, "custom", {
+        instruction: text,
+        skipContextRefresh: true,
+      });
       done += 1;
       useStore.getState().setGlobalBusy(`Editing ${done}/${ordered.length}…`, tab);
     }
@@ -568,20 +864,39 @@ export async function editSelection(instruction: string): Promise<void> {
 }
 
 /**
- * Pick a system voice that matches the script of `text` so e.g. Japanese isn't
- * read with an English voice. Returns undefined (system default) for Latin text.
- * Rust verifies the voice is installed and falls back if not.
+ * Pick the voice for read-aloud. The user's default output language wins (item
+ * 36 — a deliberate setting beats per-paragraph guessing); script detection is
+ * the fallback for unset/unmapped languages so e.g. Japanese isn't read with an
+ * English voice. Returns undefined (system default) for Latin text. Rust
+ * verifies the voice is installed and falls back if not.
  */
+const LANGUAGE_VOICES: Record<string, string | undefined> = {
+  Japanese: "Kyoko",
+  Korean: "Yuna",
+  Chinese: "Tingting",
+  English: undefined, // system default reads English well
+};
+
 function voiceForText(text: string): string | undefined {
+  const language = useStore.getState().settings?.defaultTargetLanguage;
+  if (language && language in LANGUAGE_VOICES) return LANGUAGE_VOICES[language];
   if (/[぀-ヿ]/.test(text)) return "Kyoko"; // hiragana/katakana → Japanese
   if (/[가-힣]/.test(text)) return "Yuna"; // hangul → Korean
   if (/[一-鿿]/.test(text)) return "Tingting"; // Han (no kana) → Chinese
   return undefined;
 }
 
-/** Read a paragraph aloud via the OS speech synthesizer. */
-export async function speakChunk(chunkId: string): Promise<void> {
+/**
+ * Read a paragraph aloud via the OS speech synthesizer. A direct call (chunk
+ * gutter button) replaces any in-flight multi-chunk queue — a new read intent
+ * supersedes the old one; queue-driven calls pass `fromQueue` to keep theirs.
+ */
+export async function speakChunk(
+  chunkId: string,
+  opts?: { fromQueue?: boolean }
+): Promise<void> {
   const s = useStore.getState();
+  if (!opts?.fromQueue) s.setSpeechQueue([]);
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
     s.notify("Nothing to read here.", "info");
@@ -597,8 +912,51 @@ export async function speakChunk(chunkId: string): Promise<void> {
   }
 }
 
+/**
+ * Read several chunks in sequence (item 14 — multi-paragraph / whole-document
+ * read-aloud). Only text/heading chunks with content are queued. The backend
+ * speaks ONE utterance at a time (a new speak_text kills the previous one), so
+ * the queue advances strictly on `speech-done` — see advanceSpeechQueue, called
+ * from App's event listener.
+ */
+export async function speakChunks(ids: string[]): Promise<void> {
+  const s = useStore.getState();
+  const speakable = ids.filter((id) => {
+    const c = s.doc.chunks.find((x) => x.id === id);
+    if (!c || !c.content.trim()) return false;
+    const t = c.metadata.chunkType;
+    return t === "text" || t === "heading";
+  });
+  if (speakable.length === 0) {
+    s.notify("Nothing to read.", "info");
+    return;
+  }
+  s.setSpeechQueue(speakable.slice(1));
+  await speakChunk(speakable[0], { fromQueue: true });
+}
+
+/**
+ * Speak the next queued chunk, if any. Must only be called after the previous
+ * utterance's `speech-done` arrived (killall-say semantics on the backend).
+ */
+export async function advanceSpeechQueue(): Promise<void> {
+  const s = useStore.getState();
+  // Skip queue entries whose chunk vanished while an earlier one was speaking.
+  for (;;) {
+    const next = s.shiftSpeechQueue();
+    if (next === null) return;
+    const chunk = useStore.getState().doc.chunks.find((c) => c.id === next);
+    if (chunk && chunk.content.trim()) {
+      await speakChunk(next, { fromQueue: true });
+      return;
+    }
+  }
+}
+
 export async function stopSpeaking(): Promise<void> {
-  useStore.getState().endSpeaking(); // clear the speaking indicator immediately
+  const s = useStore.getState();
+  s.setSpeechQueue([]); // stop means stop — don't advance to the next chunk
+  s.endSpeaking(); // clear the speaking indicator immediately
   try {
     await api.stopSpeaking();
   } catch {
@@ -637,6 +995,255 @@ export async function analyzeDocument(): Promise<void> {
         `Found ${result.nodes.length} nodes and ${result.edges.length} relations.`,
         "success"
       );
+    }
+  } catch (e) {
+    s.notify(message(e), "error");
+  } finally {
+    useStore.getState().setGlobalBusy(null, tab);
+  }
+}
+
+// ---- Review comments (mismatch report §2 / report ch.7 Task 4) -------------
+
+// How much of each paragraph the reviewer/integrity prompts see.
+const REVIEW_SNIPPET_CHARS = 400;
+
+/** Compact `[id] text…` listing of the document's text + heading chunks. */
+function reviewListing(chunks: Chunk[]): { ids: Set<string>; listing: string } {
+  const items = chunks.filter(
+    (c) =>
+      (c.metadata.chunkType === "text" || c.metadata.chunkType === "heading") &&
+      c.content.trim()
+  );
+  const listing = items
+    .map((c) => {
+      const text = c.content.trim().replace(/\s+/g, " ");
+      const cut =
+        text.length > REVIEW_SNIPPET_CHARS
+          ? `${text.slice(0, REVIEW_SNIPPET_CHARS)}…`
+          : text;
+      return `[${c.id}] ${cut}`;
+    })
+    .join("\n\n");
+  return { ids: new Set(items.map((c) => c.id)), listing };
+}
+
+/** First few words of a chunk's content — labels "related" paragraphs. */
+function chunkHeadWords(chunks: Chunk[], id: string): string {
+  const c = chunks.find((x) => x.id === id);
+  return c ? c.content.trim().split(/\s+/).slice(0, 5).join(" ").slice(0, 40) : "";
+}
+
+/**
+ * AI document reviewer: one non-streaming pass over every paragraph, returning
+ * at most one concise, actionable comment per paragraph that genuinely needs
+ * one. Findings land as AI review comments (kind "review") in the review
+ * panel; the previous review's comments are cleared first so re-running never
+ * stacks duplicates. A mid-flight tab switch discards the result.
+ */
+export async function reviewDocument(): Promise<void> {
+  const s = useStore.getState();
+  if (s.globalBusy) return; // one global AI pass at a time (UI2 pattern)
+  if (!aiReady()) {
+    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.openSettings();
+    return;
+  }
+  const tab = s.activeTabId;
+  // Fresh summaries first so the reviewer sees current context (T2).
+  await refreshStaleSummaries(null, tab);
+  if (useStore.getState().activeTabId !== tab) return;
+
+  const { ids, listing } = reviewListing(useStore.getState().doc.chunks);
+  if (!listing) {
+    s.notify("Nothing to review yet — write something first.", "info");
+    return;
+  }
+  const language = s.settings?.defaultTargetLanguage;
+  s.setGlobalBusy("Reviewing document…", tab);
+  try {
+    // No outputLanguage: the reply must be strict JSON, not prose — the
+    // comment-text language is pinned inside the instruction instead.
+    const raw = await api.aiProcess({
+      action: "custom",
+      text: listing,
+      instruction:
+        "Act as a rigorous academic reviewer. The text lists a document's paragraphs, each " +
+        "prefixed with its id in [brackets]. Review every paragraph for weak arguments, unclear " +
+        "claims, missing transitions, and factual vagueness. Return STRICT JSON only — no prose, " +
+        'no code fences — shaped exactly as {"comments":[{"chunkId":"...","text":"..."}]}. ' +
+        "Give at most ONE concise, actionable comment per paragraph, and ONLY for paragraphs " +
+        'that genuinely need one; return {"comments":[]} when there is nothing worth saying. ' +
+        "Copy each chunkId exactly from the [brackets]." +
+        (language ? ` Write each comment's text in ${language}.` : ""),
+    });
+    if (useStore.getState().activeTabId !== tab) {
+      s.notify("Switched tabs — review discarded.", "info");
+      return;
+    }
+    const parsed = extractJsonObject(raw) as {
+      comments?: { chunkId?: unknown; text?: unknown }[];
+    } | null;
+    if (!parsed || !Array.isArray(parsed.comments)) {
+      s.notify("The model returned no readable review.", "error");
+      return;
+    }
+    const findings = parsed.comments.filter(
+      (f): f is { chunkId: string; text: string } =>
+        typeof f?.chunkId === "string" &&
+        ids.has(f.chunkId) &&
+        typeof f?.text === "string" &&
+        !!f.text.trim()
+    );
+    const store = useStore.getState();
+    store.clearAiComments("review"); // regenerate, don't stack
+    // addComment returns null for a paragraph deleted mid-flight — count only
+    // the comments that actually landed so the toast can't overstate.
+    let added = 0;
+    for (const f of findings) {
+      if (store.addComment(f.chunkId, f.text.trim(), "ai", "review")) added += 1;
+    }
+    if (added) {
+      store.toggleReviewPanel(true);
+      s.notify(`AI review: ${added} comment${added === 1 ? "" : "s"}.`, "success");
+    } else {
+      s.notify("AI review: no issues found.", "success");
+    }
+  } catch (e) {
+    s.notify(message(e), "error");
+  } finally {
+    useStore.getState().setGlobalBusy(null, tab);
+  }
+}
+
+// The comment kinds the integrity lens writes (cleared before re-running).
+const INTEGRITY_KINDS = ["integrity", "unsupported-claim", "contradiction"];
+
+/**
+ * Integrity lens (report ch.7 Task 4): feed the RELATIONSHIP GRAPH plus the
+ * paragraph texts to the model and ask for (a) claims with no supporting
+ * evidence edge AND no evidential text in the document, (b) pairs of
+ * statements that contradict each other. Requires a fresh analysis — the graph
+ * IS the input, so a stale/missing one would produce junk findings. Findings
+ * land as AI comments (kind = "unsupported-claim" | "contradiction") and open
+ * the review panel.
+ */
+export async function checkIntegrity(): Promise<void> {
+  const s = useStore.getState();
+  if (s.globalBusy) return;
+  if (!aiReady()) {
+    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.openSettings();
+    return;
+  }
+  const analysis = s.doc.analysis;
+  if (!analysis || s.analysisStale) {
+    s.notify(
+      "Run Analyze first so integrity checking has a fresh relationship graph.",
+      "info"
+    );
+    return;
+  }
+  const tab = s.activeTabId;
+  const { ids, listing } = reviewListing(s.doc.chunks);
+  if (!listing) {
+    s.notify("Nothing to check yet — write something first.", "info");
+    return;
+  }
+  const nodeLines = analysis.nodes.map(
+    (n) =>
+      `- [${n.id}] (${n.kind ?? "paragraph"}) ${n.label}${
+        n.summary ? ` — ${n.summary}` : ""
+      }`
+  );
+  const edgeLines = analysis.edges.map(
+    (e) => `- [${e.source}] -${e.relation || "related"}-> [${e.target}]`
+  );
+  const text = [
+    "RELATIONSHIP GRAPH — NODES:",
+    ...nodeLines,
+    "",
+    "RELATIONSHIP GRAPH — EDGES:",
+    ...(edgeLines.length ? edgeLines : ["(none)"]),
+    "",
+    "PARAGRAPHS:",
+    listing,
+  ].join("\n");
+  const language = s.settings?.defaultTargetLanguage;
+  s.setGlobalBusy("Checking integrity…", tab);
+  try {
+    const raw = await api.aiProcess({
+      action: "custom",
+      text,
+      instruction:
+        "You are checking a document's logical integrity using its relationship graph. The text " +
+        "contains the graph (nodes and edges) and the document's paragraphs, each prefixed with " +
+        'its id in [brackets]. Find: (a) CLAIMS that have no supporting evidence edge in the ' +
+        'graph AND no evidential text anywhere in the document — kind "unsupported-claim"; ' +
+        '(b) pairs of statements that CONTRADICT each other — kind "contradiction", reported ' +
+        "on one chunk with the other chunk's id in relatedChunkIds. Return STRICT JSON only — " +
+        "no prose, no code fences — shaped exactly as " +
+        '{"findings":[{"chunkId":"...","kind":"unsupported-claim","note":"...",' +
+        '"relatedChunkIds":["..."]}]} where kind is "unsupported-claim" or "contradiction". ' +
+        'Return {"findings":[]} when the document holds together. Copy every id exactly from ' +
+        "the [brackets]." +
+        (language ? ` Write each note in ${language}.` : ""),
+    });
+    if (useStore.getState().activeTabId !== tab) {
+      s.notify("Switched tabs — integrity check discarded.", "info");
+      return;
+    }
+    const parsed = extractJsonObject(raw) as {
+      findings?: {
+        chunkId?: unknown;
+        kind?: unknown;
+        note?: unknown;
+        relatedChunkIds?: unknown;
+      }[];
+    } | null;
+    if (!parsed || !Array.isArray(parsed.findings)) {
+      s.notify("The model returned no readable findings.", "error");
+      return;
+    }
+    const knownKinds = new Set(INTEGRITY_KINDS);
+    const findings = parsed.findings.filter(
+      (
+        f
+      ): f is { chunkId: string; kind: string; note: string; relatedChunkIds?: unknown } =>
+        typeof f?.chunkId === "string" &&
+        ids.has(f.chunkId) &&
+        typeof f?.kind === "string" &&
+        knownKinds.has(f.kind) &&
+        typeof f?.note === "string" &&
+        !!f.note.trim()
+    );
+    const store = useStore.getState();
+    for (const kind of INTEGRITY_KINDS) store.clearAiComments(kind);
+    const chunks = useStore.getState().doc.chunks;
+    let added = 0;
+    for (const f of findings) {
+      // Suffix the head-words of resolvable related paragraphs so the comment
+      // reads standalone ("… — related: “The 2019 survey…”").
+      const related = (Array.isArray(f.relatedChunkIds) ? f.relatedChunkIds : [])
+        .filter(
+          (id): id is string =>
+            typeof id === "string" && ids.has(id) && id !== f.chunkId
+        )
+        .map((id) => chunkHeadWords(chunks, id))
+        .filter(Boolean);
+      const body = related.length
+        ? `${f.note.trim()} — related: ${related.map((h) => `“${h}…”`).join(", ")}`
+        : f.note.trim();
+      if (store.addComment(f.chunkId, body, "ai", f.kind)) added += 1;
+    }
+    if (added) {
+      store.toggleReviewPanel(true);
+      s.notify(
+        `Integrity check: ${added} finding${added === 1 ? "" : "s"}.`,
+        "success"
+      );
+    } else {
+      s.notify("Integrity check: no issues found.", "success");
     }
   } catch (e) {
     s.notify(message(e), "error");

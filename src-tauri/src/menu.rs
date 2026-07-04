@@ -17,12 +17,12 @@ pub fn build<R: Runtime>(app: &App<R>) -> tauri::Result<Menu<R>> {
     // frontend can run the unsaved-changes guard before the app exits. It keeps
     // the conventional Cmd+Q accelerator; there is no frontend Cmd+Q shortcut, so
     // it does not double-fire.
-    let quit = MenuItemBuilder::with_id("quit", "Quit aixTextEditor")
+    let quit = MenuItemBuilder::with_id("quit", "Quit NurumayuFacet")
         .accelerator("CmdOrCtrl+Q")
         .build(app)?;
-    let app_menu = SubmenuBuilder::new(app, "aixTextEditor")
+    let app_menu = SubmenuBuilder::new(app, "NurumayuFacet")
         .about(Some(AboutMetadata {
-            name: Some("aixTextEditor".into()),
+            name: Some("NurumayuFacet".into()),
             version: Some(env!("CARGO_PKG_VERSION").into()),
             copyright: Some(
                 "Copyright (c) 2026 Satoshi Kume. Artistic License 2.0.".into(),

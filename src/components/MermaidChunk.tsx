@@ -1,28 +1,11 @@
 // Renders a chunk's Mermaid code as inline SVG (spec §3.3). Errors are caught
 // and shown in place rather than crashing the editor.
 //
-// Mermaid is large, so it is loaded lazily on first use — it stays out of the
-// initial bundle and only loads once a diagram is actually shown (spec §4.1).
+// The lazy mermaid loader + config live in ../mermaidRender so the preview,
+// AI validation and export rasterisation share a single-source configuration.
 
 import { useEffect, useRef, useState } from "react";
-
-type MermaidApi = typeof import("mermaid")["default"];
-let mermaidPromise: Promise<MermaidApi> | null = null;
-
-function getMermaid(): Promise<MermaidApi> {
-  if (!mermaidPromise) {
-    mermaidPromise = import("mermaid").then((mod) => {
-      mod.default.initialize({
-        startOnLoad: false,
-        theme: "neutral",
-        securityLevel: "strict", // sanitize generated diagram markup
-        fontFamily: "Georgia, serif",
-      });
-      return mod.default;
-    });
-  }
-  return mermaidPromise;
-}
+import { getMermaid } from "../mermaidRender";
 
 let mermaidSeq = 0;
 

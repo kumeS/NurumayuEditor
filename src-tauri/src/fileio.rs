@@ -1,7 +1,8 @@
 //! Local file import/export. All disk I/O lives on the Rust side (per spec §2);
 //! the frontend only supplies a path chosen via the dialog plugin.
 //!
-//! Supported formats: `.txt`, `.md`/`.markdown`, `.rtf`.
+//! Supported formats: `.txt`, `.md`/`.markdown`, `.rtf` (plus export-only
+//! `.pdf` via `pdf.rs`).
 //! Import splits the text into paragraph chunks (blank-line separated) and
 //! promotes fenced ```mermaid blocks into diagram chunks. Export reverses this.
 
@@ -83,9 +84,33 @@ pub fn export_to_path(doc: &Document, path: &str, format: &str) -> AppResult<()>
         "txt" => document_to_txt(doc),
         "md" | "markdown" => document_to_md(doc),
         "rtf" => document_to_rtf(doc),
+        // PDF is binary and paginated — built (and written atomically) by its
+        // own module rather than as a text body.
+        "pdf" => return crate::pdf::document_to_pdf(doc, path),
         other => return Err(AppError::UnsupportedFormat(other.to_string())),
     };
-    std::fs::write(path, body)?;
+    write_atomic(path, body.as_bytes())
+}
+
+/// Write `bytes` to `path` atomically: write a temp file in the same directory,
+/// then rename it over the target. A crash mid-write leaves the previous file
+/// intact instead of a truncated one; `rename` replaces an existing file on
+/// both Unix and Windows. The ONE implementation shared by every save/export
+/// path (documents, exports, PPTX, sessions).
+pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> AppResult<()> {
+    let path = path.as_ref();
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    // A unique temp name so two concurrent writes never clobber each other's temp.
+    let tmp = dir.join(format!(".{}.{}.tmp", name, crate::models::new_id()));
+    std::fs::write(&tmp, bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on failure
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -510,6 +535,73 @@ fn rtf_escape(text: &str) -> String {
     out
 }
 
+/// Max display size for an embedded RTF picture, in twips (1/1440 in): 6 in
+/// wide × 8 in tall — larger images are scaled down preserving aspect so they
+/// stay inside a Letter/A4 page.
+const RTF_MAX_W_TWIPS: i64 = 8_640;
+const RTF_MAX_H_TWIPS: i64 = 11_520;
+
+/// Build a `{\pict ...}` group for an image data URL, or `None` when it can't
+/// be embedded (not PNG/JPEG, undecodable, unknown size) so the caller falls
+/// back to the text placeholder. `picw`/`pich` carry the pixel size in
+/// himetric (1/100 mm, assuming 96 dpi: px × 26.4583); `picwgoal`/`pichgoal`
+/// the display size in twips (px × 15), capped at 6×8 in. The app's own
+/// importer skips the hex payload safely (`pict` is an ignorable destination
+/// in `rtf_to_text`), so embedded images round-trip without corrupting text.
+fn rtf_picture_group(content: &str) -> Option<String> {
+    let bytes = crate::imageio::decode_image(content)?;
+    let blip = match crate::imageio::image_ext(&bytes)? {
+        ("png", _) => "\\pngblip",
+        ("jpeg", _) => "\\jpegblip",
+        _ => return None, // GIF/BMP/unknown keep the text placeholder
+    };
+    let (w_px, h_px) = crate::imageio::image_size(&bytes)?;
+    let (w_px, h_px) = (w_px as i64, h_px as i64);
+    let picw = (w_px as f64 * 26.4583).round() as i64;
+    let pich = (h_px as f64 * 26.4583).round() as i64;
+    let mut wgoal = w_px * 15;
+    let mut hgoal = h_px * 15;
+    if wgoal > RTF_MAX_W_TWIPS || hgoal > RTF_MAX_H_TWIPS {
+        let scale = f64::min(
+            RTF_MAX_W_TWIPS as f64 / wgoal as f64,
+            RTF_MAX_H_TWIPS as f64 / hgoal as f64,
+        );
+        wgoal = (wgoal as f64 * scale).round() as i64;
+        hgoal = (hgoal as f64 * scale).round() as i64;
+    }
+    let mut out =
+        format!("{{\\pict{blip}\\picw{picw}\\pich{pich}\\picwgoal{wgoal}\\pichgoal{hgoal}\n");
+    // Lowercase hex payload, wrapped at 128 chars (64 bytes) per line.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && i % 64 == 0 {
+            out.push('\n');
+        }
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out.push_str("\n}");
+    Some(out)
+}
+
+/// Append an embedded picture (plus a caption line when a summary is set) to
+/// `out`. Returns `false` when the bytes can't be embedded so the caller keeps
+/// its existing text fallback.
+fn push_rtf_picture(out: &mut String, content: &str, caption: Option<&str>) -> bool {
+    let Some(group) = rtf_picture_group(content) else {
+        return false;
+    };
+    out.push_str(&group);
+    out.push_str("\\par\n");
+    // Keep the caption line the text placeholder used to carry (the summary).
+    if let Some(cap) = caption.map(str::trim).filter(|c| !c.is_empty()) {
+        out.push_str("{\\i\\fs20 ");
+        out.push_str(&rtf_escape(cap));
+        out.push_str("}\\par\n");
+    }
+    true
+}
+
 fn document_to_rtf(doc: &Document) -> String {
     let mut out = String::from("{\\rtf1\\ansi\\ansicpg1252\\deff0\n");
     out.push_str("{\\fonttbl{\\f0\\froman Georgia;}{\\f1\\fmodern Consolas;}}\n");
@@ -526,9 +618,13 @@ fn document_to_rtf(doc: &Document) -> String {
             out.push_str("\\par\n");
         }
         if chunk.is_image() {
-            let caption = chunk.metadata.summary.clone().unwrap_or_default();
-            out.push_str(&rtf_escape(&format!("[Image: {caption}]")));
-            out.push_str("\\par\n");
+            // A PNG/JPEG data URL embeds as a real picture; anything else
+            // (GIF/BMP/remote URL that couldn't be fetched) keeps the placeholder.
+            if !push_rtf_picture(&mut out, &chunk.content, chunk.metadata.summary.as_deref()) {
+                let caption = chunk.metadata.summary.clone().unwrap_or_default();
+                out.push_str(&rtf_escape(&format!("[Image: {caption}]")));
+                out.push_str("\\par\n");
+            }
         } else if chunk.is_heading() {
             // Bold, size by level.
             let fs = match chunk.metadata.level.unwrap_or(1).clamp(1, 3) {
@@ -540,10 +636,15 @@ fn document_to_rtf(doc: &Document) -> String {
             out.push_str(&rtf_escape(chunk.content.trim()));
             out.push_str("}\\par\n");
         } else if chunk.is_diagram() {
-            // Diagram code is rendered as monospace text in RTF exports.
-            out.push_str("{\\f1\\fs20 ");
-            out.push_str(&rtf_escape(&chunk.content));
-            out.push_str("}\\par\n");
+            // A rendered snapshot (injected by the frontend at export time)
+            // embeds as a real picture; without one the diagram source is
+            // rendered as monospace text.
+            let snapshot = chunk.metadata.rendered_image.as_deref().unwrap_or("");
+            if !push_rtf_picture(&mut out, snapshot, chunk.metadata.summary.as_deref()) {
+                out.push_str("{\\f1\\fs20 ");
+                out.push_str(&rtf_escape(&chunk.content));
+                out.push_str("}\\par\n");
+            }
         } else {
             out.push_str(&rtf_escape(&chunk.content));
             out.push_str("\\par\n");
@@ -710,6 +811,115 @@ mod tests {
             .chunks
             .iter()
             .any(|c| c.is_heading() && c.content == "Methods" && c.metadata.level == Some(2)));
+    }
+
+    // ----- RTF picture embedding -----
+
+    /// Minimal PNG header (signature + IHDR size fields) — enough for
+    /// `image_ext` and `image_size`.
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut png = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        png.extend_from_slice(&w.to_be_bytes());
+        png.extend_from_slice(&h.to_be_bytes());
+        png
+    }
+
+    fn data_url(mime: &str, bytes: &[u8]) -> String {
+        use base64::Engine;
+        format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    fn image_chunk(order: u32, content: String) -> Chunk {
+        let mut c = Chunk::new_text(order, content);
+        c.metadata.chunk_type = crate::models::CHUNK_TYPE_IMAGE.to_string();
+        c
+    }
+
+    #[test]
+    fn rtf_embeds_png_image_as_pict_with_caption() {
+        let mut doc = Document::new("D");
+        let mut img = image_chunk(0, data_url("image/png", &png_bytes(4, 2)));
+        img.metadata.summary = Some("a tiny picture".to_string());
+        doc.chunks.push(img);
+        let rtf = document_to_rtf(&doc);
+        assert!(rtf.contains("\\pict"), "no pict group: {rtf}");
+        assert!(rtf.contains("\\pngblip"), "wrong blip type: {rtf}");
+        // 4×2 px @96 dpi → himetric ×26.4583, twips ×15.
+        assert!(rtf.contains("\\picw106\\pich53"), "himetric size wrong: {rtf}");
+        assert!(rtf.contains("\\picwgoal60\\pichgoal30"), "twips size wrong: {rtf}");
+        assert!(rtf.contains("a tiny picture"), "caption line missing: {rtf}");
+        assert!(!rtf.contains("[Image:"), "placeholder should be replaced: {rtf}");
+        // The importer must still read the file (pict is an ignored destination).
+        let text = rtf_to_text(&rtf);
+        assert!(text.contains("a tiny picture"), "got: {text:?}");
+        assert!(!text.contains("89504e47"), "hex payload leaked into text: {text:?}");
+    }
+
+    #[test]
+    fn rtf_scales_oversized_images_down_to_the_page() {
+        let mut doc = Document::new("D");
+        // 1000 px wide → 15000 twips, beyond the 8640-twip (6 in) cap.
+        doc.chunks
+            .push(image_chunk(0, data_url("image/png", &png_bytes(1000, 100))));
+        let rtf = document_to_rtf(&doc);
+        assert!(rtf.contains("\\picwgoal8640\\pichgoal864"), "not scaled: {rtf}");
+    }
+
+    #[test]
+    fn rtf_keeps_placeholder_for_gif_and_unfetched_images() {
+        let mut doc = Document::new("D");
+        let mut gif = image_chunk(0, data_url("image/gif", b"GIF89a\x04\x00\x02\x00"));
+        gif.metadata.summary = Some("animated".to_string());
+        doc.chunks.push(gif);
+        doc.chunks
+            .push(image_chunk(1, "https://example.com/x.png".to_string()));
+        let rtf = document_to_rtf(&doc);
+        assert!(!rtf.contains("\\pict"), "gif/URL must not embed: {rtf}");
+        assert!(rtf.contains("[Image: animated]"), "placeholder missing: {rtf}");
+    }
+
+    #[test]
+    fn rtf_embeds_a_diagram_rendered_snapshot_as_pict() {
+        let mut doc = Document::new("D");
+        let mut d = Chunk::new_diagram(0, "graph TD; A-->B;", "mermaid");
+        d.metadata.rendered_image = Some(data_url("image/png", &png_bytes(4, 2)));
+        doc.chunks.push(d);
+        let rtf = document_to_rtf(&doc);
+        assert!(rtf.contains("\\pict"), "snapshot not embedded: {rtf}");
+        assert!(!rtf.contains("graph TD"), "source should be replaced by the picture: {rtf}");
+
+        // Without a snapshot the mono source block stays.
+        let mut doc2 = Document::new("D2");
+        doc2.chunks
+            .push(Chunk::new_diagram(0, "graph TD; A-->B;", "mermaid"));
+        let rtf2 = document_to_rtf(&doc2);
+        assert!(!rtf2.contains("\\pict"), "nothing to embed: {rtf2}");
+        assert!(rtf2.contains("graph TD; A--"), "mono source missing: {rtf2}");
+    }
+
+    // ----- atomic writes -----
+
+    #[test]
+    fn write_atomic_replaces_content_and_leaves_no_temp_sibling() {
+        let dir = std::env::temp_dir().join("aix_write_atomic_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.txt");
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

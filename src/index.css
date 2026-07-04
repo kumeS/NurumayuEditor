@@ -40,3 +40,20 @@ textarea {
     scrollbar-width: none;
   }
 }
+
+/* Restrained fade for the Editor/Slides view swap — a user-caused state
+   change (design-tokens motion policy), not autonomous motion. Skipped
+   entirely under reduced-motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .view-fade-in {
+    animation: view-fade-in 150ms ease-out;
+  }
+}
+@keyframes view-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

@@ -1,9 +1,9 @@
 {
-  "name": "aix-text-editor",
+  "name": "nurumayufacet",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
-  "description": "aixTextEditor — an LLM-augmented, chunk-based editor for academic papers and long-form reports.",
+  "description": "NurumayuFacet — a writing app where every document is already a slide deck.",
   "author": "Satoshi Kume",
   "license": "Artistic-2.0",
   "scripts": {

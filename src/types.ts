@@ -4,6 +4,16 @@
 
 export type ChunkType = "text" | "diagram" | "heading" | "image";
 
+/** A review/feedback note attached to a chunk (user- or AI-authored). */
+export interface ReviewComment {
+  id: string;
+  text: string;
+  createdAt: number; // ms epoch
+  author?: "user" | "ai";
+  kind?: string;
+  resolved?: boolean;
+}
+
 export interface ChunkMetadata {
   chunkType: ChunkType;
   format?: string; // e.g. "mermaid" when chunkType === "diagram"
@@ -15,6 +25,16 @@ export interface ChunkMetadata {
   layout?: SlideLayout; // slide lead chunk: explicit slide-layout override
   subtitle?: boolean; // text chunk flagged as a subtitle (Req 3)
   slideBody?: string[]; // slide-only body override — "detach" from prose (Req 2)
+  // Diagram chunks: PNG data URL of the rendered graph. Injected by the
+  // frontend into EXPORT payloads only (never persisted from the editor UI).
+  renderedImage?: string;
+  comments?: ReviewComment[]; // review comments on this chunk
+  // Hex hash of the chunk content at the time metadata.summary was written
+  // (frontend computes; Rust only persists) — detects stale summaries.
+  summaryHash?: string;
+  // Optional ordering index for a slide's images (lower renders first; ties
+  // broken by document order — see `slideImages` in slides.ts).
+  slot?: number;
 }
 
 export interface Chunk {
@@ -25,9 +45,11 @@ export interface Chunk {
 }
 
 /**
- * Authoring mode of a document/tab. Chosen when the tab is created and FIXED for
- * its lifetime — an editor doc and a slide deck are independent things, never
- * converted into each other. Older .aix files without the field load as "editor".
+ * View mode of a document/tab: how the same chunk model is presented — prose
+ * paragraphs, or a deck (headings → slide titles). Switchable at any time from
+ * the toolbar's Editor/Slides toggle or the command palette; switching never
+ * migrates or drops content, it only changes presentation. Older .aix files
+ * without the field load as "editor".
  */
 export type DocMode = "editor" | "slide";
 
@@ -62,7 +84,15 @@ export interface SessionData {
 
 // Slide deck model (v1.2.0). A slide reuses editor Chunks (heading = title,
 // text = bullets, image, diagram) plus a layout; decks export to .pptx.
-export type SlideLayout = "section" | "title-content" | "title-image";
+// Auto-pick (see `autoLayout` in slides.ts / deck.rs) only ever produces
+// "section" | "title-content" | "title-image" — the "-left"/"-top" image
+// variants are manual-choice only (an explicit override), never guessed.
+export type SlideLayout =
+  | "section"
+  | "title-content"
+  | "title-image"
+  | "title-image-left"
+  | "image-top";
 
 export interface Slide {
   id: string;
@@ -93,6 +123,9 @@ export interface Settings {
   defaultTargetLanguage: string; // "Default language" — global output language
   writingTone: string; // global writing tone applied to writing actions
   temperature: number;
+  editorFontFamily?: "serif" | "sans" | "mono"; // editor body font (default "serif")
+  editorFontSize?: number; // editor body font size in px (default 17; clamped 12..=28 on load)
+  removedModels?: string[]; // built-in model ids the user removed from the pickers (default [])
 }
 
 export type AiAction =
@@ -142,6 +175,7 @@ export interface AnalysisEdge {
 export interface AnalysisResult {
   nodes: AnalysisNode[];
   edges: AnalysisEdge[];
+  analyzedAt?: number; // ms epoch — when this graph was computed
 }
 
 export type ExportFormat = "txt" | "md" | "rtf";

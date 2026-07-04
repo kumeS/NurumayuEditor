@@ -2,7 +2,7 @@
 // and settings. Kept visually quiet to honour the "Clarity & Simplicity" goal.
 
 import { useEffect, useRef, useState } from "react";
-import { analyzeDocument } from "../aiActions";
+import { analyzeDocument, speakChunks, stopSpeaking } from "../aiActions";
 import {
   exportDocument,
   exportPdf,
@@ -14,15 +14,20 @@ import {
 import { useStore } from "../store";
 import type { ExportFormat } from "../types";
 import {
+  CommentIcon,
   DraftIcon,
   ExportIcon,
+  FileIcon,
   FolderIcon,
   HelpIcon,
   ImportIcon,
   NetworkIcon,
   SaveIcon,
   SettingsIcon,
+  SlidesIcon,
+  SpeakerIcon,
   SpinnerIcon,
+  StopIcon,
 } from "./icons";
 
 function ToolButton({
@@ -63,6 +68,9 @@ export default function Toolbar() {
   const openHelp = useStore((s) => s.openHelp);
   const toggleNetwork = useStore((s) => s.toggleNetwork);
   const networkOpen = useStore((s) => s.networkOpen);
+  const toggleReviewPanel = useStore((s) => s.toggleReviewPanel);
+  const reviewPanelOpen = useStore((s) => s.reviewPanelOpen);
+  const speaking = useStore((s) => s.speakingChunkId !== null);
 
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
   const fileMenuRef = useRef<HTMLDivElement>(null);
@@ -162,10 +170,15 @@ export default function Toolbar() {
             key={m}
             onClick={() => setMode(m)}
             title={m === "editor" ? "Prose editor view" : "Slide deck view"}
-            className={`px-2.5 py-1 ${
+            className={`flex items-center gap-1.5 px-2.5 py-1 ${
               mode === m ? "bg-accent text-white" : "bg-white text-ink-soft hover:bg-gray-100"
             }`}
           >
+            {m === "editor" ? (
+              <FileIcon className="h-3.5 w-3.5" />
+            ) : (
+              <SlidesIcon className="h-3.5 w-3.5" />
+            )}
             {m === "editor" ? "Editor" : "Slides"}
           </button>
         ))}
@@ -203,7 +216,34 @@ export default function Toolbar() {
         <NetworkIcon /> {networkOpen ? "Hide graph" : "Analyze"}
       </ToolButton>
 
-      <ToolButton onClick={openHelp} title="How to write with aixTextEditor — workflow guide">
+      <ToolButton onClick={() => toggleReviewPanel()} title="Review comments">
+        <CommentIcon /> {reviewPanelOpen ? "Hide review" : "Review"}
+      </ToolButton>
+
+      {/* Whole-document read-aloud (item 14): reads from the focused paragraph
+          onward (or the top). Becomes Stop while anything is speaking. */}
+      {speaking ? (
+        <ToolButton onClick={() => void stopSpeaking()} title="Stop reading aloud">
+          <StopIcon /> Stop
+        </ToolButton>
+      ) : (
+        <ToolButton
+          onClick={() => {
+            const s = useStore.getState();
+            const chunks = s.doc.chunks;
+            const focusIdx = s.focusedChunkId
+              ? chunks.findIndex((c) => c.id === s.focusedChunkId)
+              : -1;
+            const from = focusIdx >= 0 ? focusIdx : 0;
+            void speakChunks(chunks.slice(from).map((c) => c.id));
+          }}
+          title="Read the document aloud from the current paragraph"
+        >
+          <SpeakerIcon /> Read
+        </ToolButton>
+      )}
+
+      <ToolButton onClick={openHelp} title="How to write with NurumayuFacet — workflow guide">
         <HelpIcon /> Help
       </ToolButton>
 

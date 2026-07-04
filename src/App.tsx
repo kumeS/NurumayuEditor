@@ -5,7 +5,8 @@ import { Suspense, lazy, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
-import { analyzeDocument } from "./aiActions";
+import { advanceSpeechQueue, analyzeDocument } from "./aiActions";
+import { confirmDiscard } from "./confirm";
 import {
   exportDocument,
   exportPdf,
@@ -18,8 +19,10 @@ import {
 import { useStore } from "./store";
 import type { PersistedTab, SessionData } from "./types";
 import { useShortcuts } from "./useShortcuts";
+import CommandPalette from "./components/CommandPalette";
 import DraftModal from "./components/DraftModal";
 import Editor from "./components/Editor";
+import HealthBar from "./components/HealthBar";
 import ErrorBoundary from "./components/ErrorBoundary";
 import SlideEditor from "./components/SlideEditor";
 import HelpModal from "./components/HelpModal";
@@ -32,6 +35,8 @@ import { PromptHost } from "./components/PromptModal";
 
 // Cytoscape is heavy; load the network panel only when it is first opened.
 const NetworkPanel = lazy(() => import("./components/NetworkPanel"));
+// Review comments panel — same load-on-first-open pattern.
+const ReviewPanel = lazy(() => import("./components/ReviewPanel"));
 
 /** True if any tab (active or backgrounded) has unsaved changes. */
 function anyTabDirty(): boolean {
@@ -63,19 +68,12 @@ function collectSession(): SessionData {
  */
 async function okToClose(): Promise<boolean> {
   if (!anyTabDirty()) return true;
-  return ask(
-    "You have unsaved changes in one or more tabs. Quit without saving? Unsaved documents (including AI drafts) will be lost.",
-    {
-      title: "Unsaved changes",
-      kind: "warning",
-      okLabel: "Discard & quit",
-      cancelLabel: "Cancel",
-    }
-  );
+  return confirmDiscard("quit");
 }
 
 function App() {
   const networkOpen = useStore((s) => s.networkOpen);
+  const reviewPanelOpen = useStore((s) => s.reviewPanelOpen);
   const mode = useStore((s) => s.doc.mode ?? "editor");
   const activeTabId = useStore((s) => s.activeTabId);
   const setSettings = useStore((s) => s.setSettings);
@@ -154,7 +152,14 @@ function App() {
   // matched by utterance id so a stale event can't clear a newer playback.
   useEffect(() => {
     const unlisten = listen<number>("speech-done", (e) => {
+      // Multi-chunk read-aloud (item 14): the backend speaks one utterance at a
+      // time, so the queue may only advance once the previous one reported done.
+      // A KILLED utterance also emits speech-done (its wait-thread sees the exit)
+      // — only the CURRENT utterance's completion may advance, or a superseded
+      // read would cut off its replacement.
+      const wasCurrent = useStore.getState().speakingUtterance === e.payload;
       useStore.getState().endSpeaking(e.payload);
+      if (wasCurrent) void advanceSpeechQueue();
     });
     return () => {
       void unlisten.then((f) => f());
@@ -248,10 +253,12 @@ function App() {
       <div className="flex min-h-0 flex-1">
         <main className="min-h-0 flex-1 overflow-y-auto">
           {/* Reset the boundary when the tab or view mode changes, so a crash in
-              one view doesn't trap the user — they can switch away and back. */}
-          <ErrorBoundary key={`${activeTabId}:${mode}`}>
-            {mode === "slide" ? <SlideEditor /> : <Editor />}
-          </ErrorBoundary>
+              one view doesn't trap the user — they can switch away and back. The
+              fade-in (keyed the same way) softens the hard remount on a mode
+              switch without being a real transition between two live views. */}
+          <div key={`${activeTabId}:${mode}`} className="view-fade-in h-full">
+            <ErrorBoundary>{mode === "slide" ? <SlideEditor /> : <Editor />}</ErrorBoundary>
+          </div>
         </main>
         {networkOpen && (
           <Suspense
@@ -264,11 +271,24 @@ function App() {
             <NetworkPanel />
           </Suspense>
         )}
+        {reviewPanelOpen && (
+          <Suspense
+            fallback={
+              <aside className="flex h-full w-80 shrink-0 items-center justify-center border-l border-gray-200 bg-white text-sm text-ink-faint">
+                Loading review…
+              </aside>
+            }
+          >
+            <ReviewPanel />
+          </Suspense>
+        )}
       </div>
+      <HealthBar />
 
       <SettingsModal />
       <DraftModal />
       <HelpModal />
+      <CommandPalette />
       <PromptHost />
       <SelectionBar />
       <Toasts />

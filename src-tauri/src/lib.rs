@@ -1,4 +1,4 @@
-//! aixTextEditor — Tauri backend entry point.
+//! NurumayuFacet — Tauri backend entry point.
 
 mod ai;
 pub mod cli;
@@ -6,9 +6,11 @@ mod commands;
 mod deck;
 mod error;
 mod fileio;
+mod imageio;
 mod menu;
 mod models;
 mod net;
+mod pdf;
 mod pptx;
 mod settings;
 

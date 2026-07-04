@@ -5,6 +5,12 @@
 //! following paragraphs become bullets, and image chunks attach to their slide.
 //! The layout is then picked from the slide's chunk composition. AI-assisted
 //! deck generation (bulletizing, image suggestions) is a separate, later step.
+//!
+//! Sync contract: layout resolution here (first non-empty `metadata.layout`
+//! override, else auto-pick) mirrors the TS `resolveLayout`, and a slide's
+//! multi-image GRID (which visuals show, their slot/document ordering, and the
+//! cell subdivision of the layout's image region) is defined identically in
+//! `pptx.rs` (export) and `SlideEditor.tsx` (preview) — change one, change all.
 
 use crate::models::{
     Chunk, Deck, Document, Slide, SLIDE_LAYOUT_SECTION, SLIDE_LAYOUT_TITLE_CONTENT,
@@ -142,5 +148,40 @@ mod tests {
         let deck = document_to_deck(&doc);
         assert_eq!(deck.slides.len(), 1);
         assert_eq!(deck.slides[0].layout, SLIDE_LAYOUT_SECTION);
+    }
+
+    #[test]
+    fn manual_only_layouts_are_never_auto_picked_but_pass_through_as_overrides() {
+        // title-image-left / image-top are manual-choice-only (auto-pick still
+        // only ever produces section/title-content/title-image, see the
+        // `layout` field doc comment in models.rs) — but an explicit override
+        // must still win, exactly like the other layouts.
+        use crate::models::{SLIDE_LAYOUT_IMAGE_TOP, SLIDE_LAYOUT_TITLE_IMAGE_LEFT};
+
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Left image");
+        h.metadata.layout = Some(SLIDE_LAYOUT_TITLE_IMAGE_LEFT.to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "bullet"));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].layout, SLIDE_LAYOUT_TITLE_IMAGE_LEFT);
+
+        let mut doc2 = Document::new("D2");
+        let mut h2 = Chunk::new_heading(0, 1, "Banner");
+        h2.metadata.layout = Some(SLIDE_LAYOUT_IMAGE_TOP.to_string());
+        doc2.chunks.push(h2);
+        doc2.chunks.push(Chunk::new_text(1, "bullet"));
+        let deck2 = document_to_deck(&doc2);
+        assert_eq!(deck2.slides[0].layout, SLIDE_LAYOUT_IMAGE_TOP);
+
+        // Meanwhile, an image with NO override still auto-picks "title-image"
+        // (right), not either of the manual-only variants.
+        let mut doc3 = Document::new("D3");
+        doc3.chunks.push(Chunk::new_heading(0, 1, "Auto"));
+        let mut img = Chunk::new_text(1, "u");
+        img.metadata.chunk_type = crate::models::CHUNK_TYPE_IMAGE.to_string();
+        doc3.chunks.push(img);
+        let deck3 = document_to_deck(&doc3);
+        assert_eq!(deck3.slides[0].layout, SLIDE_LAYOUT_TITLE_IMAGE);
     }
 }

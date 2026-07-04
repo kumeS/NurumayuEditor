@@ -9,6 +9,7 @@ use crate::ai::{self, AiRequest, LlmConfig};
 use crate::deck;
 use crate::error::{AppError, AppResult};
 use crate::fileio;
+use crate::imageio;
 use crate::models::{AnalysisResult, Document};
 use crate::pptx;
 use crate::settings::{self, Settings};
@@ -97,8 +98,13 @@ pub fn import_document(path: String) -> AppResult<Document> {
 }
 
 #[tauri::command]
-pub fn export_document(document: Document, path: String, format: String) -> AppResult<()> {
+pub async fn export_document(mut document: Document, path: String, format: String) -> AppResult<()> {
     check_ext(&path, &[format.as_str()])?;
+    if format.eq_ignore_ascii_case("rtf") {
+        // Same as the PPTX path: fetch remote image URLs so the RTF writer can
+        // embed them; a failed fetch falls back to the text placeholder.
+        imageio::resolve_remote_images(document.chunks.iter_mut()).await;
+    }
     fileio::export_to_path(&document, &path, &format)
 }
 
@@ -109,9 +115,9 @@ pub fn export_document(document: Document, path: String, format: String) -> AppR
 pub async fn export_pptx(document: Document, path: String) -> AppResult<pptx::PptxReport> {
     check_ext(&path, &["pptx"])?;
     let mut deck = deck::document_to_deck(&document);
-    pptx::resolve_remote_images(&mut deck).await;
+    imageio::resolve_remote_images(deck.slides.iter_mut().flat_map(|s| s.chunks.iter_mut())).await;
     let (bytes, warnings) = pptx::deck_to_pptx(&deck)?;
-    std::fs::write(&path, bytes)?;
+    fileio::write_atomic(&path, &bytes)?;
     Ok(pptx::PptxReport {
         slides: deck.slides.len(),
         warnings,
@@ -119,11 +125,11 @@ pub async fn export_pptx(document: Document, path: String) -> AppResult<pptx::Pp
 }
 
 /// Save/open the native `.aix` document format (the chunk JSON from spec §5).
+/// Written atomically so a crash mid-save can't truncate the user's document.
 #[tauri::command]
 pub fn save_document_json(document: Document, path: String) -> AppResult<()> {
     check_ext(&path, &["aix"])?;
-    std::fs::write(path, serde_json::to_string_pretty(&document)?)?;
-    Ok(())
+    fileio::write_atomic(&path, serde_json::to_string_pretty(&document)?.as_bytes())
 }
 
 /// A `.aix` document loaded from disk, plus any repairs `Document::normalize`
@@ -455,18 +461,16 @@ fn session_path(app: &AppHandle) -> AppResult<PathBuf> {
 /// Persist the whole multi-tab working set (active + background tabs) so a crash
 /// or force-quit doesn't lose unsaved work, including irreproducible AI drafts
 /// (A2). The frontend debounces this on dirty changes. Written atomically
-/// (temp + rename) so a crash mid-write can't corrupt the recovery file. The
-/// payload is an opaque JSON value — its shape is owned by the frontend.
+/// (`fileio::write_atomic`) so a crash mid-write can't corrupt the recovery
+/// file. The payload is an opaque JSON value — its shape is owned by the
+/// frontend.
 #[tauri::command]
 pub fn save_session(app: AppHandle, session: serde_json::Value) -> AppResult<()> {
     let path = session_path(&app)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string(&session)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    fileio::write_atomic(&path, serde_json::to_string(&session)?.as_bytes())
 }
 
 /// Load the saved session, or `None` if there isn't one (first run / clean exit).

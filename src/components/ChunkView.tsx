@@ -9,6 +9,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
+  cancelChunkAction,
   generateImageFromChunk,
   regenerateImageChunk,
   runChunkAction,
@@ -17,6 +18,7 @@ import {
 } from "../aiActions";
 import { caretVerticalEdge } from "../caret";
 import { changed, wordDiff } from "../diff";
+import { editorBodyFontStyle } from "../fonts";
 import { useStore } from "../store";
 import ChunkAiMenu from "./ChunkAiMenu";
 import MermaidChunk from "./MermaidChunk";
@@ -26,6 +28,7 @@ import {
   ArrowUpIcon,
   CheckSquareIcon,
   CloseIcon,
+  CommentIcon,
   FlowIcon,
   HistoryIcon,
   ImageIcon,
@@ -68,7 +71,9 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const chunk = useStore((s) => s.doc.chunks.find((c) => c.id === chunkId));
   const busy = useStore((s) => !!s.busyChunks[chunkId]);
   const isFocused = useStore((s) => s.focusedChunkId === chunkId);
-  const isFlashing = useStore((s) => s.flashChunkId === chunkId);
+  const isFlashing = useStore(
+    (s) => s.flashChunkId === chunkId || s.flashChunkIds.includes(chunkId)
+  );
   const isStreaming = useStore((s) => s.streamingChunkId === chunkId);
   const streamingText = useStore((s) => (s.streamingChunkId === chunkId ? s.streamingText : ""));
 
@@ -88,6 +93,11 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const selectChunkVersion = useStore((s) => s.selectChunkVersion);
   const justAiEdited = useStore((s) => s.lastAiEditChunkId === chunkId);
   const dismissAiEdit = useStore((s) => s.dismissAiEdit);
+  const settings = useStore((s) => s.settings);
+  // Review comments: open the panel with this chunk as the composer target.
+  const toggleReviewPanel = useStore((s) => s.toggleReviewPanel);
+  const setReviewTarget = useStore((s) => s.setReviewTarget);
+  const flashChunk = useStore((s) => s.flashChunk);
 
   const textRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -136,10 +146,13 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const isHeading = type === "heading";
   const isImage = type === "image";
   const isSubtitle = isText && !!chunk.metadata.subtitle; // Req 3
-  // A subtitle renders larger and lighter than a body paragraph.
+  // A subtitle renders larger and lighter than a body paragraph. Body prose
+  // follows the user's editor font settings (提案5 — family/size as inline
+  // style, see fonts.ts); subtitles/headings keep their designed sans styling.
   const textCls = isSubtitle
     ? "w-full resize-none overflow-hidden bg-transparent font-sans text-2xl font-medium leading-snug text-ink-soft outline-none placeholder:text-ink-faint/40"
-    : "w-full resize-none overflow-hidden bg-transparent font-serif text-[1.075rem] leading-8 text-ink-soft outline-none placeholder:text-ink-faint/50";
+    : "w-full resize-none overflow-hidden bg-transparent text-ink-soft outline-none placeholder:text-ink-faint/50";
+  const bodyFontStyle = isSubtitle ? undefined : editorBodyFontStyle(settings);
   const headingLevel = Math.min(Math.max(chunk.metadata.level ?? 1, 1), 3);
 
   // Per-chunk version history (prior text revisions / image URLs).
@@ -151,6 +164,11 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
     : [];
   const hasTextDiff =
     (isText || isHeading) && !!prevVersion && changed(prevVersion, chunk.content);
+
+  // Unresolved review comments on this chunk — drives the gutter badge.
+  const unresolvedComments = (chunk.metadata.comments ?? []).filter(
+    (cm) => !cm.resolved
+  ).length;
 
   // Typing "# ", "## " or "### " at the start of a text chunk turns it into a
   // heading of that level (Markdown-style). Disabled inside the slide editor
@@ -371,7 +389,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
         })()
       ) : isText ? (
         isStreaming ? (
-          <div className={`${textCls} whitespace-pre-wrap break-words`}>
+          <div className={`${textCls} whitespace-pre-wrap break-words`} style={bodyFontStyle}>
             {streamingText}
             <span className="ml-0.5 inline-block h-4 w-0.5 animate-pulse bg-accent align-middle" />
           </div>
@@ -392,6 +410,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             onKeyDown={onKeyDown}
             rows={1}
             className={textCls}
+            style={bodyFontStyle}
           />
         )
       ) : (
@@ -412,6 +431,19 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             }`}
           />
         </div>
+      )}
+
+      {/* FE cancel (item 22): stop an in-flight AI action on this chunk. The
+          backend request itself is not aborted — its result is discarded when
+          it arrives; this clears the busy/streaming UI immediately. */}
+      {(busy || isStreaming) && (
+        <button
+          onClick={() => cancelChunkAction(chunkId)}
+          className="mt-1 flex items-center gap-1 text-xs text-ink-faint hover:text-red-500"
+          title="Stop this AI action (the result will be discarded)"
+        >
+          <StopIcon className="h-3 w-3" /> Stop
+        </button>
       )}
 
       {/* Summary metadata badge (set via Summarize action). Image chunks show
@@ -557,6 +589,31 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             </button>
           </Tooltip>
         )}
+        <Tooltip
+          label={
+            unresolvedComments
+              ? `Review comments (${unresolvedComments} open)`
+              : "Add a review comment"
+          }
+        >
+          <button
+            className={`${gutterBtn} relative hover:text-accent ${
+              unresolvedComments ? "text-accent" : ""
+            }`}
+            onClick={() => {
+              setReviewTarget(chunkId);
+              toggleReviewPanel(true);
+              flashChunk(chunkId); // make the panel group easy to spot
+            }}
+          >
+            <CommentIcon />
+            {unresolvedComments > 0 && (
+              <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-[0.875rem] items-center justify-center rounded-full bg-accent px-0.5 text-[9px] font-semibold leading-none text-white">
+                {unresolvedComments}
+              </span>
+            )}
+          </button>
+        </Tooltip>
         <Tooltip label="Add a paragraph below">
           <button className={gutterBtn} onClick={() => addChunkAfter(chunkId, "text")}>
             <PlusIcon />
