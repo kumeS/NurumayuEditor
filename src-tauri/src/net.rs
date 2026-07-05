@@ -16,10 +16,32 @@
 use crate::error::{AppError, AppResult};
 use futures_util::StreamExt;
 use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const USER_AGENT: &str = "NurumayuFacet/1.3 (+https://github.com/kumeS/NurumayuFacet)";
 const MAX_REDIRECTS: usize = 5;
+
+// ----- "zero external transmission" visibility (開発.txt Stage 2, item 2-2) --
+//
+// Process-wide counters for reference/image fetches made through `safe_fetch`,
+// the single guarded chokepoint for content-derived URLs. NOTE for future
+// readers: 開発.txt's Stage 2 text frames `net.rs` as the sole outbound
+// chokepoint for the whole app — that is NOT quite accurate. `safe_fetch` only
+// covers reference-material and remote-image fetches; the actual LLM API
+// calls (OpenRouter chat/streaming/image-generation) in `ai.rs` construct
+// their own `reqwest::Client` and never touch this module. Those calls are
+// counted separately in `ai.rs` (see its `ai_call_stats()`); the frontend
+// combines both via `commands::get_network_stats`.
+static FETCH_CALLS: AtomicU64 = AtomicU64::new(0);
+static FETCH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Current reference/image-fetch traffic: `(calls, bytes)`. A "call" is every
+/// invocation of `safe_fetch` (successful or not — an attempted fetch still
+/// left the machine); "bytes" counts only bytes actually returned on success.
+pub fn stats() -> (u64, u64) {
+    (FETCH_CALLS.load(Ordering::Relaxed), FETCH_BYTES.load(Ordering::Relaxed))
+}
 
 /// Classify a *resolved* IP as one we must never fetch from when following a
 /// user/document-supplied URL. Pure and deterministic, so it is unit-tested
@@ -104,6 +126,10 @@ fn guard_url(url: &reqwest::Url) -> AppResult<()> {
 /// `MAX_REDIRECTS` redirects, re-validating each hop's host. Returns the body
 /// bytes, or a `Network` error if the URL is disallowed, too large, or fails.
 pub async fn safe_fetch(url: &str, max_bytes: usize, timeout_secs: u64) -> AppResult<Vec<u8>> {
+    // Count the attempt regardless of outcome — a blocked/failed fetch still
+    // means we tried to leave the machine; bytes are only added on success below.
+    FETCH_CALLS.fetch_add(1, Ordering::Relaxed);
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::none()) // we follow + re-validate manually
@@ -155,6 +181,7 @@ pub async fn safe_fetch(url: &str, max_bytes: usize, timeout_secs: u64) -> AppRe
             }
             buf.extend_from_slice(&chunk);
         }
+        FETCH_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
         return Ok(buf);
     }
 
@@ -215,5 +242,50 @@ mod tests {
         assert!(is_blocked_host("169.254.169.254"));
         assert!(!is_blocked_host("8.8.8.8"));
         assert!(!is_blocked_host("93.184.216.34"));
+    }
+
+    // NOTE: there's no local mock-HTTP-server crate in this workspace (and the
+    // task/rules forbid adding a new dependency just for this), so a genuine
+    // "byte count increments on a real successful fetch" integration test isn't
+    // practical here. What IS practical and non-vacuous without any network
+    // mocking: `safe_fetch` must count the ATTEMPT even when the fetch is
+    // rejected before ever reaching the wire (blocked host) — this exercises
+    // the exact `FETCH_CALLS.fetch_add` line this change adds, using only the
+    // existing SSRF guard (no network I/O, no new dependency). A dedicated
+    // Runtime (built from the existing `rt` feature) avoids needing the
+    // `macros` feature just for `#[tokio::test]`.
+    //
+    // `calls_after` uses `>=`, not `==`: `FETCH_CALLS` is a process-wide static
+    // also touched by `commands::tests::get_network_stats_reflects_underlying_counters`
+    // (same test binary), and `cargo test`'s default parallel runner can
+    // interleave that test's own `safe_fetch` call between our before/after
+    // reads. `>=` still catches the real regression (the counter not
+    // advancing at all) while tolerating a concurrent test's bump.
+    #[test]
+    fn safe_fetch_counts_the_call_even_when_blocked() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (calls_before, bytes_before) = stats();
+
+        let result = rt.block_on(safe_fetch("http://127.0.0.1:9/", 1024, 1));
+
+        assert!(result.is_err(), "loopback fetch must be refused by the SSRF guard");
+        let (calls_after, bytes_after) = stats();
+        // The attempt is counted regardless of outcome.
+        assert!(
+            calls_after >= calls_before + 1,
+            "expected calls to advance by at least 1 (before={calls_before}, after={calls_after})"
+        );
+        // A failed fetch never adds to the byte counter.
+        assert_eq!(bytes_after, bytes_before);
+    }
+
+    #[test]
+    fn stats_getter_reflects_the_shared_counters() {
+        // Pure sanity check on the getter itself: two independent reads without
+        // an intervening fetch must be stable (no accidental increment-on-read),
+        // and the tuple order is (calls, bytes) as documented.
+        let a = stats();
+        let b = stats();
+        assert_eq!(a, b);
     }
 }

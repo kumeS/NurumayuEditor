@@ -345,8 +345,13 @@ export async function saveNativeAs(): Promise<void> {
       filters: [{ name: "AIX Document", extensions: [NATIVE_EXT] }],
     });
     if (!path) return;
-    await api.saveDocumentJson(s.doc, path);
-    s.markClean(path);
+    // Capture the exact document being written — the save is awaited without
+    // blocking the editor, so `useStore.getState().doc` could advance (another
+    // keystroke) before this resolves. markClean must anchor the new baseline
+    // to what actually reached disk, not to whatever is live when it returns.
+    const written = s.doc;
+    await api.saveDocumentJson(written, path);
+    s.markClean(path, written);
     clearSessionIfAllSaved();
     s.notify("Document saved.", "success");
   } catch (e) {
@@ -361,8 +366,9 @@ export async function saveNative(): Promise<void> {
     return;
   }
   try {
-    await api.saveDocumentJson(s.doc, s.filePath);
-    s.markClean();
+    const written = s.doc;
+    await api.saveDocumentJson(written, s.filePath);
+    s.markClean(undefined, written);
     clearSessionIfAllSaved();
     s.notify("Document saved.", "success");
   } catch (e) {

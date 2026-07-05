@@ -2,16 +2,19 @@
 
 mod ai;
 pub mod cli;
+mod citations;
 mod commands;
 mod deck;
 mod error;
 mod fileio;
 mod imageio;
+mod mcp;
 mod menu;
 mod models;
 mod net;
 mod pdf;
 mod pptx;
+mod rag;
 mod settings;
 
 use tauri::{Emitter, Manager};
@@ -53,14 +56,29 @@ pub fn run() {
             commands::set_api_key,
             commands::has_api_key,
             commands::delete_api_key,
+            commands::get_network_stats,
             commands::ai_process,
             commands::ai_process_stream,
+            commands::ai_ghost_complete_stream,
             commands::ai_draft_stream,
             commands::ai_generate_image,
             commands::ai_generate_diagram,
             commands::ai_analyze_document,
             commands::read_reference_file,
             commands::fetch_url_text,
+            commands::rag_add_source,
+            commands::rag_remove_source,
+            commands::rag_list_sources,
+            commands::rag_search,
+            commands::citations_import_bibtex,
+            commands::citations_list,
+            commands::citations_lookup_doi,
+            commands::citations_lookup_arxiv,
+            commands::citations_add_entry,
+            commands::citations_add_lookup_result,
+            commands::citations_remove_entry,
+            commands::citations_format,
+            commands::citations_bibliography,
             commands::speak_text,
             commands::stop_speaking,
             commands::save_session,

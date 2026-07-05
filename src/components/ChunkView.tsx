@@ -8,7 +8,9 @@
 // component (Phase 5 performance goal).
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { api } from "../api";
 import {
+  aiReady,
   cancelChunkAction,
   generateImageFromChunk,
   regenerateImageChunk,
@@ -46,6 +48,12 @@ const pendingCaret = new Map<string, number>();
 export function setPendingCaret(id: string, offset: number) {
   pendingCaret.set(id, offset);
 }
+
+// Ghost-text inline completion (開発.txt Stage 2, item 2-4). A nice-to-have
+// quality-of-life feature, not a differentiator — kept deliberately lean:
+// debounce after typing stops, one in-flight request per chunk (last one
+// wins), no error surface (a failed/slow completion is simply invisible).
+const GHOST_DEBOUNCE_MS = 400;
 
 interface Props {
   chunkId: string;
@@ -99,6 +107,14 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const setReviewTarget = useStore((s) => s.setReviewTarget);
   const flashChunk = useStore((s) => s.flashChunk);
 
+  // Ghost-text inline completion (開発.txt Stage 2, item 2-4).
+  const ghostText = useStore((s) =>
+    s.ghostSuggestion?.chunkId === chunkId ? s.ghostSuggestion.text : null
+  );
+  const startGhostRequest = useStore((s) => s.startGhostRequest);
+  const setGhostSuggestion = useStore((s) => s.setGhostSuggestion);
+  const clearGhostSuggestion = useStore((s) => s.clearGhostSuggestion);
+
   const textRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [showHistory, setShowHistory] = useState(false);
@@ -139,6 +155,68 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
       containerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
     }
   }, [isFlashing]);
+
+  // Ghost-text inline completion (開発.txt Stage 2, item 2-4): after the user
+  // stops typing in a focused, non-empty TEXT chunk (headings/diagrams/images
+  // are out of scope — this is a prose quality-of-life feature, not a
+  // differentiator) with the caret at the very END of the content, wait
+  // GHOST_DEBOUNCE_MS and then request one short continuation. Any keystroke
+  // (content or caret move) cancels the pending timer and clears whatever
+  // suggestion was showing — "let normal typing win" beats a stale ghost.
+  useEffect(() => {
+    clearGhostSuggestion();
+    if (!chunk || chunk.metadata.chunkType !== "text" || !isFocused) return;
+    if (!chunk.content.trim()) return;
+    if (!aiReady()) return; // silent — no toast for a background nicety
+
+    const timer = window.setTimeout(() => {
+      // Check the CURRENT caret/content right before firing, not what the
+      // effect captured when it started — the user may have kept the caret
+      // still but moved it away from the end (e.g. arrow keys) without a new
+      // content change re-running this effect.
+      const el = textRef.current;
+      if (
+        !el ||
+        el.selectionStart !== el.value.length ||
+        el.selectionEnd !== el.value.length
+      ) {
+        return;
+      }
+      const live = useStore.getState().doc.chunks.find((c) => c.id === chunkId);
+      if (!live || !live.content.trim()) return;
+
+      // Cheap context hint: the nearest preceding heading, if any — NOT a
+      // full document map (that's for one-click actions, not a
+      // must-feel-instant background completion).
+      const chunks = useStore.getState().doc.chunks;
+      const idx = chunks.findIndex((c) => c.id === chunkId);
+      let contextHint = "";
+      for (let i = idx - 1; i >= 0; i--) {
+        if (chunks[i].metadata.chunkType === "heading" && chunks[i].content.trim()) {
+          contextHint = chunks[i].content.trim();
+          break;
+        }
+      }
+
+      const requestId = startGhostRequest();
+      void api
+        .aiGhostCompleteStream(live.content, contextHint, (text) => {
+          setGhostSuggestion(chunkId, text, requestId);
+        })
+        .then((finalText) => setGhostSuggestion(chunkId, finalText, requestId))
+        .catch(() => {
+          // Silent by design (item 8 of the spec): a completion failing or
+          // being slow is invisible — never a toast for this background
+          // nicety. A superseded request's late arrival is already a no-op
+          // via the requestId guard in setGhostSuggestion.
+        });
+    }, GHOST_DEBOUNCE_MS);
+
+    return () => window.clearTimeout(timer);
+    // Re-run on every content change so the debounce restarts; also on focus
+    // change so switching away cancels a pending timer for this chunk.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chunk?.content, isFocused, chunkId]);
 
   if (!chunk) return null;
   const type = chunk.metadata.chunkType;
@@ -184,6 +262,27 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
     if (e.nativeEvent.isComposing) return; // don't interrupt IME composition
     const mod = e.metaKey || e.ctrlKey;
     const el = e.currentTarget;
+
+    // Ghost-text (開発.txt Stage 2, item 2-4): plain Tab (no modifier) accepts
+    // the visible suggestion by inserting it at the cursor. Only intercepted
+    // when a suggestion is actually showing — with nothing suggested, Tab
+    // falls through untouched (normal focus-move behaviour is preserved; this
+    // codebase has no other global Tab handler to conflict with). Escape
+    // dismisses; every other key just lets the suggestion vanish naturally on
+    // the next debounce effect run — no explicit handling needed here.
+    if (ghostText && !mod && !e.shiftKey && !e.altKey && e.key === "Tab") {
+      e.preventDefault();
+      const accepted = chunk.content + ghostText;
+      clearGhostSuggestion();
+      updateChunkContent(chunkId, accepted);
+      setPendingCaret(chunkId, accepted.length);
+      return;
+    }
+    if (ghostText && e.key === "Escape") {
+      e.preventDefault();
+      clearGhostSuggestion();
+      return;
+    }
 
     if (mod && e.key === "Enter" && e.shiftKey) {
       // Split this chunk at the caret.
@@ -394,24 +493,44 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             <span className="ml-0.5 inline-block h-4 w-0.5 animate-pulse bg-accent align-middle" />
           </div>
         ) : (
-          <textarea
-            ref={textRef}
-            value={chunk.content}
-            spellCheck
-            placeholder={
-              isSubtitle
-                ? "Subtitle"
-                : index === 0
-                  ? "Start writing your first paragraph…"
-                  : "…"
-            }
-            onFocus={() => setFocused(chunkId)}
-            onChange={(e) => handleTextChange(e.target.value)}
-            onKeyDown={onKeyDown}
-            rows={1}
-            className={textCls}
-            style={bodyFontStyle}
-          />
+          <div className="relative">
+            {/* Ghost-text overlay (開発.txt Stage 2, item 2-4): a non-interactive,
+                non-editable preview positioned right after the cursor. Mirrors the
+                textarea's own text in transparent ink (to occupy identical space/
+                wrapping) so the muted suggestion lands exactly after the real
+                content — never part of the editable value, so it can't be copied,
+                pasted, or saved into the document by accident. Only shown when the
+                caret is at the end (the debounce effect's own precondition), which
+                is also why appending after the mirrored text is always correct. */}
+            {ghostText && (
+              <div
+                aria-hidden="true"
+                className={`${textCls} pointer-events-none absolute inset-0 whitespace-pre-wrap break-words !text-transparent`}
+                style={bodyFontStyle}
+              >
+                {chunk.content}
+                <span className="text-ink-faint/50">{ghostText}</span>
+              </div>
+            )}
+            <textarea
+              ref={textRef}
+              value={chunk.content}
+              spellCheck
+              placeholder={
+                isSubtitle
+                  ? "Subtitle"
+                  : index === 0
+                    ? "Start writing your first paragraph…"
+                    : "…"
+              }
+              onFocus={() => setFocused(chunkId)}
+              onChange={(e) => handleTextChange(e.target.value)}
+              onKeyDown={onKeyDown}
+              rows={1}
+              className={textCls}
+              style={bodyFontStyle}
+            />
+          </div>
         )
       ) : (
         <div>

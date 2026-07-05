@@ -21,6 +21,9 @@ import {
   saveNative,
 } from "../fileActions";
 import { useStore } from "../store";
+import { openCitationsPanel } from "./CitationsPanel";
+import { openCriteriaPanel } from "./CriteriaPanel";
+import { openPersonalLibraryPanel } from "./PersonalLibraryPanel";
 
 interface Command {
   id: string;
@@ -86,9 +89,21 @@ export default function CommandPalette() {
       { id: "analyze", label: "Analyze relationships", group: "AI", keywords: "graph network claims", run: wrap(analyzeDocument) },
       { id: "review", label: "AI review (comments per paragraph)", group: "AI", keywords: "feedback critique", run: wrap(reviewDocument) },
       { id: "integrity", label: "Check integrity (claims & contradictions)", group: "AI", keywords: "evidence fact unsupported", run: wrap(checkIntegrity) },
+      { id: "criteria", label: "Check against review criteria", group: "AI", keywords: "criteria grant review coverage 科研費", run: wrap(openCriteriaPanel) },
+      { id: "personal-library", label: "Open personal library (RAG)", group: "AI", keywords: "rag knowledge base sources embeddings grounding personal", run: wrap(openPersonalLibraryPanel) },
+      { id: "citations", label: "Open citations (BibTeX, APA/IEEE)", group: "AI", keywords: "citation reference bibliography bibtex zotero doi arxiv apa ieee cite", run: wrap(openCitationsPanel) },
       { id: "toggle-graph", label: s.networkOpen ? "Hide relationship graph" : "Show relationship graph", group: "View", keywords: "network panel", run: wrap(() => s.toggleNetwork()) },
       { id: "toggle-review", label: s.reviewPanelOpen ? "Hide review comments" : "Show review comments", group: "View", keywords: "comments panel", run: wrap(() => s.toggleReviewPanel()) },
+      { id: "toggle-diff", label: s.diffPanelOpen ? "Hide changes since last save" : "Show changes since last save", group: "View", keywords: "diff changes compare save history", run: wrap(() => s.toggleDiffPanel()) },
       { id: "mode", label: s.doc.mode === "slide" ? "Switch to editor view" : "Switch to slide view", group: "View", keywords: "mode slides editor", run: wrap(() => s.setMode(s.doc.mode === "slide" ? "editor" : "slide")) },
+      {
+        id: "present",
+        label: "Start presentation",
+        group: "View",
+        keywords: "fullscreen slideshow present slides",
+        visible: s.doc.mode === "slide",
+        run: wrap(() => s.openPresentation()),
+      },
       {
         id: "read-aloud",
         label: "Read document aloud",

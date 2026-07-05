@@ -6,13 +6,16 @@ import { api } from "./api";
 import { validateMermaid } from "./mermaidRender";
 import { groupSlides, slideBullets, slideImages, slideTitle } from "./slides";
 import { staleSummaryChunkIds, useStore } from "./store";
-import type { AiAction, Chunk, SlideLayout } from "./types";
+import type { AiAction, Chunk, RagSearchHit, SlideLayout } from "./types";
 
 // T1 — whole-document context assembly.
 const LINKED_MAX_CHARS = 2500;
 // Chunks with no summary contribute this many leading content chars to the doc
 // map instead, so the outline covers EVERY chunk (nothing silently omitted).
 const MAP_SNIPPET_CHARS = 120;
+
+// Personal RAG (開発.txt Stage 3, item 3-1) grounding.
+const RAG_TOP_K = 3;
 
 /**
  * Assemble the context an AI action gets for a chunk. Beyond the immediate
@@ -114,6 +117,51 @@ function gatherContext(chunkId: string): {
   }
 
   return { chunk, before, after, sectionHeading, documentMap, linkedContent };
+}
+
+/**
+ * Personal RAG (開発.txt Stage 3, item 3-1) — companion to `gatherContext`,
+ * called separately (and only conditionally) so a disabled/unused personal
+ * library adds ZERO overhead: when `personalRagEnabled` is off, this returns
+ * `[]` WITHOUT attempting any query at all (no `rag_search` invoke, no
+ * `rag_list_sources` invoke either — the setting check short-circuits first).
+ *
+ * Query text is the chunk's own current content when non-empty, falling back
+ * to the nearest section heading (e.g. for an empty paragraph the user is
+ * about to draft into) — simple and fast, per the task's guidance, rather
+ * than a fancier query-rewrite step.
+ *
+ * Returns the top few matches (source file path + matched snippet) for the
+ * caller to attach as grounding context and to later surface as "grounded by"
+ * citations near the result (see the per-action UI that applies the AI
+ * result).
+ */
+export async function gatherRagSnippets(
+  chunkId: string,
+  sectionHeading?: string
+): Promise<RagSearchHit[]> {
+  const s = useStore.getState();
+  if (!s.settings?.personalRagEnabled) return [];
+
+  const chunk = s.doc.chunks.find((c) => c.id === chunkId);
+  const query = (chunk?.content.trim() || sectionHeading?.trim()) ?? "";
+  if (!query) return [];
+
+  try {
+    // An empty personal library must not even attempt a search — checking the
+    // source list first (rather than only catching a search error) keeps this
+    // an explicit no-op rather than relying on `rag_search`'s own empty-index
+    // short-circuit (rag.rs's `index_exists` guard) as the ONLY signal.
+    const sources = await api.ragListSources();
+    if (sources.length === 0) return [];
+    return await api.ragSearch(query, RAG_TOP_K);
+  } catch {
+    // Grounding is a best-effort enhancement, never a blocker: any failure
+    // (feature toggled off mid-flight, index error, etc.) just means no
+    // snippets are attached — the AI action proceeds without RAG context
+    // rather than failing the whole action over an optional enhancement.
+    return [];
+  }
 }
 
 function message(e: unknown): string {
@@ -513,6 +561,17 @@ export async function runChunkAction(
     gatherContext(chunkId);
   if (!chunk) return;
 
+  // Personal RAG (開発.txt Stage 3, item 3-1): attach the top few personal-
+  // library matches as grounding context, but ONLY when the setting is on and
+  // at least one source is indexed — `gatherRagSnippets` itself is the
+  // zero-overhead-when-disabled guard (no query attempted otherwise). The
+  // Rust `AiRequest` struct does not read this field yet (that wiring, plus
+  // surfacing which sources were used near the result, is the citation-
+  // management follow-up) — sending it as an extra JSON key is harmless
+  // (ignored by serde) until then, so grounding can be exercised/tested here
+  // in isolation ahead of that change landing.
+  const ragSnippets = await gatherRagSnippets(chunkId, sectionHeading);
+
   const request = {
     action,
     text: chunk.content,
@@ -530,6 +589,7 @@ export async function runChunkAction(
     sectionHeading,
     documentMap,
     linkedContent,
+    ragSnippets,
   };
 
   // Stream every action except "summarize" (which writes metadata, not content).
@@ -1120,6 +1180,45 @@ export async function reviewDocument(): Promise<void> {
 const INTEGRITY_KINDS = ["integrity", "unsupported-claim", "contradiction"];
 
 /**
+ * Shared context assembly for anything that reasons over the whole document's
+ * RELATIONSHIP GRAPH plus its paragraph texts — currently `checkIntegrity`
+ * (unsupported claims / contradictions) and `checkAgainstCriteria` (review-
+ * criteria coverage). Both need the exact same "graph + paragraph listing"
+ * block, so it's built once here rather than duplicated. Returns `null` when
+ * there's nothing to check (no analysis yet, stale analysis, or an empty
+ * document) — callers surface their own action-specific message for each case.
+ */
+function buildGraphAndParagraphContext():
+  | { ids: Set<string>; text: string }
+  | null {
+  const s = useStore.getState();
+  const analysis = s.doc.analysis;
+  if (!analysis || s.analysisStale) return null;
+  const { ids, listing } = reviewListing(s.doc.chunks);
+  if (!listing) return null;
+  const nodeLines = analysis.nodes.map(
+    (n) =>
+      `- [${n.id}] (${n.kind ?? "paragraph"}) ${n.label}${
+        n.summary ? ` — ${n.summary}` : ""
+      }`
+  );
+  const edgeLines = analysis.edges.map(
+    (e) => `- [${e.source}] -${e.relation || "related"}-> [${e.target}]`
+  );
+  const text = [
+    "RELATIONSHIP GRAPH — NODES:",
+    ...nodeLines,
+    "",
+    "RELATIONSHIP GRAPH — EDGES:",
+    ...(edgeLines.length ? edgeLines : ["(none)"]),
+    "",
+    "PARAGRAPHS:",
+    listing,
+  ].join("\n");
+  return { ids, text };
+}
+
+/**
  * Integrity lens (report ch.7 Task 4): feed the RELATIONSHIP GRAPH plus the
  * paragraph texts to the model and ask for (a) claims with no supporting
  * evidence edge AND no evidential text in the document, (b) pairs of
@@ -1145,30 +1244,12 @@ export async function checkIntegrity(): Promise<void> {
     return;
   }
   const tab = s.activeTabId;
-  const { ids, listing } = reviewListing(s.doc.chunks);
-  if (!listing) {
+  const ctx = buildGraphAndParagraphContext();
+  if (!ctx) {
     s.notify("Nothing to check yet — write something first.", "info");
     return;
   }
-  const nodeLines = analysis.nodes.map(
-    (n) =>
-      `- [${n.id}] (${n.kind ?? "paragraph"}) ${n.label}${
-        n.summary ? ` — ${n.summary}` : ""
-      }`
-  );
-  const edgeLines = analysis.edges.map(
-    (e) => `- [${e.source}] -${e.relation || "related"}-> [${e.target}]`
-  );
-  const text = [
-    "RELATIONSHIP GRAPH — NODES:",
-    ...nodeLines,
-    "",
-    "RELATIONSHIP GRAPH — EDGES:",
-    ...(edgeLines.length ? edgeLines : ["(none)"]),
-    "",
-    "PARAGRAPHS:",
-    listing,
-  ].join("\n");
+  const { ids, text } = ctx;
   const language = s.settings?.defaultTargetLanguage;
   s.setGlobalBusy("Checking integrity…", tab);
   try {
@@ -1247,6 +1328,156 @@ export async function checkIntegrity(): Promise<void> {
     }
   } catch (e) {
     s.notify(message(e), "error");
+  } finally {
+    useStore.getState().setGlobalBusy(null, tab);
+  }
+}
+
+// ---- Review-criteria ↔ body-text mapping (開発.txt Stage 2, item 2-1, Part B) --
+
+/**
+ * One review-criterion's coverage result: whether ANY paragraph in the
+ * document supports it, and which paragraph(s) do. The criteria themselves
+ * are entirely user-supplied free text (e.g. grant-review phrases the user
+ * types in) — this module has no built-in list and no knowledge of any real
+ * institution's actual review criteria (see 開発.txt §9 — bundling official
+ * form content is an explicitly unresolved decision, out of scope here).
+ */
+export interface CriteriaCheckResult {
+  criterion: string;
+  covered: boolean;
+  supportingChunkIds: string[];
+}
+
+/**
+ * Parse the model's reply into `CriteriaCheckResult[]`, tolerantly (mirrors
+ * `checkIntegrity`'s JSON handling): extract the first balanced JSON object,
+ * expect `{"results":[{"criterion","covered","supportingChunkIds"}]}`, and
+ * keep only well-shaped entries whose `supportingChunkIds` are restricted to
+ * ids that actually exist in `validIds` (a hallucinated id is dropped rather
+ * than surfaced as if it were real). Any criterion the model dropped entirely
+ * (missing from its reply) is re-added as not-covered with no supporting
+ * chunks — a gap in the model's answer must never silently disappear the
+ * criterion from the result, since "criterion missing" and "criterion not
+ * covered" would otherwise be indistinguishable to the user. Exported for
+ * adversarial-input testing (malformed/partial LLM output).
+ */
+export function parseCriteriaResults(
+  raw: string,
+  criteria: string[],
+  validIds: Set<string>
+): CriteriaCheckResult[] {
+  const parsed = extractJsonObject(raw) as {
+    results?: {
+      criterion?: unknown;
+      covered?: unknown;
+      supportingChunkIds?: unknown;
+    }[];
+  } | null;
+
+  const byCriterion = new Map<string, CriteriaCheckResult>();
+  const rawResults = Array.isArray(parsed?.results) ? parsed!.results : [];
+  for (const r of rawResults) {
+    const modelCriterion = r?.criterion;
+    if (typeof modelCriterion !== "string") continue;
+    // Match against the user's ORIGINAL phrase, not whatever the model echoed
+    // back, in case of trivial rewording/whitespace differences.
+    const match = criteria.find((c) => c.trim() === modelCriterion.trim());
+    if (!match) continue;
+    const supportingChunkIds = (
+      Array.isArray(r.supportingChunkIds) ? r.supportingChunkIds : []
+    ).filter((id): id is string => typeof id === "string" && validIds.has(id));
+    // A criterion is only "covered" if the model said so AND named at least
+    // one real supporting paragraph — a "covered:true" with zero valid ids
+    // (e.g. all hallucinated) is not real coverage.
+    const covered = r.covered === true && supportingChunkIds.length > 0;
+    byCriterion.set(match, { criterion: match, covered, supportingChunkIds });
+  }
+  // Anything the model's reply omitted entirely is reported as an explicit
+  // not-covered gap, never silently dropped from the result list.
+  return criteria.map(
+    (c) => byCriterion.get(c) ?? { criterion: c, covered: false, supportingChunkIds: [] }
+  );
+}
+
+/**
+ * Ask the LLM which of the user-supplied `criteria` phrases have NO
+ * supporting paragraph anywhere in the document. Reuses the exact same
+ * graph+paragraph-listing context `checkIntegrity` builds (via
+ * `buildGraphAndParagraphContext`) rather than reinventing it — same
+ * "requires a fresh analysis" precondition, for the same reason (the graph is
+ * part of the input). Returns `null` (with a toast already shown) on any
+ * failure — precondition not met, empty criteria, or a request/parse error —
+ * so the caller (`CriteriaPanel`) only has to render the busy/error/result
+ * states, not re-derive them.
+ */
+export async function checkAgainstCriteria(
+  criteria: string[]
+): Promise<CriteriaCheckResult[] | null> {
+  const s = useStore.getState();
+  if (s.globalBusy) return null;
+  if (!aiReady()) {
+    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.openSettings();
+    return null;
+  }
+  const cleaned = criteria.map((c) => c.trim()).filter(Boolean);
+  if (!cleaned.length) {
+    s.notify("Add at least one review criterion first.", "info");
+    return null;
+  }
+  const analysis = s.doc.analysis;
+  if (!analysis || s.analysisStale) {
+    s.notify(
+      "Run Analyze first so criteria checking has a fresh relationship graph.",
+      "info"
+    );
+    return null;
+  }
+  const tab = s.activeTabId;
+  const ctx = buildGraphAndParagraphContext();
+  if (!ctx) {
+    s.notify("Nothing to check yet — write something first.", "info");
+    return null;
+  }
+  const { ids, text } = ctx;
+  const criteriaListing = cleaned.map((c, i) => `${i + 1}. ${c}`).join("\n");
+  const fullText = [text, "", "REVIEW CRITERIA:", criteriaListing].join("\n");
+  s.setGlobalBusy("Checking against review criteria…", tab);
+  try {
+    const raw = await api.aiProcess({
+      action: "custom",
+      text: fullText,
+      instruction:
+        "You are checking document coverage against a list of user-supplied review criteria. The " +
+        "text contains the document's relationship graph, its paragraphs (each prefixed with its " +
+        "id in [brackets]), and a numbered REVIEW CRITERIA list. For EVERY criterion, decide " +
+        "whether the document contains a paragraph that genuinely supports/addresses it, and if " +
+        "so which paragraph id(s). Return STRICT JSON only — no prose, no code fences — shaped " +
+        'exactly as {"results":[{"criterion":"...","covered":true|false,' +
+        '"supportingChunkIds":["..."]}]}, with exactly one entry per criterion, copying each ' +
+        "criterion's text EXACTLY as given and copying every id exactly from the [brackets]. " +
+        'A criterion with no genuinely supporting paragraph MUST be reported as "covered":false ' +
+        'with "supportingChunkIds":[].',
+    });
+    if (useStore.getState().activeTabId !== tab) {
+      s.notify("Switched tabs — criteria check discarded.", "info");
+      return null;
+    }
+    const results = parseCriteriaResults(raw, cleaned, ids);
+    const uncovered = results.filter((r) => !r.covered).length;
+    if (uncovered) {
+      s.notify(
+        `Criteria check: ${uncovered} of ${results.length} not covered.`,
+        "info"
+      );
+    } else {
+      s.notify("Criteria check: every criterion is covered.", "success");
+    }
+    return results;
+  } catch (e) {
+    s.notify(message(e), "error");
+    return null;
   } finally {
     useStore.getState().setGlobalBusy(null, tab);
   }

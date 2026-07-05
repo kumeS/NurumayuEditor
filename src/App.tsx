@@ -26,6 +26,7 @@ import HealthBar from "./components/HealthBar";
 import ErrorBoundary from "./components/ErrorBoundary";
 import SlideEditor from "./components/SlideEditor";
 import HelpModal from "./components/HelpModal";
+import PresentationMode from "./components/PresentationMode";
 import SelectionBar from "./components/SelectionBar";
 import SettingsModal from "./components/SettingsModal";
 import TabBar from "./components/TabBar";
@@ -74,6 +75,7 @@ async function okToClose(): Promise<boolean> {
 function App() {
   const networkOpen = useStore((s) => s.networkOpen);
   const reviewPanelOpen = useStore((s) => s.reviewPanelOpen);
+  const presentationOpen = useStore((s) => s.presentationOpen);
   const mode = useStore((s) => s.doc.mode ?? "editor");
   const activeTabId = useStore((s) => s.activeTabId);
   const setSettings = useStore((s) => s.setSettings);
@@ -283,6 +285,17 @@ function App() {
           </Suspense>
         )}
       </div>
+      {/* Item 1-3: the presentation overlay is a separate, ephemeral, UI-only
+          state (NOT a third doc.mode value) — mounted as a SIBLING of the main
+          content, not nested in the mode ternary above, so it can open over
+          either Edit or Preview and survives whichever sub-view was active.
+          Keyed by view+tab like the main ErrorBoundary above, so a crash here
+          resets on tab switch instead of trapping the user in a blank overlay. */}
+      {presentationOpen && (
+        <ErrorBoundary key={`presentation:${activeTabId}`}>
+          <PresentationMode />
+        </ErrorBoundary>
+      )}
       <HealthBar />
 
       <SettingsModal />

@@ -203,6 +203,23 @@ function structurallyStale(doc: Document): boolean {
   );
 }
 
+/**
+ * Clamp/advance the presentation overlay's current slide index by `delta`
+ * (item 1-3) — never below 0 or beyond `slideCount - 1`. Used for the bare
+ * arrow-key/space next/previous navigation inside PresentationMode, extracted
+ * as a pure function so the deck-bounds behaviour has a direct unit test
+ * (empty deck / first slide / last slide) independent of any keyboard or
+ * rendering integration.
+ */
+export function clampPresentIndex(
+  current: number,
+  delta: number,
+  slideCount: number
+): number {
+  if (slideCount <= 0) return 0;
+  return Math.min(Math.max(current + delta, 0), slideCount - 1);
+}
+
 export type ToastKind = "info" | "success" | "error";
 export interface Toast {
   id: number;
@@ -220,6 +237,12 @@ interface TabSnapshot {
   doc: Document;
   filePath: string | null;
   dirty: boolean;
+  // The document as it was at the last save/open (item 1-2): the baseline
+  // documentDiff() compares `doc` against to drive the "changes since last
+  // save" view. null only transiently before the very first load (never
+  // exposed to the UI, since loadDocument/newTab always set it in the SAME
+  // action that clears dirty).
+  savedDoc: Document | null;
   past: Document[];
   future: Document[];
   analysis: AnalysisResult | null;
@@ -240,6 +263,7 @@ function snapshotActive(s: AppState): TabSnapshot {
     doc: s.doc,
     filePath: s.filePath,
     dirty: s.dirty,
+    savedDoc: s.savedDoc,
     past: s.past,
     future: s.future,
     analysis: s.analysis,
@@ -258,6 +282,7 @@ function applySnapshot(snap: TabSnapshot) {
     doc: snap.doc,
     filePath: snap.filePath,
     dirty: snap.dirty,
+    savedDoc: snap.savedDoc,
     past: snap.past,
     future: snap.future,
     analysis: snap.analysis,
@@ -272,6 +297,9 @@ function applySnapshot(snap: TabSnapshot) {
     flashChunkIds: [],
     selectedChunkIds: [],
     lastAiEditChunkId: null,
+    // A ghost suggestion is scoped to a specific chunk in the OUTGOING
+    // document — meaningless (and potentially confusing) on the incoming tab.
+    ghostSuggestion: null,
     // The queue indexes the OUTGOING document — meaningless for the incoming tab.
     speechQueue: [],
   };
@@ -284,6 +312,11 @@ interface AppState {
   doc: Document;
   filePath: string | null; // current native (.aix) file, if any
   dirty: boolean;
+  // The document as it was at the last save/open — baseline for documentDiff()
+  // (item 1-2). Kept in lockstep with `dirty`: every action that sets
+  // dirty:false after a load/save also sets this in the SAME action, so the
+  // two can never drift apart.
+  savedDoc: Document | null;
 
   // ----- tabs -----
   tabOrder: string[];
@@ -303,6 +336,17 @@ interface AppState {
   // real content is untouched until the stream finalises.
   streamingChunkId: string | null;
   streamingText: string;
+  // Ghost-text inline completion (開発.txt Stage 2, item 2-4): a transient,
+  // non-undoable overlay suggestion — NEVER written into `chunk.content` until
+  // explicitly accepted (Tab). `requestId` is a monotonic per-store counter:
+  // the component that fired the completion request captures the id it was
+  // issued and only applies a result if it still matches `ghostRequestId`,
+  // which is how a superseded (stale) in-flight request's late result is
+  // discarded (last-request-wins), mirroring the tab-race-guard pattern
+  // aiActions.ts already uses for chunk actions (`chunkStillActive` /
+  // `streamingChunkId === chunkId` checks).
+  ghostSuggestion: { chunkId: string; text: string } | null;
+  ghostRequestId: number;
   // Read-aloud (UI3): the single chunk currently being spoken, plus the backend
   // utterance id so a stale `speech-done` event can't clear a newer playback.
   speakingChunkId: string | null;
@@ -323,6 +367,16 @@ interface AppState {
   // when the panel is opened from a chunk's gutter comment button).
   reviewPanelOpen: boolean;
   reviewTargetChunkId: string | null;
+  // "Changes since last save" popover (item 1-2), toggled from the HealthBar
+  // indicator or the command palette — not per-tab (like networkOpen), since
+  // it's a transient view over whichever tab is active.
+  diffPanelOpen: boolean;
+  // Fullscreen presentation overlay (item 1-3): ephemeral, UI-only state — NOT
+  // a third `doc.mode` value (that's persisted editor/slide document state).
+  // Not per-tab (like networkOpen/diffPanelOpen): it's a transient view over
+  // whichever tab is active, opened from the Slide editor's Present button or
+  // the command palette.
+  presentationOpen: boolean;
   settingsOpen: boolean;
   draftOpen: boolean;
   helpOpen: boolean;
@@ -383,6 +437,7 @@ interface AppActions {
   setChunkLayout: (id: string, layout: SlideLayout | null) => void;
   setChunkSubtitle: (id: string, subtitle: boolean) => void;
   setSlideBody: (leadId: string, body: string[] | null) => void;
+  setChunkNotes: (id: string, notes: string) => void;
   replaceChunksWithTexts: (ids: string[], texts: string[]) => void;
   splitSlideBefore: (chunkId: string) => string | null;
   mergeSlideIntoPrevious: (headingChunkId: string) => string | null;
@@ -399,6 +454,12 @@ interface AppActions {
   beginChunkStream: (id: string, tabId?: string) => void;
   updateChunkStream: (text: string, tabId?: string) => void;
   endChunkStream: (tabId?: string) => void;
+  // Ghost-text (開発.txt Stage 2, item 2-4). `startGhostRequest` bumps and
+  // returns the new request id BEFORE any async call is made, so the caller
+  // can guard its own `on_delta`/resolution against being superseded.
+  startGhostRequest: () => number;
+  setGhostSuggestion: (chunkId: string, text: string, requestId: number) => void;
+  clearGhostSuggestion: () => void;
   // Read-aloud lifecycle (UI3).
   beginSpeaking: (chunkId: string, utterance: number) => void;
   endSpeaking: (utterance?: number) => void;
@@ -423,6 +484,9 @@ interface AppActions {
   toggleNetwork: (open?: boolean) => void;
   toggleReviewPanel: (open?: boolean) => void;
   setReviewTarget: (id: string | null) => void;
+  toggleDiffPanel: (open?: boolean) => void;
+  openPresentation: () => void;
+  closePresentation: () => void;
 
   // Review comments (per-chunk, persisted in metadata.comments). All undoable;
   // comments never invalidate the relationship graph (marksStale:false).
@@ -443,7 +507,16 @@ interface AppActions {
   undo: () => void;
   redo: () => void;
 
-  markClean: (filePath?: string | null) => void;
+  // `savedDocument` is the EXACT document that was just written to disk —
+  // callers MUST pass the snapshot they captured before the (async) write, not
+  // rely on this reading "whatever doc is live right now". Save IPC calls are
+  // awaited without blocking the editor, so the live doc can advance (another
+  // keystroke) while the write is in flight; reading `get().doc` here would
+  // silently promote that unsaved keystroke into the baseline (dirty:false
+  // AND savedDoc pointing past what's actually on disk — the two are supposed
+  // to be inseparable, item 1-2). Defaults to the current doc ONLY for callers
+  // with no async gap between capturing and calling (e.g. tests).
+  markClean: (filePath?: string | null, savedDocument?: Document) => void;
 }
 
 const MAX_HISTORY = 100;
@@ -507,10 +580,13 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     chunks: fn(doc.chunks),
   });
 
+  const initialDoc = makeInitialDoc();
   return {
-    doc: makeInitialDoc(),
+    doc: initialDoc,
     filePath: null,
     dirty: false,
+    // A brand-new blank tab's baseline is itself — no changes yet (item 1-2).
+    savedDoc: initialDoc,
     tabOrder: [INITIAL_TAB_ID],
     activeTabId: INITIAL_TAB_ID,
     inactiveTabs: {},
@@ -524,6 +600,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     globalBusy: null,
     streamingChunkId: null,
     streamingText: "",
+    ghostSuggestion: null,
+    ghostRequestId: 0,
     speakingChunkId: null,
     speakingUtterance: null,
     speechQueue: [],
@@ -532,6 +610,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     networkOpen: false,
     reviewPanelOpen: false,
     reviewTargetChunkId: null,
+    diffPanelOpen: false,
+    presentationOpen: false,
     settingsOpen: false,
     draftOpen: false,
     helpOpen: false,
@@ -551,6 +631,11 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         // must be dirty — otherwise the tab/quit guards treat irreproducible AI
         // drafts as "clean" and discard them silently.
         dirty: opts?.dirty ?? false,
+        // The just-opened/imported document IS the new baseline (item 1-2) even
+        // when it's dirty (e.g. a repaired-on-load file, or an AI draft with no
+        // backing file yet) — "since last save" reads as "since this doc showed
+        // up", not "since an unreachable on-disk state".
+        savedDoc: doc,
         past: [],
         future: [],
         // Prefer the persisted full graph (paragraph + sentence nodes); fall back
@@ -561,6 +646,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         lastEditChunkId: null,
         lastAiEditChunkId: null,
         selectedChunkIds: [],
+        ghostSuggestion: null,
       }),
 
     // Live streaming snapshot (Draft): replace the document only — no history,
@@ -580,6 +666,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           doc: fresh,
           filePath: null,
           dirty: false,
+          // A fresh blank tab's baseline is itself (item 1-2).
+          savedDoc: fresh,
           past: [],
           future: [],
           analysis: null,
@@ -591,6 +679,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           flashChunkIds: [],
           speechQueue: [],
           selectedChunkIds: [],
+          ghostSuggestion: null,
           // A fresh tab starts with no in-flight operations (B3).
           globalBusy: null,
           streamingChunkId: null,
@@ -649,6 +738,10 @@ export const useStore = create<AppState & AppActions>((set, get) => {
             doc: t.doc,
             filePath: t.filePath,
             dirty: t.dirty,
+            // PersistedTab carries no baseline (item 1-2 predates session
+            // persistence) — treat the restored doc as its own baseline, same
+            // as any other freshly-loaded document.
+            savedDoc: t.doc,
             past: [],
             future: [],
             analysis: t.doc.analysis ?? rebuildAnalysis(t.doc),
@@ -668,6 +761,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           doc: active.doc,
           filePath: active.filePath,
           dirty: active.dirty,
+          savedDoc: active.doc,
           past: [],
           future: [],
           analysis: active.doc.analysis ?? rebuildAnalysis(active.doc),
@@ -1289,6 +1383,24 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         { marksStale: false }
       ),
 
+    // Set a slide's speaker notes on its heading chunk (item 1-1). Presentation-
+    // only, so it doesn't invalidate the relationship graph — same rationale as
+    // setChunkSubtitle/setSlideBody. A blank (after-trim) string is stored as
+    // `undefined`, mirroring the Rust normalize() rule that collapses an
+    // empty-after-trim notes string to `None` so it never round-trips as `Some("")`.
+    setChunkNotes: (id, notes) =>
+      commit(
+        (doc) =>
+          mapChunks(doc, (chunks) =>
+            chunks.map((c) =>
+              c.id === id
+                ? { ...c, metadata: { ...c.metadata, notes: notes.trim() ? notes : undefined } }
+                : c
+            )
+          ),
+        { marksStale: false }
+      ),
+
     // Replace a set of chunks with fresh text chunks (one per string), inserted
     // at the position of the first removed chunk. Used by AI "Bulletize" to turn
     // a slide's prose into separate bullet chunks. Keeps ≥1 chunk overall.
@@ -1393,6 +1505,41 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         streamingChunkId: null,
         streamingText: "",
       }),
+
+    // Ghost-text (開発.txt Stage 2, item 2-4). Not per-tab and not routed
+    // through routeTabPatch/undo history: it never touches `doc`, so a
+    // background tab has nothing to reconcile, and there's nothing to
+    // reconstruct on undo/redo either — it's pure ephemeral UI state, like
+    // `flashChunkId`.
+    startGhostRequest: () => {
+      const next = get().ghostRequestId + 1;
+      set({ ghostRequestId: next });
+      return next;
+    },
+    setGhostSuggestion: (chunkId, text, requestId) => {
+      // Discard a result from a superseded request (last-request-wins) — the
+      // guard the spec asks for, mirroring aiActions.ts's
+      // `streamingChunkId === chunkId` / `chunkStillActive` checks.
+      if (requestId !== get().ghostRequestId) return;
+      set({ ghostSuggestion: { chunkId, text } });
+    },
+    // Bumping `ghostRequestId` here (not just clearing the suggestion) is
+    // load-bearing: the backend stream for the request that produced the
+    // now-dismissed/accepted suggestion is NOT server-cancelled (it is a
+    // background nicety — see `cancelChunkAction`'s comment on the same
+    // pattern for one-click actions), so it keeps delivering deltas, and
+    // eventually its final `.then(finalText => ...)`, after Escape/Tab. Every
+    // one of those callbacks captured the OLD requestId and calls
+    // `setGhostSuggestion` with it. Without the bump, that id still matched
+    // `ghostRequestId` (only `startGhostRequest` used to advance it), so a
+    // late delta silently resurrected a dismissed/already-accepted suggestion
+    // — visibly reappearing after Escape, or, worse, letting a second Tab
+    // duplicate content that was already merged in on accept. Bumping here
+    // makes every in-flight callback's id stale immediately, the same
+    // guard `setGhostSuggestion` already enforces for keystroke-driven
+    // supersession.
+    clearGhostSuggestion: () =>
+      set({ ghostSuggestion: null, ghostRequestId: get().ghostRequestId + 1 }),
 
     // Read-aloud (UI3): a single global "currently speaking" chunk + the backend
     // utterance id, so a `speech-done` for an older utterance can't clear a newer
@@ -1512,6 +1659,15 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       }),
 
     setReviewTarget: (id) => set({ reviewTargetChunkId: id }),
+
+    toggleDiffPanel: (open) =>
+      set((s) => ({ diffPanelOpen: open ?? !s.diffPanelOpen })),
+
+    // Fullscreen presentation overlay (item 1-3) — plain open/close (not a
+    // toggle) so the palette entry and the Slide editor's Present button both
+    // read as an unambiguous "start"/"stop", matching openSettings/closeSettings.
+    openPresentation: () => set({ presentationOpen: true }),
+    closePresentation: () => set({ presentationOpen: false }),
 
     // ----- review comments (persisted in chunk metadata; spec mismatch §2) -----
     addComment: (chunkId, text, author = "user", kind) => {
@@ -1675,10 +1831,16 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         };
       }),
 
-    markClean: (filePath) =>
+    markClean: (filePath, savedDocument) =>
       set((s) => ({
         dirty: false,
         filePath: filePath === undefined ? s.filePath : filePath,
+        // The just-saved document IS the new baseline (item 1-2). Both
+        // saveNative and saveNativeAs pass the EXACT doc they wrote (captured
+        // before the async IPC call) so a keystroke landing during the write
+        // can never be silently promoted into the baseline — see the
+        // `savedDocument` param doc for why `s.doc` here would be unsafe.
+        savedDoc: savedDocument ?? s.doc,
       })),
   };
 });

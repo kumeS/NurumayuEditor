@@ -14,6 +14,31 @@ use crate::models::{AnalysisResult, Document, CHUNK_TYPE_HEADING, CHUNK_TYPE_TEX
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ----- "zero external transmission" visibility (開発.txt Stage 2, item 2-2) --
+//
+// Process-wide counters for actual LLM API traffic. NOTE for future readers:
+// unlike reference/image fetches (guarded through `net::safe_fetch`), the LLM
+// calls below do NOT go through that chokepoint at all — `complete()`,
+// `complete_stream()`, and `generate_image()` each build their own
+// `reqwest::Client` and funnel the real request through `send_with_retry`
+// here. That is deliberately the single instrumentation point (one counter
+// bump covers all three call sites) rather than three separate ones. Kept as
+// a SEPARATE pair of counters from `net::stats()` — LLM calls and
+// reference/image fetches are conceptually different traffic, and a user
+// should be able to tell them apart in the health bar.
+static AI_CALLS: AtomicU64 = AtomicU64::new(0);
+static AI_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Current LLM-call traffic: `(calls, bytes)`. A "call" is every attempt that
+/// reaches `send_with_retry` (i.e. actually sent, or tried to send, a request
+/// to the configured endpoint — retries of the SAME logical call are not
+/// double-counted); "bytes" counts the response body bytes of the final
+/// (non-retried) response actually returned to the caller.
+pub fn ai_call_stats() -> (u64, u64) {
+    (AI_CALLS.load(Ordering::Relaxed), AI_BYTES.load(Ordering::Relaxed))
+}
 
 /// Configuration needed to reach a provider for a single request.
 #[derive(Debug, Clone)]
@@ -53,6 +78,11 @@ async fn send_with_retry(
     api_key: &str,
     payload: &serde_json::Value,
 ) -> AppResult<reqwest::Response> {
+    // One logical LLM call, however many retries it takes underneath — counted
+    // once, up front, since this is the single funnel point all three call
+    // sites (complete/complete_stream/generate_image) go through.
+    AI_CALLS.fetch_add(1, Ordering::Relaxed);
+
     const MAX_ATTEMPTS: u32 = 3;
     let mut attempt: u32 = 0;
     loop {
@@ -113,7 +143,9 @@ impl LlmProvider for OpenRouterProvider {
         let res = send_with_retry(&client, &self.config.endpoint, &self.config.api_key, &payload)
             .await?;
         let status = res.status();
-        let body: serde_json::Value = res.json().await?;
+        let raw = res.bytes().await?;
+        AI_BYTES.fetch_add(raw.len() as u64, Ordering::Relaxed);
+        let body: serde_json::Value = serde_json::from_slice(&raw)?;
 
         if !status.is_success() {
             let provider_msg = body["error"]["message"]
@@ -155,6 +187,45 @@ impl LlmProvider for OpenRouterProvider {
     }
 }
 
+/// Per-call overrides for the chat-completions request payload. Strictly
+/// additive/optional: every existing call site keeps building its payload
+/// from `config.temperature` and no max-token cap (`None`/default) unless it
+/// explicitly opts in, so this cannot change behaviour for any existing
+/// action. Ghost-text (開発.txt Stage 2, item 2-4) is the first caller that
+/// sets both fields, to keep its completion short, fast and cheap.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompletionOverrides {
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
+/// Build the JSON payload for a streaming chat-completions request. Pure (no
+/// I/O) so the override plumbing is unit-testable without a network call.
+/// `overrides.temperature` replaces `config.temperature`; `overrides.max_tokens`
+/// is added only when present — omitting it entirely reproduces exactly what
+/// `complete_stream` always sent, before this function existed.
+fn build_stream_payload(
+    config: &LlmConfig,
+    system: &str,
+    user: &str,
+    overrides: Option<CompletionOverrides>,
+) -> serde_json::Value {
+    let temperature = overrides.and_then(|o| o.temperature).unwrap_or(config.temperature);
+    let mut payload = json!({
+        "model": config.model,
+        "temperature": temperature,
+        "stream": true,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ]
+    });
+    if let Some(max_tokens) = overrides.and_then(|o| o.max_tokens) {
+        payload["max_tokens"] = json!(max_tokens);
+    }
+    payload
+}
+
 impl OpenRouterProvider {
     /// Stream a completion token-by-token. `on_delta` is called with the FULL
     /// accumulated text each time new content arrives; the final text is returned.
@@ -162,18 +233,23 @@ impl OpenRouterProvider {
         &self,
         system: &str,
         user: &str,
+        on_delta: F,
+    ) -> AppResult<String> {
+        self.complete_stream_with(system, user, None, on_delta).await
+    }
+
+    /// Same as `complete_stream`, with optional per-call `overrides` (temperature /
+    /// max_tokens). `None` reproduces the exact payload `complete_stream` always
+    /// sent, so this is a backward-compatible superset, not a behaviour change.
+    pub async fn complete_stream_with<F: FnMut(&str)>(
+        &self,
+        system: &str,
+        user: &str,
+        overrides: Option<CompletionOverrides>,
         mut on_delta: F,
     ) -> AppResult<String> {
         let client = reqwest::Client::new();
-        let payload = json!({
-            "model": self.config.model,
-            "temperature": self.config.temperature,
-            "stream": true,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user }
-            ]
-        });
+        let payload = build_stream_payload(&self.config, system, user, overrides);
 
         // Retries (429/5xx/network) happen inside `send_with_retry`, i.e. only
         // BEFORE the first delta has been forwarded to the caller. Once the
@@ -213,6 +289,7 @@ impl OpenRouterProvider {
 
         while let Some(item) = stream.next().await {
             let bytes = item.map_err(AppError::from)?;
+            AI_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             buf.extend_from_slice(&bytes);
 
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -473,6 +550,53 @@ pub async fn run_action_stream<F: FnMut(&str)>(
     provider.complete_stream(&system, &user, on_delta).await
 }
 
+// ----- ghost-text inline completion (開発.txt Stage 2, item 2-4) -----------
+//
+// Deliberately NOT routed through `AiRequest`/`action_system`/`action_user`:
+// those assemble a whole-document-aware context (section heading, document
+// map, linked chunks) sized for one-click actions the user explicitly
+// triggered, which is both slower and unnecessary for a completion that must
+// feel instant while the user is still typing. This is a narrow, separate
+// request shape by design — see `commands::ai_ghost_complete_stream`.
+
+/// Max tokens requested for a ghost-text continuation — short by design (a
+/// phrase to a sentence, not a paragraph), which keeps latency and cost low.
+const GHOST_TEXT_MAX_TOKENS: u32 = 40;
+/// Low, near-deterministic temperature: a ghost suggestion that changes
+/// wildly between keystrokes is more distracting than no suggestion at all.
+const GHOST_TEXT_TEMPERATURE: f32 = 0.2;
+
+/// Stream a short inline continuation of `prefix` (the text immediately
+/// before the cursor). `context_hint` is optional, cheap orientation (e.g. the
+/// section heading) — never a full document map, so this stays fast.
+/// `on_delta` receives the FULL accumulated text each time new content
+/// arrives; the final text is returned.
+pub async fn complete_ghost_text_stream<F: FnMut(&str)>(
+    config: &LlmConfig,
+    prefix: &str,
+    context_hint: &str,
+    on_delta: F,
+) -> AppResult<String> {
+    let provider = OpenRouterProvider::new(config.clone());
+    let system = "You are an inline autocomplete engine for a prose writing tool. Continue the \
+        user's sentence/paragraph naturally from exactly where it stops. Output ONLY the \
+        continuation text — no repetition of what was already written, no preamble, no \
+        quotation marks, no markdown. Keep it brief: a few words to at most one short sentence. \
+        Stop at a natural point (end of clause or sentence) rather than trailing off mid-word.";
+    let user = if context_hint.trim().is_empty() {
+        format!("[Text so far]\n{}", prefix)
+    } else {
+        format!("[Section]\n{}\n\n[Text so far]\n{}", context_hint.trim(), prefix)
+    };
+    let overrides = CompletionOverrides {
+        max_tokens: Some(GHOST_TEXT_MAX_TOKENS),
+        temperature: Some(GHOST_TEXT_TEMPERATURE),
+    };
+    provider
+        .complete_stream_with(system, &user, Some(overrides), on_delta)
+        .await
+}
+
 fn strip_code_fences(s: &str) -> String {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix("```") {
@@ -527,7 +651,9 @@ pub async fn generate_image(config: &LlmConfig, prompt: &str) -> AppResult<Strin
     let res = send_with_retry(&client, &config.endpoint, &config.api_key, &payload).await?;
 
     let status = res.status();
-    let body: serde_json::Value = res.json().await?;
+    let raw = res.bytes().await?;
+    AI_BYTES.fetch_add(raw.len() as u64, Ordering::Relaxed);
+    let body: serde_json::Value = serde_json::from_slice(&raw)?;
     if !status.is_success() {
         let provider_msg = body["error"]["message"]
             .as_str()
@@ -819,6 +945,88 @@ fn normalize_analysis(result: &mut AnalysisResult) {
 mod tests {
     use super::*;
     use crate::models::{AnalysisEdge, AnalysisNode, Chunk, Document, CHUNK_TYPE_IMAGE};
+
+    fn test_config() -> LlmConfig {
+        LlmConfig {
+            endpoint: "http://example.invalid/".to_string(),
+            model: "test/model".to_string(),
+            api_key: "test-key".to_string(),
+            temperature: 0.3,
+        }
+    }
+
+    /// f32 -> JSON goes through f64, so e.g. 0.3f32 prints as
+    /// 0.30000001192092896 — compare via the f32 round-trip instead of a raw
+    /// JSON `Value` equality, which is what these tests actually care about.
+    fn temperature_of(payload: &serde_json::Value) -> f32 {
+        payload["temperature"].as_f64().expect("temperature is a number") as f32
+    }
+
+    #[test]
+    fn build_stream_payload_without_overrides_matches_prior_shape() {
+        // No overrides: reproduces exactly what `complete_stream` always sent —
+        // config.temperature, no max_tokens key at all.
+        let payload = build_stream_payload(&test_config(), "sys", "usr", None);
+        assert_eq!(temperature_of(&payload), 0.3);
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "max_tokens must be absent when no override is given: {payload}"
+        );
+        assert_eq!(payload["model"], json!("test/model"));
+        assert_eq!(payload["messages"][0]["content"], json!("sys"));
+        assert_eq!(payload["messages"][1]["content"], json!("usr"));
+    }
+
+    #[test]
+    fn build_stream_payload_overrides_reach_the_payload() {
+        // Ghost-text's low-temperature / short-max-tokens request actually lands
+        // in the built JSON, without touching the default config.temperature.
+        let overrides = CompletionOverrides { max_tokens: Some(40), temperature: Some(0.2) };
+        let payload = build_stream_payload(&test_config(), "sys", "usr", Some(overrides));
+        assert_eq!(temperature_of(&payload), 0.2);
+        assert_eq!(payload["max_tokens"], json!(40));
+    }
+
+    #[test]
+    fn build_stream_payload_partial_override_only_sets_given_field() {
+        // Overriding only max_tokens must NOT also change the temperature away
+        // from config.temperature — the two fields are independent.
+        let overrides = CompletionOverrides { max_tokens: Some(10), temperature: None };
+        let payload = build_stream_payload(&test_config(), "sys", "usr", Some(overrides));
+        assert_eq!(temperature_of(&payload), 0.3);
+        assert_eq!(payload["max_tokens"], json!(10));
+    }
+
+    // `send_with_retry` is the single funnel point `complete()`, `complete_stream()`
+    // and `generate_image()` all go through, so exercising it directly (rather
+    // than the three call sites, and without a real network call / new mock-
+    // server dependency) is enough to prove the counter fires exactly once per
+    // LOGICAL call — even though the target here fails on every one of its
+    // internal retry attempts. `example.invalid` is reserved by RFC 2606 to
+    // never resolve, so this never touches the network; a short client timeout
+    // keeps each of the 3 attempts (and their capped backoff) fast.
+    #[test]
+    fn send_with_retry_counts_one_call_despite_internal_retries() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (calls_before, _) = ai_call_stats();
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let result = rt.block_on(send_with_retry(
+            &client,
+            "http://example.invalid/",
+            "test-key",
+            &json!({}),
+        ));
+
+        assert!(result.is_err(), "a non-resolving host must fail");
+        let (calls_after, _) = ai_call_stats();
+        // Exactly one logical call counted, no matter how many retry attempts
+        // `send_with_retry` made internally.
+        assert_eq!(calls_after, calls_before + 1);
+    }
 
     #[test]
     fn extract_json_plain_object() {

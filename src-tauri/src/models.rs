@@ -85,6 +85,14 @@ pub struct ChunkMetadata {
     /// broken by document order) — see the multi-image grid in `pptx.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,
+    /// Speaker notes for the slide this chunk begins (only meaningful on a
+    /// heading chunk that starts a slide). Populated into `Slide::notes` by
+    /// `deck::document_to_deck` and emitted as a PPTX notesSlide part by
+    /// `pptx.rs`. A present-but-empty-after-trim string is normalized to
+    /// `None` (see `Document::normalize`) so the field never round-trips as
+    /// `Some("")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 /// A review comment on a chunk (frontend-owned; persisted only). Mirrors the
@@ -127,6 +135,7 @@ impl Default for ChunkMetadata {
             comments: None,
             summary_hash: None,
             slot: None,
+            notes: None,
         }
     }
 }
@@ -303,6 +312,7 @@ impl Document {
         let mut clamped_levels = 0usize;
         let mut dropped_layouts = 0usize;
         let mut dropped_links = 0usize;
+        let mut blanked_notes = 0usize;
         for c in &mut self.chunks {
             if !known_types.contains(&c.metadata.chunk_type.as_str()) {
                 c.metadata.chunk_type = CHUNK_TYPE_TEXT.to_string();
@@ -321,6 +331,13 @@ impl Document {
                     dropped_layouts += 1;
                 }
             }
+            // A present-but-empty-after-trim notes string is the same as "no
+            // notes" — collapse it to `None` so the field never round-trips as
+            // `Some("")` (e.g. a UI textarea cleared to whitespace).
+            if c.metadata.notes.as_deref().is_some_and(|n| n.trim().is_empty()) {
+                c.metadata.notes = None;
+                blanked_notes += 1;
+            }
             let before = c.metadata.linked_chunks.len();
             c.metadata
                 .linked_chunks
@@ -338,6 +355,11 @@ impl Document {
         }
         if dropped_links > 0 {
             notes.push(format!("Removed {dropped_links} link(s) to missing paragraphs."));
+        }
+        if blanked_notes > 0 {
+            notes.push(format!(
+                "{blanked_notes} chunk(s) had blank speaker notes; cleared."
+            ));
         }
 
         // ---- 5. Prune a persisted analysis graph of references to gone chunks.
@@ -398,7 +420,9 @@ pub struct Slide {
     /// Reused editor chunks: heading = title, text = bullets, image, diagram.
     #[serde(default)]
     pub chunks: Vec<Chunk>,
-    /// Speaker notes (not yet emitted to PPTX; reserved for a later phase).
+    /// Speaker notes, derived by `deck::document_to_deck` from the slide's
+    /// heading chunk's `ChunkMetadata::notes` (empty string when absent).
+    /// Emitted as a PPTX notesSlide part by `pptx.rs`.
     #[serde(default)]
     pub notes: String,
 }
@@ -578,5 +602,51 @@ mod tests {
         doc.chunks.push(Chunk::new_text(1, "body"));
         let notes = doc.normalize();
         assert!(notes.is_empty(), "no repairs expected: {notes:?}");
+    }
+
+    #[test]
+    fn blank_notes_are_normalized_to_none() {
+        // A present-but-empty-after-trim notes string is treated the same as
+        // no notes at all, so it never round-trips as `Some("")`.
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "H");
+        h.metadata.notes = Some("   ".into());
+        doc.chunks.push(h);
+        let notes = doc.normalize();
+        assert_eq!(doc.chunks[0].metadata.notes, None);
+        assert!(notes.iter().any(|n| n.contains("notes")), "expected a repair note: {notes:?}");
+    }
+
+    #[test]
+    fn non_empty_notes_survive_normalize_untouched() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "H");
+        h.metadata.notes = Some("Remember to mention X".into());
+        doc.chunks.push(h);
+        let notes = doc.normalize();
+        assert_eq!(doc.chunks[0].metadata.notes.as_deref(), Some("Remember to mention X"));
+        assert!(notes.is_empty(), "no repairs expected: {notes:?}");
+    }
+
+    #[test]
+    fn chunk_metadata_notes_round_trips_through_json() {
+        // .aix save/load is exactly serde_json::to_string / from_str over
+        // `Document` (see commands.rs save_document/open_document) — a chunk
+        // with metadata.notes set must survive that round trip unchanged.
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "H");
+        h.metadata.notes = Some("Remember to mention X".into());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "body"));
+
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let mut back: Document = serde_json::from_str(&json).expect("deserialize");
+        back.normalize();
+
+        assert_eq!(
+            back.chunks[0].metadata.notes.as_deref(),
+            Some("Remember to mention X"),
+            "notes should round-trip through the .aix JSON shape"
+        );
     }
 }

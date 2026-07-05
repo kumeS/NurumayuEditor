@@ -10,6 +10,7 @@ import {
   slideImage,
   slideImages,
   slideMoveBounds,
+  slideNotes,
   slideOverflows,
   slideSubtitle,
   slideTitle,
@@ -261,6 +262,25 @@ describe("detach / slideBody (Req 2)", () => {
     const [slide] = groupSlides([t, chunk("u", "text", "more")]);
     expect(isSlideDetached(slide)).toBe(true);
     expect(slideBullets(slide)).toEqual(["S1"]);
+  });
+});
+
+describe("slideNotes (contract test — mirrors deck.rs's heading_notes_populate_the_slides_notes_field / heading_without_notes_yields_empty_slide_notes)", () => {
+  it("a heading chunk with notes produces that notes value", () => {
+    const h = chunk("h", "heading", "Intro");
+    h.metadata.notes = "Remember to mention X";
+    const [slide] = groupSlides([h, chunk("a", "text", "bullet")]);
+    expect(slideNotes(slide)).toBe("Remember to mention X");
+  });
+
+  it("a heading chunk with no notes yields an empty string", () => {
+    const [slide] = groupSlides([chunk("h", "heading", "Intro"), chunk("a", "text", "bullet")]);
+    expect(slideNotes(slide)).toBe("");
+  });
+
+  it("a heading-less (leading) slide has no heading to carry notes, so it's always empty", () => {
+    const [slide] = groupSlides([chunk("a", "text", "lonely")]);
+    expect(slideNotes(slide)).toBe("");
   });
 });
 

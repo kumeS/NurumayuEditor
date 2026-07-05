@@ -69,7 +69,22 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
         Ok(())
     };
 
-    add(&mut zip, "[Content_Types].xml", content_types(n).as_bytes())?;
+    // Slide numbers (1-based) that carry non-empty speaker notes, so the
+    // content-types manifest declares a notesSlideN.xml override ONLY for
+    // slides that actually get one — no empty notesSlide parts.
+    let notes_slide_numbers: Vec<usize> = deck
+        .slides
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.notes.trim().is_empty())
+        .map(|(i, _)| i + 1)
+        .collect();
+
+    add(
+        &mut zip,
+        "[Content_Types].xml",
+        content_types(n, &notes_slide_numbers).as_bytes(),
+    )?;
     add(&mut zip, "_rels/.rels", PACKAGE_RELS.as_bytes())?;
     add(&mut zip, "docProps/core.xml", core_xml(&deck.title).as_bytes())?;
     add(&mut zip, "docProps/app.xml", app_xml(n).as_bytes())?;
@@ -105,6 +120,7 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
     for (i, slide) in deck.slides.iter().enumerate() {
         let (sp_tree, images) = build_slide(slide, &mut media_counter, &mut stats);
         let n1 = i + 1;
+        let has_notes = !slide.notes.trim().is_empty();
         add(
             &mut zip,
             &format!("ppt/slides/slide{n1}.xml"),
@@ -113,10 +129,22 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
         add(
             &mut zip,
             &format!("ppt/slides/_rels/slide{n1}.xml.rels"),
-            slide_rels(&images).as_bytes(),
+            slide_rels(&images, has_notes.then_some(n1)).as_bytes(),
         )?;
         for img in &images {
             add(&mut zip, &format!("ppt/media/{}", img.file), &img.bytes)?;
+        }
+        if has_notes {
+            add(
+                &mut zip,
+                &format!("ppt/notesSlides/notesSlide{n1}.xml"),
+                notes_slide_xml(&slide.notes).as_bytes(),
+            )?;
+            add(
+                &mut zip,
+                &format!("ppt/notesSlides/_rels/notesSlide{n1}.xml.rels"),
+                notes_slide_rels(n1).as_bytes(),
+            )?;
         }
     }
 
@@ -675,7 +703,10 @@ fn slide_xml(sp_tree: &str) -> String {
     )
 }
 
-fn slide_rels(images: &[SlideImage]) -> String {
+/// `notes_slide_num`: `Some(n1)` when this slide has a `ppt/notesSlides/notesSlideN1.xml`
+/// part to link to (its own 1-based slide number — notesSlides are numbered to
+/// match their owning slide, so N1 == the slide's own number), `None` when it has none.
+fn slide_rels(images: &[SlideImage], notes_slide_num: Option<usize>) -> String {
     let mut rels = String::from(
         r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>"#,
     );
@@ -686,6 +717,14 @@ fn slide_rels(images: &[SlideImage]) -> String {
             file = img.file
         ));
     }
+    if let Some(n) = notes_slide_num {
+        // rId1 is the layout, rId2.. are images (see `embed_visuals`) — the
+        // notesSlide relationship takes the next free id after all of them.
+        let rid = format!("rId{}", 2 + images.len());
+        rels.push_str(&format!(
+            r#"<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/>"#
+        ));
+    }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#
@@ -694,16 +733,62 @@ fn slide_rels(images: &[SlideImage]) -> String {
 
 // ----- fixed package parts --------------------------------------------------
 
-fn content_types(n_slides: usize) -> String {
+fn content_types(n_slides: usize, notes_slide_numbers: &[usize]) -> String {
     let mut overrides = String::new();
     for i in 1..=n_slides {
         overrides.push_str(&format!(
             r#"<Override PartName="/ppt/slides/slide{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#
         ));
     }
+    // Only slides that actually carry notes get a notesSlideN.xml override —
+    // no empty notesSlide parts are ever written (see `deck_to_pptx`).
+    for n in notes_slide_numbers {
+        overrides.push_str(&format!(
+            r#"<Override PartName="/ppt/notesSlides/notesSlide{n}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>"#
+        ));
+    }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/><Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>{overrides}<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#
+    )
+}
+
+// ----- speaker notes (notesSlide) -------------------------------------------
+//
+// KNOWN LIMITATION: this emits a minimal notesSlide part with its own
+// slideLayout-less `<p:notes>` tree and a rels file that points ONLY back to
+// its owning slide — there is no `ppt/notesMasters/notesMaster1.xml` part and
+// no presentation-level `notesMasterIdLst`. A full OOXML notes reference chain
+// (presentation → notesMaster → notesLayout) is more than this minimal writer
+// implements; PowerPoint, Keynote and LibreOffice all tolerate a notesSlide
+// part without a separate notesMaster (they fall back to a default notes
+// layout), so the notes text is readable, but a notesMaster-driven custom
+// notes page design is NOT supported. Only emitted for slides with non-empty
+// notes (see `deck_to_pptx`) — a slide with no notes gets no notesSlide part.
+fn notes_slide_xml(notes: &str) -> String {
+    let paras: String = notes
+        .split('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                r#"<a:p><a:endParaRPr lang="en-US"/></a:p>"#.to_string()
+            } else {
+                format!(
+                    r#"<a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>{}</a:t></a:r></a:p>"#,
+                    esc(line)
+                )
+            }
+        })
+        .collect();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/>{paras}</p:txBody></p:sp></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:notes>"#
+    )
+}
+
+fn notes_slide_rels(slide_num: usize) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="../slides/slide{slide_num}.xml"/></Relationships>"#
     )
 }
 
@@ -1341,5 +1426,167 @@ mod tests {
             body.contains(&format!(r#"cx="{}""#, full_body_cx())),
             "expected a full-width Body box, not a blank image column: {body}"
         );
+    }
+
+    // ----- speaker notes: notesSlide export -----
+
+    #[test]
+    fn slide_with_notes_gets_a_notes_slide_part_containing_its_text() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Topic");
+        h.metadata.notes = Some("Remember to mention X".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].notes, "Remember to mention X");
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ppt/notesSlides/notesSlide1.xml"),
+            "expected a notesSlide1.xml part: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ppt/notesSlides/_rels/notesSlide1.xml.rels"),
+            "expected a notesSlide1.xml.rels part: {names:?}"
+        );
+        use std::io::Read as _;
+        let mut notes_xml = String::new();
+        zip.by_name("ppt/notesSlides/notesSlide1.xml")
+            .unwrap()
+            .read_to_string(&mut notes_xml)
+            .unwrap();
+        // Scope the assertion to the notesSlide entry's OWN bytes, not a
+        // whole-archive contains() check.
+        assert!(
+            notes_xml.contains("Remember to mention X"),
+            "notes text missing from notesSlide1.xml: {notes_xml}"
+        );
+        let mut rels_xml = String::new();
+        zip.by_name("ppt/notesSlides/_rels/notesSlide1.xml.rels")
+            .unwrap()
+            .read_to_string(&mut rels_xml)
+            .unwrap();
+        assert!(
+            rels_xml.contains("../slides/slide1.xml"),
+            "notesSlide rels should point back to its slide: {rels_xml}"
+        );
+        // The slide's own rels must carry a notesSlide relationship too.
+        let mut slide_rels_xml = String::new();
+        zip.by_name("ppt/slides/_rels/slide1.xml.rels")
+            .unwrap()
+            .read_to_string(&mut slide_rels_xml)
+            .unwrap();
+        assert!(
+            slide_rels_xml.contains("relationships/notesSlide")
+                && slide_rels_xml.contains("../notesSlides/notesSlide1.xml"),
+            "slide1.xml.rels should link to its notesSlide: {slide_rels_xml}"
+        );
+        // Content-types manifest must declare the notesSlide part.
+        let mut ct = String::new();
+        zip.by_name("[Content_Types].xml").unwrap().read_to_string(&mut ct).unwrap();
+        assert!(
+            ct.contains("/ppt/notesSlides/notesSlide1.xml"),
+            "content-types missing notesSlide override: {ct}"
+        );
+    }
+
+    #[test]
+    fn slide_with_empty_notes_produces_no_notes_slide_part() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Topic"));
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].notes, "");
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("ppt/notesSlides/")),
+            "no notesSlides parts should exist for a slide with empty notes: {names:?}"
+        );
+        use std::io::Read as _;
+        let mut slide_rels_xml = String::new();
+        zip.by_name("ppt/slides/_rels/slide1.xml.rels")
+            .unwrap()
+            .read_to_string(&mut slide_rels_xml)
+            .unwrap();
+        assert!(
+            !slide_rels_xml.contains("notesSlide"),
+            "slide1.xml.rels should not reference a notesSlide when there are no notes: {slide_rels_xml}"
+        );
+    }
+
+    #[test]
+    fn notes_with_xml_special_and_control_chars_escape_to_legal_xml() {
+        // A malicious/weird notes string carrying angle brackets, ampersands,
+        // quotes and a C0 control char must not produce invalid XML or break
+        // the zip — `notes_slide_xml` must run every line through the shared
+        // `esc()` helper, not skip escaping. Scoped to the notesSlide1.xml
+        // entry's own bytes, not a whole-archive contains() check.
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Topic");
+        h.metadata.notes = Some("<script>alert(\"x\")</script> & bad\u{7}bell\u{1}".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        let deck = document_to_deck(&doc);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        use std::io::Read as _;
+        let mut notes_xml = String::new();
+        zip.by_name("ppt/notesSlides/notesSlide1.xml")
+            .unwrap()
+            .read_to_string(&mut notes_xml)
+            .unwrap();
+        // The raw special characters must be gone (escaped), replaced by their
+        // entities, and the C0 control bytes must be stripped entirely.
+        assert!(
+            !notes_xml.contains("<script>") && !notes_xml.contains("</script>"),
+            "raw '<script>' tag must not survive unescaped in notesSlide1.xml: {notes_xml}"
+        );
+        assert!(
+            notes_xml.contains("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; bad"),
+            "expected the escaped notes text in notesSlide1.xml: {notes_xml}"
+        );
+        assert!(
+            !notes_xml
+                .bytes()
+                .any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r'),
+            "notesSlide1.xml still contains an illegal control byte: {notes_xml}"
+        );
+        // The whole part must still be well-formed enough to round-trip through
+        // a real XML-unaware check: every '<' that isn't part of a real tag was
+        // escaped, so the only literal '<' bytes left open real elements/tags.
+        assert!(notes_xml.starts_with("<?xml"), "notesSlide1.xml should still be valid XML preamble");
+    }
+
+    #[test]
+    fn mixed_notes_only_emit_parts_for_slides_that_have_them() {
+        // A 2-slide deck where only the SECOND slide has notes must produce
+        // exactly one notesSlide part, numbered to match its own slide (2),
+        // not slide 1.
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "First"));
+        doc.chunks.push(Chunk::new_text(1, "bullet one"));
+        let mut h2 = Chunk::new_heading(2, 1, "Second");
+        h2.metadata.notes = Some("Only slide two has notes".to_string());
+        doc.chunks.push(h2);
+        doc.chunks.push(Chunk::new_text(3, "bullet two"));
+        let deck = document_to_deck(&doc);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == "ppt/notesSlides/notesSlide1.xml"));
+        assert!(names.iter().any(|n| n == "ppt/notesSlides/notesSlide2.xml"));
     }
 }

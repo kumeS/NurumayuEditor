@@ -1,6 +1,8 @@
 // Minimal word-level diff (LCS) used to highlight what an AI edit changed.
 // Tokens keep their trailing whitespace so re-joining reproduces the text.
 
+import type { Chunk, Document } from "./types";
+
 export type DiffOp = { type: "equal" | "insert" | "delete"; text: string };
 
 function tokenize(s: string): string[] {
@@ -75,4 +77,49 @@ export function wordDiff(before: string, after: string): DiffOp[] {
 /** True when the two strings differ at all (cheap guard before diffing). */
 export function changed(before: string, after: string): boolean {
   return before.trim() !== after.trim();
+}
+
+/** One paragraph that differs between the saved baseline and the current doc. */
+export interface ChangedChunk {
+  id: string;
+  before: string;
+  after: string;
+}
+
+/**
+ * Document-wide diff (item 1-2): compares `saved.chunks` vs `current.chunks`
+ * BY CHUNK ID — content never decides identity — so an edited paragraph is
+ * always "changed", never a remove+add pair (chunks keep their id across
+ * edits; only structural ops like delete/duplicate change the id set). Pure
+ * function, no side effects, so it is fully unit-testable and safe to call
+ * from a render path (memoize the CALLER if it's hot).
+ */
+export interface DocumentDiffResult {
+  added: Chunk[];
+  removed: Chunk[];
+  changed: ChangedChunk[];
+}
+
+export function documentDiff(
+  saved: Document | null,
+  current: Document
+): DocumentDiffResult {
+  const savedChunks = saved?.chunks ?? [];
+  const savedById = new Map(savedChunks.map((c) => [c.id, c]));
+  const currentIds = new Set(current.chunks.map((c) => c.id));
+
+  const added: Chunk[] = [];
+  const changedList: ChangedChunk[] = [];
+  // Preserve CURRENT's chunk order for stable UI ordering.
+  for (const chunk of current.chunks) {
+    const before = savedById.get(chunk.id);
+    if (!before) {
+      added.push(chunk);
+    } else if (changed(before.content, chunk.content)) {
+      changedList.push({ id: chunk.id, before: before.content, after: chunk.content });
+    }
+  }
+  const removed = savedChunks.filter((c) => !currentIds.has(c.id));
+
+  return { added, removed, changed: changedList };
 }

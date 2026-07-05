@@ -11,6 +11,10 @@
 //! multi-image GRID (which visuals show, their slot/document ordering, and the
 //! cell subdivision of the layout's image region) is defined identically in
 //! `pptx.rs` (export) and `SlideEditor.tsx` (preview) — change one, change all.
+//!
+//! Sync contract (notes): a slide's `notes` field is derived from its heading
+//! chunk's `metadata.notes` (empty string when absent). This MUST mirror the
+//! TS `slideNotes` in `slides.ts` — change one, change both.
 
 use crate::models::{
     Chunk, Deck, Document, Slide, SLIDE_LAYOUT_SECTION, SLIDE_LAYOUT_TITLE_CONTENT,
@@ -82,6 +86,16 @@ pub fn document_to_deck(doc: &Document) -> Deck {
                 SLIDE_LAYOUT_TITLE_CONTENT.to_string()
             }
         });
+
+        // Speaker notes: the slide's heading chunk's `metadata.notes`, or an
+        // empty string when absent. Sync contract with the TS `slideNotes` —
+        // see the module doc comment.
+        s.notes = s
+            .chunks
+            .iter()
+            .find(|c| c.is_heading())
+            .and_then(|c| c.metadata.notes.clone())
+            .unwrap_or_default();
     }
 
     let mut deck = Deck::new(&doc.title);
@@ -183,5 +197,25 @@ mod tests {
         doc3.chunks.push(img);
         let deck3 = document_to_deck(&doc3);
         assert_eq!(deck3.slides[0].layout, SLIDE_LAYOUT_TITLE_IMAGE);
+    }
+
+    #[test]
+    fn heading_notes_populate_the_slides_notes_field() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Intro");
+        h.metadata.notes = Some("Remember to mention X".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "bullet"));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].notes, "Remember to mention X");
+    }
+
+    #[test]
+    fn heading_without_notes_yields_empty_slide_notes() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Intro"));
+        doc.chunks.push(Chunk::new_text(1, "bullet"));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].notes, "");
     }
 }

@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { documentDiff } from "./diff";
 import { groupSlides, hasLayoutOverride, resolveLayout } from "./slides";
 import {
+  clampPresentIndex,
   hashContent,
   pruneAnalysis,
   staleSummaryChunkIds,
@@ -40,6 +42,8 @@ function reset(chunks: Chunk[]): void {
     // timeout, which no test waits out.
     flashChunkId: null,
     flashChunkIds: [],
+    ghostSuggestion: null,
+    ghostRequestId: 0,
   });
   useStore.getState().loadDocument(doc(chunks));
 }
@@ -607,5 +611,276 @@ describe("item 14 — speech queue mechanics", () => {
     st().setSpeechQueue(["a"]);
     st().newTab();
     expect(st().speechQueue).toEqual([]);
+  });
+});
+
+describe("item 1-3 — presentation mode", () => {
+  // Full keyboard/rendering behaviour is verified manually (see
+  // PresentationMode.tsx's top-of-file comment) — disproportionate to
+  // integration-test here. The pure index math it's built on gets a direct
+  // unit test instead, since "arrow-key navigation never goes out of bounds"
+  // is exactly the kind of user-visible claim this project's testing rules
+  // require a guard for.
+  describe("clampPresentIndex", () => {
+    it("advances and retreats within bounds", () => {
+      expect(clampPresentIndex(0, 1, 5)).toBe(1);
+      expect(clampPresentIndex(2, -1, 5)).toBe(1);
+    });
+
+    it("clamps at the first slide — does not go negative", () => {
+      expect(clampPresentIndex(0, -1, 5)).toBe(0);
+    });
+
+    it("clamps at the last slide — does not exceed the deck", () => {
+      expect(clampPresentIndex(4, 1, 5)).toBe(4);
+    });
+
+    it("returns 0 for an empty deck regardless of direction", () => {
+      expect(clampPresentIndex(0, 1, 0)).toBe(0);
+      expect(clampPresentIndex(0, -1, 0)).toBe(0);
+    });
+
+    it("re-clamps a current index that is already out of range (deck shrank)", () => {
+      // Mirrors the SlideEditor B6 fix: an undo mid-presentation can shrink the
+      // deck out from under an existing (now too-large) index.
+      expect(clampPresentIndex(9, 0, 3)).toBe(2);
+    });
+  });
+
+  describe("openPresentation / closePresentation", () => {
+    it("opens and closes the ephemeral overlay flag", () => {
+      reset([chunk("a", "heading", "Slide 1")]);
+      expect(st().presentationOpen).toBe(false);
+      st().openPresentation();
+      expect(st().presentationOpen).toBe(true);
+      st().closePresentation();
+      expect(st().presentationOpen).toBe(false);
+    });
+
+    it("is a global flag, not per-tab state — it is unaffected by tab switches", () => {
+      // presentationOpen deliberately lives alongside networkOpen/diffPanelOpen
+      // (not in TabSnapshot), so — like those — it is untouched by newTab/
+      // switchTab. This documents that choice with a guard: if it were ever
+      // moved into TabSnapshot, this test would catch the behaviour change.
+      reset([chunk("a", "heading", "Slide 1")]);
+      st().openPresentation();
+      st().newTab();
+      expect(st().presentationOpen).toBe(true);
+    });
+  });
+});
+
+describe("item 1-2 — savedDoc baseline lifecycle", () => {
+  it("a freshly loaded/imported document is its own baseline (dirty:false case)", () => {
+    reset([chunk("a", "text", "hello")]);
+    const opened = doc([chunk("x", "text", "opened content")], "Opened");
+    st().loadDocument(opened, "/some/path.aix");
+    expect(st().dirty).toBe(false);
+    expect(st().savedDoc).toBe(opened);
+  });
+
+  it("a repaired-on-load / drafted document is still its own baseline even though dirty:true", () => {
+    // B2: opts.dirty can be true (repaired file, AI draft with no backing file),
+    // but savedDoc must still equal the just-loaded doc — "changes since last
+    // save" reads as "since this doc showed up", not against some other state.
+    reset([chunk("a", "text", "hello")]);
+    const imported = doc([chunk("y", "text", "imported content")], "Imported");
+    st().loadDocument(imported, null, { dirty: true });
+    expect(st().dirty).toBe(true);
+    expect(st().savedDoc).toBe(imported);
+  });
+
+  it("a new blank tab's baseline is itself", () => {
+    reset([chunk("a", "text", "hello")]);
+    st().newTab();
+    expect(st().dirty).toBe(false);
+    expect(st().savedDoc).toBe(st().doc);
+  });
+
+  it("markClean() after a save sets savedDoc to the current doc in the SAME action as dirty:false", () => {
+    reset([chunk("a", "text", "hello")]);
+    st().updateChunkContent("a", "hello, edited");
+    expect(st().dirty).toBe(true);
+    expect(st().savedDoc).not.toBe(st().doc); // still diverged pre-save
+    st().markClean("/path/to/file.aix");
+    expect(st().dirty).toBe(false);
+    expect(st().savedDoc).toBe(st().doc); // baseline now matches — no false diff
+    expect(st().filePath).toBe("/path/to/file.aix");
+  });
+
+  it("markClean(path, savedDocument) anchors the baseline to what was ACTUALLY written, not a keystroke that landed during the async save", () => {
+    // Regression guard: saveNative/saveNativeAs await an IPC write without
+    // blocking the editor. If a keystroke lands in that gap, markClean must
+    // not silently promote it into the baseline (dirty:false + savedDoc
+    // pointing past what's really on disk would make the diff panel lie).
+    reset([chunk("a", "text", "hello")]);
+    const writtenDoc = st().doc; // snapshot captured "before the await"
+    st().updateChunkContent("a", "hello, typed during the save"); // race window
+    expect(st().doc).not.toBe(writtenDoc);
+    st().markClean("/path/to/file.aix", writtenDoc);
+    expect(st().dirty).toBe(false);
+    expect(st().savedDoc).toBe(writtenDoc); // baseline = what was saved
+    expect(st().savedDoc).not.toBe(st().doc); // NOT the newer, unsaved doc
+    // The diff view must still report the mid-save keystroke as a real change.
+    const diff = documentDiff(st().savedDoc, st().doc);
+    expect(diff.changed.map((c) => c.id)).toEqual(["a"]);
+  });
+
+  it("carries savedDoc into and out of the inactive-tab snapshot across a tab switch (round-trip)", () => {
+    reset([chunk("a", "text", "hello")]);
+    const tabA = st().activeTabId;
+    // Edit tab A so its savedDoc (baseline) and doc (current) diverge.
+    st().updateChunkContent("a", "hello, edited on A");
+    const savedDocA = st().savedDoc;
+    const currentDocA = st().doc;
+    expect(savedDocA).not.toBe(currentDocA);
+
+    st().newTab(); // switches away — tab A becomes a snapshot
+    // The new tab's own baseline should be itself, not leaked from tab A.
+    expect(st().savedDoc).toBe(st().doc);
+    expect(st().savedDoc).not.toBe(savedDocA);
+
+    st().switchTab(tabA);
+    // Tab A's baseline/current pair must come back EXACTLY as they were —
+    // savedDoc must not have been lost (reset to current doc) or leaked from
+    // the tab we just left.
+    expect(st().doc).toBe(currentDocA);
+    expect(st().savedDoc).toBe(savedDocA);
+    expect(st().savedDoc).not.toBe(st().doc);
+  });
+
+  it("hydrateSession gives every restored tab (active and inactive) its doc as its own baseline", () => {
+    reset([chunk("a", "text")]);
+    const docA = doc([chunk("a", "text", "A")], "A");
+    const docB = doc([chunk("b", "text", "B")], "B");
+    st().hydrateSession(
+      [
+        { id: "t1", doc: docA, filePath: "/a.aix", dirty: false },
+        { id: "t2", doc: docB, filePath: null, dirty: true },
+      ],
+      "t2"
+    );
+    expect(st().savedDoc).toBe(docB); // active tab
+    expect(st().inactiveTabs["t1"].savedDoc).toBe(docA); // inactive tab
+    st().switchTab("t1");
+    expect(st().savedDoc).toBe(docA); // round-trips correctly
+  });
+
+  it("does not touch ChunkMetadata.contentHistory — an unrelated, independent mechanism", () => {
+    // contentHistory is the per-chunk AI-version-swap history (replaceChunkContent
+    // / selectChunkVersion); the diff-since-last-save feature must never read or
+    // write it — the two mechanisms are independent by design.
+    reset([chunk("a", "text", "hello")]);
+    st().replaceChunkContent("a", "hello, ai-edited");
+    const histAfterAiEdit = st().doc.chunks[0].metadata.contentHistory;
+    expect(histAfterAiEdit).toEqual(["hello"]);
+    st().markClean("/path.aix");
+    // markClean must not have mutated contentHistory in any way.
+    expect(st().doc.chunks[0].metadata.contentHistory).toEqual(["hello"]);
+    expect(st().savedDoc?.chunks[0].metadata.contentHistory).toEqual(["hello"]);
+  });
+});
+
+describe("2-4 — ghost-text inline completion", () => {
+  beforeEach(() => reset([chunk("a", "text", "The quick brown fox")]));
+
+  it("startGhostRequest issues increasing ids and a superseded request's late result is discarded", () => {
+    const firstId = st().startGhostRequest();
+    const secondId = st().startGhostRequest();
+    expect(secondId).toBeGreaterThan(firstId);
+
+    // The newer request "wins": apply its suggestion first...
+    st().setGhostSuggestion("a", " jumps", secondId);
+    expect(st().ghostSuggestion).toEqual({ chunkId: "a", text: " jumps" });
+
+    // ...then the OLDER (superseded) request's late-arriving result must be a
+    // no-op — it must NOT clobber the newer suggestion, and must not appear at
+    // all even if nothing had been set yet.
+    st().setGhostSuggestion("a", " over the lazy dog", firstId);
+    expect(st().ghostSuggestion).toEqual({ chunkId: "a", text: " jumps" });
+  });
+
+  it("an older request's result is discarded even when it is the ONLY result received", () => {
+    const firstId = st().startGhostRequest();
+    st().startGhostRequest(); // a newer keystroke supersedes it — result never checked here
+    // The stale request's delta arrives after being superseded.
+    st().setGhostSuggestion("a", " stale suggestion", firstId);
+    expect(st().ghostSuggestion).toBeNull();
+  });
+
+  it("accepting a suggestion inserts EXACTLY the suggested text at the cursor, nothing else added or lost", () => {
+    const id = st().startGhostRequest();
+    st().setGhostSuggestion("a", " jumps over the lazy dog", id);
+    expect(st().ghostSuggestion?.text).toBe(" jumps over the lazy dog");
+
+    // Mirrors ChunkView's Tab-accept handler: content + suggestion, then clear.
+    const before = st().doc.chunks[0].content;
+    const accepted = before + (st().ghostSuggestion?.text ?? "");
+    st().clearGhostSuggestion();
+    st().updateChunkContent("a", accepted);
+
+    expect(st().doc.chunks[0].content).toBe("The quick brown fox jumps over the lazy dog");
+    expect(st().ghostSuggestion).toBeNull();
+  });
+
+  it("rejecting (Escape) leaves the original chunk content completely unchanged", () => {
+    const id = st().startGhostRequest();
+    st().setGhostSuggestion("a", " jumps over the lazy dog", id);
+    const before = st().doc.chunks[0].content;
+
+    // Mirrors ChunkView's Escape handler: clear only, no content mutation.
+    st().clearGhostSuggestion();
+
+    expect(st().doc.chunks[0].content).toBe(before);
+    expect(st().doc.chunks[0].content).toBe("The quick brown fox");
+    expect(st().ghostSuggestion).toBeNull();
+  });
+
+  it("a suggestion for one chunk does not leak onto another chunk's render", () => {
+    reset([chunk("a", "text", "one"), chunk("b", "text", "two")]);
+    const id = st().startGhostRequest();
+    st().setGhostSuggestion("a", " continued", id);
+    expect(st().ghostSuggestion?.chunkId).toBe("a");
+    // ChunkView only renders when ghostSuggestion.chunkId === its own id, so a
+    // chunk "b" component would see this as no suggestion for itself.
+    expect(st().ghostSuggestion?.chunkId).not.toBe("b");
+  });
+
+  it("a late delta arriving after Escape-dismiss must not resurrect the suggestion", () => {
+    const id = st().startGhostRequest();
+    st().setGhostSuggestion("a", " jumps", id);
+    expect(st().ghostSuggestion).not.toBeNull();
+
+    // User hits Escape (mirrors ChunkView's Escape handler).
+    st().clearGhostSuggestion();
+    expect(st().ghostSuggestion).toBeNull();
+
+    // The stream backing THIS SAME requestId is still in flight (streams are
+    // not server-cancelled) and delivers one more delta / its final resolution.
+    st().setGhostSuggestion("a", " jumps over", id);
+
+    // A dismissed suggestion must stay dismissed.
+    expect(st().ghostSuggestion).toBeNull();
+  });
+
+  it("a late delta arriving after Tab-accept must not resurrect a suggestion for content already merged in", () => {
+    const id = st().startGhostRequest();
+    st().setGhostSuggestion("a", " jumps", id);
+
+    // Mirrors ChunkView's Tab-accept handler.
+    const before = st().doc.chunks[0].content;
+    const accepted = before + (st().ghostSuggestion?.text ?? "");
+    st().clearGhostSuggestion();
+    st().updateChunkContent("a", accepted);
+    expect(st().doc.chunks[0].content).toBe("The quick brown fox jumps");
+    expect(st().ghostSuggestion).toBeNull();
+
+    // The same in-flight stream (same requestId) delivers a late final delta.
+    st().setGhostSuggestion("a", " jumps over the lazy dog", id);
+
+    // Must stay dismissed — the acceptance already happened; resurrecting a
+    // suggestion here would show a ghost overlay for text that doesn't match
+    // what's now in the box, and a second Tab would duplicate content.
+    expect(st().ghostSuggestion).toBeNull();
   });
 });

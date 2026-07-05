@@ -26,6 +26,11 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# Already resolved transitively (via tauri's own dependency graph, see Cargo.lock)
+# at the same version — used directly so the headless CLI (cli.rs) can resolve the
+# same per-OS config directory Tauri's `AppHandle::path().app_config_dir()` uses,
+# without needing an AppHandle (there is none outside the GUI).
+dirs = "6"
 # rustls avoids a system OpenSSL/native-tls dependency, keeping the build portable.
 # `stream` enables byte-stream responses for SSE token streaming (Draft).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -46,6 +51,27 @@ printpdf = { version = "0.7", default-features = false, features = ["font_subset
 # PPTX (Open XML) export: write the .pptx zip and decode image data URLs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
+# Personal RAG (開発.txt Stage 3, item 3-1): fully on-device local text
+# embedding. `default-features = false` + explicit feature list drops the
+# upstream default `image-models` feature (pulls in y4m/v_frame and other
+# image/video codec deps we don't need for plain text embedding) — see
+# `rag.rs` module doc for the full rationale. `ort-download-binaries-rustls-tls`
+# (not the native-tls default) matches this project's existing rustls-only
+# policy (see the `reqwest` dependency above); `hf-hub-rustls-tls` does the
+# same for the one-time model-download HTTP client fastembed builds internally.
+fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+# Bundled SQLite (no system libsqlite3 needed) as the local vector-index store.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# `vec0` virtual table extension for cosine/L2 similarity search over the
+# embeddings rusqlite stores — loaded via `sqlite3_auto_extension` (rag.rs).
+sqlite-vec = "0.1"
+# Citation management (開発.txt Stage 3, item 3-2): parses the universal BibTeX
+# export format (Zotero and virtually every reference manager). A well-
+# established, actively-maintained crate rather than a hand-rolled parser —
+# see citations.rs's module doc for the exact fields it exposes and this
+# feature's scope (BibTeX import + APA/IEEE formatting + DOI/arXiv lookup;
+# explicitly NOT a general Citation Style Language engine).
+biblatex = "0.12"
 
 [profile.release]
 # Smaller, faster-to-ship desktop binaries.

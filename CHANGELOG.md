@@ -2,6 +2,86 @@
 
 ## Unreleased
 
+### Stage 1 (開発.txt §5 — 主戦場の完成)
+
+- **Speaker notes** — every slide's heading chunk can carry speaker notes
+  (`metadata.notes`), edited in a labeled textarea in Slide view, exported as a
+  proper `notesSlide` OOXML part in `.pptx` (skipped entirely for slides with no
+  notes, so empty decks stay untouched), and round-tripped losslessly through
+  `.aix`. XML-escaped through the same helper as slide bodies.
+- **"Changes since last save" view** — the health bar now shows how many
+  paragraphs changed since the last save/open, backed by a new document-level
+  diff (added / removed / changed, by chunk id, CJK-safe) and a docked panel
+  reusing the existing per-paragraph diff highlighting. Reachable from the
+  health bar or the command palette ("Show changes since last save").
+- **Presentation mode** — "Present" (toolbar button in Slide view, or the
+  command palette) opens a fullscreen, keyboard-driven slideshow (←/→/Space to
+  navigate, Esc to exit, `N` to toggle the current slide's speaker notes),
+  rendered with the exact same slide component Preview/export use, so what you
+  present matches what exports. A weekly lab-meeting talk no longer needs a
+  PPTX export step first.
+- **Headless AI via CLI** — `nurumayufacet ai <verb> <file.aix> <chunkId>
+  [instruction] [--json]` runs any existing per-paragraph AI action
+  (translate/proofread/summarize/…) from a script or agent, without the GUI.
+  Read-only in this pass (prints a result, does not modify the source file).
+  The `capabilities` manifest now reports `"aiActionsRunVia": ["gui", "cli"]`
+  and lists `"ai"` among its CLI verbs.
+- **CI** — `.github/workflows/ci.yml` now runs `cargo test --lib`, `npm test`,
+  and `npm run build` on every push/PR.
+
+### Stage 2 (開発.txt §5 — 第二波＋堀の公開)
+
+- **"Zero external transmission" visibility** — the health bar now shows a
+  live count of external calls this session ("N AI · M fetch"), backed by
+  atomic counters at every real outbound network site: the three OpenRouter
+  call sites in `ai.rs` (via their shared retry funnel) *and* `net.rs`'s
+  guarded reference/image fetch — correcting an earlier assumption that
+  `net.rs` alone was the sole chokepoint; it wasn't.
+- **Minimal MCP server** (`nurumayufacet mcp`) — a standards-correct,
+  read-only Model Context Protocol server over stdio (JSON-RPC 2.0,
+  newline-delimited), so any MCP client (Claude Desktop, Claude Code, or
+  otherwise) can inspect a `.aix` document without the GUI: `list_chunks`,
+  `get_chunk`, `get_document`, `analyze`, and `export`. Malformed input,
+  unknown methods, and unknown chunk ids all return proper JSON-RPC errors —
+  never a crash that would kill the persistent server process. Write/apply-edit
+  is intentionally **not** implemented yet (planned, pending a decision on
+  approval-gated writes) and is documented as such, not silently absent.
+- **Ghost-text inline completion** (Phase 6) — a low-latency, low-temperature
+  inline suggestion as you type at the end of a paragraph (Tab accepts,
+  Escape dismisses, any other key lets it vanish); only one in-flight request
+  at a time, newest wins. An opt-in "limit to a local model" setting refuses
+  to fire at all against a non-local endpoint rather than silently ignoring
+  the preference.
+- **Grant-application beachhead** (generic infrastructure only — bundling any
+  specific official form is an explicit open decision, not attempted here):
+  a configurable, CJK-aware per-paragraph character-limit warning in the
+  health bar, and a "Check against review criteria" panel where you supply
+  your own list of criteria and the AI flags which ones have no supporting
+  paragraph anywhere in the document.
+
+### Stage 3 (開発.txt §5 — 差別化の第二幕)
+
+- **Personal RAG** (Phase 8) — an opt-in, fully on-device knowledge base of
+  your own past papers and notes. Add reference files to your personal
+  library; the AI can then optionally ground drafts/revisions in the most
+  relevant passages, citing which source files it drew from. Embedding
+  (`fastembed`, local ONNX) and similarity search (`sqlite-vec`) run entirely
+  on-device — the only network activity anywhere in this feature is a
+  one-time embedding-model download the first time it's used, never a
+  per-search or per-add call (proven by a test asserting Stage 2's
+  external-transmission counters don't move across repeated add/search
+  cycles). Deliberately does not repurpose the existing same-document
+  `linkedChunks` relationship field for this — a new, independent index is
+  the cross-document link mechanism instead, so the relationship-graph
+  subsystem is untouched.
+- **Citation management** (Phase 9) — "bring your own references and format
+  them," not a literature-search feature. Import a `.bib` file (the universal
+  Zotero/reference-manager export format), format entries in APA or IEEE
+  style, look up a DOI or arXiv id to auto-fill an entry via the guarded
+  fetch, and insert a formatted citation or build an end-of-document
+  bibliography. Citations are stored per-document (a JSON sidecar next to the
+  `.aix` file), travel with the paper that cites them.
+
 ### Rebrand → NurumayuFacet
 
 - **Renamed the app from `aixTextEditor` to `NurumayuFacet`** (project/studio

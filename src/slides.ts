@@ -117,6 +117,17 @@ export function slideLead(s: SlideGroup): Chunk | undefined {
 }
 
 /**
+ * The slide's speaker notes: its heading chunk's `metadata.notes`, or an
+ * empty string when absent. Sync contract: this MUST mirror deck.rs's
+ * `document_to_deck` notes derivation exactly — change one, change both (see
+ * the deck.rs module doc comment). A heading-less (leading) slide has no
+ * heading chunk to carry notes, so it always returns "".
+ */
+export function slideNotes(s: SlideGroup): string {
+  return headingOf(s)?.metadata.notes ?? "";
+}
+
+/**
  * The slide's explicit subtitle line, if a text chunk on it is flagged
  * `subtitle` (Req 3). Returns undefined when there's no explicit subtitle (the
  * section layout then falls back to the first bullet, matching AI Draft's

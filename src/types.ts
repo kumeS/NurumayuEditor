@@ -35,6 +35,9 @@ export interface ChunkMetadata {
   // Optional ordering index for a slide's images (lower renders first; ties
   // broken by document order — see `slideImages` in slides.ts).
   slot?: number;
+  // Speaker notes for the slide this chunk begins (only meaningful on a
+  // heading chunk that starts a slide). Mirrors Rust's ChunkMetadata::notes.
+  notes?: string;
 }
 
 export interface Chunk {
@@ -99,7 +102,7 @@ export interface Slide {
   order: number;
   layout: SlideLayout;
   chunks: Chunk[];
-  notes: string; // speaker notes (reserved; not yet emitted to PPTX)
+  notes: string; // speaker notes, derived from the slide's heading chunk's metadata.notes
 }
 
 export interface Deck {
@@ -114,6 +117,17 @@ export interface PptxReport {
   warnings: string[];
 }
 
+/** "Zero external transmission" visibility (開発.txt Stage 2, item 2-2):
+ * process-wide counters mirroring `commands::NetworkStats` — LLM calls
+ * (ai.rs) and reference/image fetches (net.rs's `safe_fetch`) are two
+ * separate chokepoints, so they stay as two distinct pairs of numbers. */
+export interface NetworkStats {
+  aiCalls: number;
+  aiBytes: number;
+  fetchCalls: number;
+  fetchBytes: number;
+}
+
 export interface Settings {
   endpoint: string;
   model: string; // active text model id
@@ -126,6 +140,86 @@ export interface Settings {
   editorFontFamily?: "serif" | "sans" | "mono"; // editor body font (default "serif")
   editorFontSize?: number; // editor body font size in px (default 17; clamped 12..=28 on load)
   removedModels?: string[]; // built-in model ids the user removed from the pickers (default [])
+  // Ghost-text inline completion (開発.txt Stage 2, item 2-4): when true, only
+  // fire completion requests if the configured endpoint is local (privacy
+  // preference) — enforced backend-side in commands::ai_ghost_complete_stream,
+  // not just here. Default false (opt-in), mirrors Rust `Settings`.
+  limitCompletionToLocalModel?: boolean;
+  // Grant-application beachhead (開発.txt Stage 2, item 2-1): global
+  // character-limit warning threshold — "warn me when any paragraph exceeds
+  // N characters". Generic (any length-constrained writing), not tied to any
+  // specific bundled form. `undefined`/absent = off (default); the frontend
+  // computes each chunk's character count live from `chunk.content` (CJK-
+  // aware) rather than persisting counts. Mirrors Rust `Settings.char_limit_warning`.
+  charLimitWarning?: number;
+  // Personal RAG (開発.txt Stage 3, item 3-1): opt-in to grounding AI writing/
+  // revision actions against the user's own local knowledge base of past
+  // papers/notes — fully on-device (rag.rs: fastembed + sqlite-vec). Off by
+  // default; enabling this alone does not download the embedding model or
+  // create an index — both happen lazily on the first add-source/search
+  // call. Mirrors Rust `Settings.personal_rag_enabled`.
+  personalRagEnabled?: boolean;
+}
+
+/** One indexed source file in the personal knowledge base (rag.rs). */
+export interface RagSourceInfo {
+  path: string;
+  passageCount: number;
+}
+
+/** One personal-library search hit: source file + matched snippet + distance
+ * (cosine distance from the query; lower = more similar). */
+export interface RagSearchHit {
+  sourcePath: string;
+  snippet: string;
+  distance: number;
+}
+
+// ----- Citation management (開発.txt Stage 3, item 3-2) --------------------
+// Mirrors src-tauri/src/citations.rs's `CitationEntry`/`CitationStyle`/
+// `LookupResult` 1:1. Deliberately "bring your own references and format
+// them" — NOT a literature-search engine (see that module's doc comment).
+// Only two citation styles are supported: APA (7th ed., author-date) and
+// IEEE (numbered bracket) — not a general Citation Style Language engine.
+
+/** One imported/looked-up citation entry, persisted per-document (a JSON
+ * sidecar next to the `.aix` file — see citations.rs's module doc). */
+export interface CitationEntry {
+  id: string;
+  bibtexKey: string;
+  entryType: string; // "article" | "inproceedings" | "book" | … (BibTeX/BibLaTeX type)
+  authors: string[];
+  title: string;
+  year?: number;
+  venue?: string; // journal / booktitle / publisher / venue, whichever applies
+  doi?: string;
+  volume?: string;
+  number?: string;
+  pages?: string;
+  publisher?: string;
+  url?: string;
+}
+
+/** Result of `citations_import_bibtex`: newly added entries plus any
+ * per-entry warnings (e.g. an entry missing a required title was skipped —
+ * "warn, don't block", shown on a persistent surface, never toast-only). */
+export interface BibtexImportResult {
+  added: CitationEntry[];
+  warnings: string[];
+}
+
+/** Exactly the two supported citation styles — see this file's section doc. */
+export type CitationStyleName = "apa" | "ieee";
+
+/** Metadata fetched from a DOI (CrossRef) or arXiv id lookup, for reviewing
+ * before adding as a new citation entry (`citations_add_lookup_result`). */
+export interface CitationLookupResult {
+  title: string;
+  authors: string[];
+  year?: number;
+  venue?: string;
+  doi?: string;
+  abstractText?: string;
 }
 
 export type AiAction =
@@ -154,6 +248,14 @@ export interface AiRequest {
   sectionHeading?: string;
   documentMap?: string;
   linkedContent?: string;
+  // Personal RAG (開発.txt Stage 3, item 3-1): top personal-library matches for
+  // this chunk (see `aiActions.ts::gatherRagSnippets`), empty/omitted whenever
+  // the setting is off or nothing is indexed. NOT YET a true Rust mirror: the
+  // backend `AiRequest` (ai.rs) does not read this field yet — an unread extra
+  // JSON key is harmless (serde ignores it) — wiring it into the prompt AND
+  // surfacing which sources were used near the result is the citation-
+  // management follow-up (開発.txt Stage 3, item 3-2's adjacent work).
+  ragSnippets?: RagSearchHit[];
 }
 
 export type AnalysisNodeKind = "paragraph" | "sentence";

@@ -192,6 +192,44 @@ pub struct Settings {
     /// Editor body font size in px (12..=28).
     #[serde(default = "default_editor_font_size")]
     pub editor_font_size: u32,
+    /// Ghost-text inline completion (開発.txt Stage 2, item 2-4): when true,
+    /// only fire a completion request when the configured endpoint is a local
+    /// one (see `commands::is_local_endpoint`) — a real privacy preference,
+    /// not a cosmetic toggle, so ghost-text is simply skipped rather than
+    /// silently sent to a remote endpoint when this is on but the endpoint
+    /// isn't local. Off by default (opt-in), like every other auto-picked
+    /// behaviour in this app's Settings. `#[serde(default)]` keeps older
+    /// settings files (without this field) loadable.
+    #[serde(default)]
+    pub limit_completion_to_local_model: bool,
+    /// Grant-application beachhead (開発.txt Stage 2, item 2-1): a GLOBAL,
+    /// user-configurable character-limit warning threshold — "warn me when
+    /// any paragraph exceeds N characters". Generic (useful for any
+    /// length-constrained writing, not just grant forms specifically); this
+    /// project does NOT bundle any real institutional form's actual limits
+    /// (that bundling decision is explicitly unresolved — see 開発.txt §9).
+    /// `None` (the default) means the feature is off — the frontend shows no
+    /// extra UI until the user opts in. Per-chunk character counts themselves
+    /// are computed live from `chunk.content` on the frontend (CJK-aware via
+    /// `Array.from(...).length`); nothing about the count is persisted here,
+    /// only the threshold. `#[serde(default, skip_serializing_if =
+    /// "Option::is_none")]` keeps older settings files loadable and keeps a
+    /// never-configured limit out of the saved JSON entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_limit_warning: Option<u32>,
+    /// Personal RAG (開発.txt Stage 3, item 3-1): opt-in to grounding AI
+    /// writing/revision actions against the user's own local knowledge base
+    /// of past papers/notes (`rag.rs`, fully on-device — embedding, indexing,
+    /// and search never leave the machine). Off by default, matching this
+    /// app's "auto-picked behaviour starts off" tone: this setting alone does
+    /// not create the index or download the embedding model — both are
+    /// lazily initialized on the FIRST add-source or search call made while
+    /// this is true (see `rag::Index::open` and its callers in
+    /// `commands.rs`), so leaving this off costs nothing at all, forever.
+    /// `#[serde(default)]` keeps older settings files (without this field)
+    /// loadable.
+    #[serde(default)]
+    pub personal_rag_enabled: bool,
 }
 
 impl Default for Settings {
@@ -208,6 +246,9 @@ impl Default for Settings {
             removed_models: Vec::new(),
             editor_font_family: default_editor_font_family(),
             editor_font_size: default_editor_font_size(),
+            limit_completion_to_local_model: false,
+            char_limit_warning: None,
+            personal_rag_enabled: false,
         }
     }
 }
@@ -434,6 +475,105 @@ mod tests {
         let loaded = Settings::load(&dir);
         assert_eq!(loaded.editor_font_size, 12);
         assert_eq!(loaded.editor_font_family, "mono");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn limit_completion_to_local_model_round_trips_and_defaults_false() {
+        let dir = temp_config_dir("ghost-toggle");
+
+        // Back-compat: an old settings file written before this field existed
+        // has no such key at all — it must load as `false`, not fail to parse.
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert!(!loaded.limit_completion_to_local_model);
+
+        // Explicitly set true, save, reload — the value round-trips.
+        let mut settings = loaded;
+        settings.limit_completion_to_local_model = true;
+        settings.save(&dir).unwrap();
+        let reloaded = Settings::load(&dir);
+        assert!(reloaded.limit_completion_to_local_model);
+
+        // camelCase JSON key per the frontend schema contract.
+        let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(text.contains("\"limitCompletionToLocalModel\""), "got: {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn char_limit_warning_round_trips_and_defaults_to_unset() {
+        let dir = temp_config_dir("char-limit");
+
+        // Back-compat: an old settings file written before this field existed
+        // has no such key at all — it must load as `None`, not fail to parse.
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert_eq!(loaded.char_limit_warning, None);
+
+        // A fresh Default::default() is also unset.
+        assert_eq!(Settings::default().char_limit_warning, None);
+
+        // Explicitly set, save, reload — the value round-trips.
+        let mut settings = loaded;
+        settings.char_limit_warning = Some(800);
+        settings.save(&dir).unwrap();
+        let reloaded = Settings::load(&dir);
+        assert_eq!(reloaded.char_limit_warning, Some(800));
+
+        // camelCase JSON key per the frontend schema contract.
+        let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(text.contains("\"charLimitWarning\": 800"), "got: {text}");
+
+        // Clearing it back to None removes the key from the saved JSON
+        // (skip_serializing_if) rather than writing a literal `null`.
+        settings.char_limit_warning = None;
+        settings.save(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(!text.contains("charLimitWarning"), "got: {text}");
+        let reloaded = Settings::load(&dir);
+        assert_eq!(reloaded.char_limit_warning, None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn personal_rag_enabled_round_trips_and_defaults_false() {
+        let dir = temp_config_dir("personal-rag-toggle");
+
+        // Back-compat: an old settings file written before this field existed
+        // has no such key at all — it must load as `false`, not fail to parse.
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert!(!loaded.personal_rag_enabled);
+
+        // A fresh Default::default() is also off.
+        assert!(!Settings::default().personal_rag_enabled);
+
+        // Explicitly set true, save, reload — the value round-trips.
+        let mut settings = loaded;
+        settings.personal_rag_enabled = true;
+        settings.save(&dir).unwrap();
+        let reloaded = Settings::load(&dir);
+        assert!(reloaded.personal_rag_enabled);
+
+        // camelCase JSON key per the frontend schema contract.
+        let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(text.contains("\"personalRagEnabled\": true"), "got: {text}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

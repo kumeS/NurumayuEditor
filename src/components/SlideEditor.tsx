@@ -1,18 +1,23 @@
 // Slide-mode authoring surface: a thumbnail rail + a 16:9 canvas with an
-// Edit / Preview / Present switch. A slide-mode document is the same chunk model
-// as the editor, presented as slides — each HEADING starts a new slide and the
-// chunks under it are that slide's body. Editing reuses ChunkView, so every
-// per-chunk AI action, image/diagram generation and version history works inside
-// slides unchanged; "Export ▸ .pptx" turns this deck into a file.
+// Edit / Preview switch, plus a "Present" button that opens the fullscreen
+// PresentationMode overlay (item 1-3 — see ../components/PresentationMode.tsx).
+// A slide-mode document is the same chunk model as the editor, presented as
+// slides — each HEADING starts a new slide and the chunks under it are that
+// slide's body. Editing reuses ChunkView, so every per-chunk AI action,
+// image/diagram generation and version history works inside slides unchanged;
+// "Export ▸ .pptx" turns this deck into a file.
 //
-// WYSIWYG: thumbnails, the Preview canvas, and Present all render the SAME slide
-// content at a fixed 1280×720 design size, CSS-scaled to fit. The slide-derivation
-// helpers live in ../slides and MIRROR the Rust deck.rs/pptx.rs rules, so what you
-// see matches the exported layout (the bug report's ROOT alignment) — including
-// the multi-image grid (ImageRegionGrid + splitImageRegion mirror the pptx.rs
-// grid contract: same visuals ordering, cell split and gap). The toolbar's
+// WYSIWYG: thumbnails, the Preview canvas, and the PresentationMode overlay all
+// render the SAME slide content via the exported `SlideStage`, at a fixed
+// 1280×720 design size, CSS-scaled to fit. The slide-derivation helpers live in
+// ../slides and MIRROR the Rust deck.rs/pptx.rs rules, so what you see matches
+// the exported layout (the bug report's ROOT alignment) — including the
+// multi-image grid (ImageRegionGrid + splitImageRegion mirror the pptx.rs grid
+// contract: same visuals ordering, cell split and gap). The toolbar's
 // Editor/Slides toggle can switch a tab into and out of this view at any
 // time — App.tsx keys the view by tab+mode so state resets cleanly either way.
+// Presentation mode itself is NOT part of that mode switch — it's a separate,
+// ephemeral overlay (store.presentationOpen) mounted as a sibling in App.tsx.
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -29,6 +34,7 @@ import {
   slideDiagrams,
   slideImages,
   slideMoveBounds,
+  slideNotes,
   slideOverflows,
   slideSubtitle,
   slideTitle,
@@ -96,10 +102,10 @@ export default function SlideEditor() {
   const splitSlideBefore = useStore((s) => s.splitSlideBefore);
   const mergeSlideIntoPrevious = useStore((s) => s.mergeSlideIntoPrevious);
 
+  const openPresentation = useStore((s) => s.openPresentation);
+
   const [view, setView] = useState<"edit" | "preview">("edit");
   const [anchor, setAnchor] = useState<string | null>(null);
-  const [presenting, setPresenting] = useState(false);
-  const [presentIdx, setPresentIdx] = useState(0);
   const dragFrom = useRef<number | null>(null);
   const thumbRefs = useRef<(HTMLDivElement | null)[]>([]);
 
@@ -124,31 +130,6 @@ export default function SlideEditor() {
     thumbRefs.current[selected]?.scrollIntoView({ block: "nearest" });
   }, [selected]);
 
-  const pIdx = Math.max(0, Math.min(presentIdx, slides.length - 1));
-  // B6: re-clamp the REAL present index when the deck shrinks (e.g. an undo during
-  // a presentation), so Prev/← aren't "dead" for a few presses while only the
-  // displayed index was clamped.
-  useEffect(() => {
-    setPresentIdx((i) => Math.min(i, Math.max(0, slides.length - 1)));
-  }, [slides.length]);
-
-  useEffect(() => {
-    if (!presenting) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ") {
-        e.preventDefault();
-        setPresentIdx((i) => Math.min(slides.length - 1, i + 1));
-      } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-        e.preventDefault();
-        setPresentIdx((i) => Math.max(0, i - 1));
-      } else if (e.key === "Escape") {
-        setPresenting(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [presenting, slides.length]);
-
   const reorder = (from: number, to: number) => {
     if (from === to || to < 0 || to >= slides.length) return;
     setChunkOrder(arrayMove(slideIdLists, from, to).flat());
@@ -171,10 +152,12 @@ export default function SlideEditor() {
     setAnchor(neighbour?.items[0]?.id ?? null);
     deleteChunks(slides[idx].items.map((c) => c.id));
   };
-  const startPresent = () => {
-    setPresentIdx(selected);
-    setPresenting(true);
-  };
+  // Item 1-3: presentation mode is a separate, ephemeral overlay owned by the
+  // store (presentationOpen) and rendered as a sibling of the main view in
+  // App.tsx — not local state here — so it opens the same way from the command
+  // palette regardless of which sub-view (Edit/Preview) is showing. It resumes
+  // on the slide currently selected in this rail.
+  const startPresent = () => openPresentation();
 
   // The chunk that holds this slide's layout override — heading, else the first
   // chunk — so even a heading-less slide can have a layout applied (Req 1).
@@ -467,51 +450,10 @@ export default function SlideEditor() {
                 <SlideStage slide={current} layout={resolveLayout(current)} docTitle={title} placeholders />
               </div>
             )}
+            {current && <SpeakerNotes slide={current} />}
           </div>
         </div>
       </div>
-
-      {/* ---- present overlay ---- */}
-      {presenting && slides[pIdx] && (
-        <div
-          className="fixed inset-0 z-[100] flex flex-col bg-black"
-          onClick={() => setPresenting(false)}
-        >
-          <div
-            className="flex flex-1 items-center justify-center p-6"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="w-full max-w-[1280px] shadow-2xl">
-              <SlideStage slide={slides[pIdx]} layout={resolveLayout(slides[pIdx])} docTitle={title} />
-            </div>
-          </div>
-          <div
-            className="flex items-center justify-center gap-5 pb-6 text-sm text-white/70"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <button
-              onClick={() => setPresentIdx((i) => Math.max(0, i - 1))}
-              disabled={pIdx === 0}
-              className="hover:text-white disabled:opacity-30"
-            >
-              ‹ Prev
-            </button>
-            <span className="tabular-nums">
-              {pIdx + 1} / {slides.length}
-            </span>
-            <button
-              onClick={() => setPresentIdx((i) => Math.min(slides.length - 1, i + 1))}
-              disabled={pIdx === slides.length - 1}
-              className="hover:text-white disabled:opacity-30"
-            >
-              Next ›
-            </button>
-            <button onClick={() => setPresenting(false)} className="hover:text-white">
-              Esc to exit
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -738,7 +680,52 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
   );
 }
 
-interface StageProps {
+/**
+ * Speaker notes for the current slide (item 1-1): a labeled textarea bound to
+ * the slide's heading chunk's `metadata.notes` via `slideNotes`/`setChunkNotes`.
+ * Uncommitted while typing and saved on blur (same pattern as
+ * `DetachedSlideBody`'s bullet textarea), so it doesn't spam undo history.
+ * A heading-less (leading) slide has no chunk to hold notes (mirrors
+ * deck.rs/slides.ts, which only ever derive notes from a heading), so the
+ * textarea is disabled with an explanatory placeholder in that case instead of
+ * silently doing nothing on blur.
+ *
+ * States: this is a simple always-visible synchronous text field bound to
+ * already-loaded in-memory document state — there is no async load, so a
+ * separate loading/error state doesn't apply (it can only be empty, which the
+ * placeholder covers, or populated).
+ */
+function SpeakerNotes({ slide }: { slide: SlideGroup }) {
+  const setChunkNotes = useStore((s) => s.setChunkNotes);
+  const heading = headingOf(slide);
+  const notes = slideNotes(slide);
+  return (
+    <div className="mt-3 rounded-lg border border-gray-200 bg-white p-3 shadow-sm">
+      <label
+        htmlFor="speaker-notes"
+        className="mb-1.5 block text-xs font-semibold text-ink-soft"
+      >
+        Speaker notes
+      </label>
+      <textarea
+        id="speaker-notes"
+        key={heading?.id ?? "none"}
+        defaultValue={notes}
+        onBlur={(e) => heading && setChunkNotes(heading.id, e.target.value)}
+        disabled={!heading}
+        placeholder={
+          heading
+            ? "Add speaker notes…"
+            : "This slide has no title yet — add one to attach speaker notes."
+        }
+        rows={3}
+        className="w-full resize-y rounded-md border border-gray-200 bg-gray-50/60 p-2 font-serif text-sm leading-6 text-ink-soft outline-none focus:border-accent/40 disabled:cursor-not-allowed disabled:opacity-60"
+      />
+    </div>
+  );
+}
+
+export interface StageProps {
   slide: SlideGroup;
   layout: SlideLayout;
   docTitle: string;
@@ -780,7 +767,11 @@ function stageEqual(a: StageProps, b: StageProps): boolean {
  * container — gives true-to-export WYSIWYG at any size (thumbnail/preview/present).
  * Memoised so editing one slide doesn't re-render (or re-observe) the others (D6).
  */
-const SlideStage = memo(function SlideStage({ slide, layout, docTitle, placeholders }: StageProps) {
+// Exported (item 1-3) so PresentationMode reuses this SAME rendering function
+// for its fullscreen view instead of reimplementing slide layout — the WYSIWYG
+// contract (thumbnail/Preview/Present/PresentationMode all render identically)
+// depends on there being exactly one render path.
+export const SlideStage = memo(function SlideStage({ slide, layout, docTitle, placeholders }: StageProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(0);
   useEffect(() => {

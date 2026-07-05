@@ -8,6 +8,7 @@ import { FONT_STACKS } from "../fonts";
 import { useStore } from "../store";
 import type { Settings } from "../types";
 import { CloseIcon } from "./icons";
+import { openPersonalLibraryPanel } from "./PersonalLibraryPanel";
 
 const DEFAULTS: Settings = {
   endpoint: "https://openrouter.ai/api/v1/chat/completions",
@@ -36,6 +37,9 @@ const DEFAULTS: Settings = {
   editorFontFamily: "serif",
   editorFontSize: 17,
   removedModels: [],
+  limitCompletionToLocalModel: false,
+  charLimitWarning: undefined,
+  personalRagEnabled: false,
 };
 
 // Common languages for the default-language picker.
@@ -339,6 +343,89 @@ export default function SettingsModal() {
               <code>http://localhost:11434/v1/chat/completions</code> (leave the API
               key blank for local endpoints). Image generation requires an
               OpenRouter image model.
+            </p>
+          </div>
+
+          <div>
+            <label className="flex items-center gap-2 text-sm font-medium text-ink-soft">
+              <input
+                type="checkbox"
+                checked={form.limitCompletionToLocalModel ?? false}
+                onChange={(e) => update("limitCompletionToLocalModel", e.target.checked)}
+                className="h-4 w-4 accent-accent"
+              />
+              Limit ghost-text completion to a local model
+            </label>
+            <p className="mt-1 text-xs text-ink-faint">
+              While typing, a faint inline suggestion previews how the sentence
+              might continue (Tab to accept, Esc to dismiss). When enabled, this
+              only fires if the endpoint above is local (e.g.{" "}
+              <code>localhost</code>/<code>127.0.0.1</code>) — if it isn't, no
+              suggestion is requested rather than sending your text to a remote
+              endpoint. Off by default.
+            </p>
+          </div>
+
+          <div>
+            <label className={labelCls}>Paragraph character-limit warning</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={1}
+                step={1}
+                value={form.charLimitWarning ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  update(
+                    "charLimitWarning",
+                    raw === "" ? undefined : Math.max(1, Math.round(Number(raw)))
+                  );
+                }}
+                placeholder="Off"
+                className={`${field} w-32`}
+              />
+              <button
+                type="button"
+                onClick={() => update("charLimitWarning", undefined)}
+                disabled={form.charLimitWarning === undefined}
+                className="shrink-0 rounded-md px-3 py-2 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-40"
+              >
+                Turn off
+              </button>
+            </div>
+            <p className="mt-1 text-xs text-ink-faint">
+              Flags any paragraph longer than this many characters in the health
+              bar — useful for any length-constrained writing (grant applications,
+              abstracts, forms). CJK characters count as one character each. Off
+              (unset) by default; leave blank to disable.
+            </p>
+          </div>
+
+          <div>
+            <label className="flex items-center gap-2 text-sm font-medium text-ink-soft">
+              <input
+                type="checkbox"
+                checked={form.personalRagEnabled ?? false}
+                onChange={(e) => update("personalRagEnabled", e.target.checked)}
+                className="h-4 w-4 accent-accent"
+              />
+              Personal knowledge base (RAG)
+            </label>
+            <p className="mt-1 text-xs text-ink-faint">
+              Let AI actions optionally pull in relevant snippets from your own
+              past papers/notes as grounding context. Fully on-device: embedding,
+              indexing, and search all run locally (a one-time embedding-model
+              download happens the first time you add a source or search, after
+              enabling this — no other network traffic). Off by default. Manage
+              indexed files from{" "}
+              <button
+                type="button"
+                onClick={() => openPersonalLibraryPanel()}
+                className="text-accent underline decoration-dotted hover:text-accent-soft"
+              >
+                the personal library panel
+              </button>{" "}
+              (also in the command palette).
             </p>
           </div>
 
