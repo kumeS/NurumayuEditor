@@ -166,9 +166,13 @@ function MarkdownPreview({
     );
 
   return (
+    /* `zoom` (not font-size) so the WHOLE page scales — text, measure, margins,
+       tables and images together — instead of only reflowing text inside a
+       fixed-width column. Lengths keep their layout meaning, so the scroll
+       container can reach whatever no longer fits. */
     <article
       className="markdown-preview mx-auto w-full max-w-prose px-10 py-12 font-sans text-ink"
-      style={{ fontSize: `${(17 * zoom).toFixed(2)}px` }}
+      style={{ zoom }}
     >
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
@@ -439,7 +443,7 @@ export default function MarkdownEditor() {
               </div>
             )}
             {surface !== "edit" && (
-              <div className="min-h-0 overflow-y-auto bg-white">
+              <div className="min-h-0 overflow-auto bg-white">
                 <MarkdownPreview source={source} onLink={showLink} />
               </div>
             )}
