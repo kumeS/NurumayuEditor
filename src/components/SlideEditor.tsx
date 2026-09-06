@@ -41,6 +41,7 @@ import {
   splitImageRegion,
   type SlideGroup,
 } from "../slides";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import type { Chunk, SlideLayout } from "../types";
 import ChunkView from "./ChunkView";
@@ -86,6 +87,7 @@ function arrayMove<T>(arr: T[], from: number, to: number): T[] {
 }
 
 export default function SlideEditor() {
+  const t = useT();
   const title = useStore((s) => s.doc.title);
   const setTitle = useStore((s) => s.setTitle);
   const chunks = useStore((s) => s.doc.chunks);
@@ -174,8 +176,7 @@ export default function SlideEditor() {
       <aside className="flex w-56 shrink-0 flex-col border-r border-gray-200 bg-gray-50/60">
         <div className="flex items-center justify-between px-3 py-2 text-xs font-semibold text-ink-soft">
           <span className="flex items-center gap-1.5">
-            <SlidesIcon className="h-3.5 w-3.5" /> Slides
-          </span>
+            <SlidesIcon className="h-3.5 w-3.5" />{t("Slides")}</span>
           <span className="text-ink-faint">{slides.length}</span>
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 pb-3">
@@ -244,11 +245,11 @@ export default function SlideEditor() {
                     isSel ? "opacity-100" : "opacity-0 group-hover/thumb:opacity-100"
                   }`}
                 >
-                  <RailBtn title="Move up" disabled={i === 0} onClick={() => reorder(i, i - 1)}>
+                  <RailBtn title={t("Move up")} disabled={i === 0} onClick={() => reorder(i, i - 1)}>
                     <ArrowUpIcon className="h-3 w-3" />
                   </RailBtn>
                   <RailBtn
-                    title="Move down"
+                    title={t("Move down")}
                     disabled={i === slides.length - 1}
                     onClick={() => reorder(i, i + 1)}
                   >
@@ -266,7 +267,7 @@ export default function SlideEditor() {
                     <CopyIcon className="h-3 w-3" />
                   </RailBtn>
                   <RailBtn
-                    title="Delete slide"
+                    title={t("Delete slide")}
                     disabled={slides.length <= 1}
                     onClick={() => deleteSlide(i)}
                   >
@@ -281,8 +282,7 @@ export default function SlideEditor() {
           onClick={addSlide}
           className="m-3 mt-0 flex items-center justify-center gap-1.5 rounded-md border border-dashed border-gray-300 py-2 text-sm text-ink-faint hover:border-accent/40 hover:text-accent"
         >
-          <PlusIcon className="h-4 w-4" /> Add slide
-        </button>
+          <PlusIcon className="h-4 w-4" />{t("Add slide")}</button>
       </aside>
 
       {/* ---- canvas ---- */}
@@ -291,7 +291,7 @@ export default function SlideEditor() {
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="Untitled Deck"
+            placeholder={t("Untitled Deck")}
             className="min-w-[8rem] flex-1 bg-transparent text-lg font-bold text-ink outline-none placeholder:text-ink-faint/40"
           />
           {/* Slide design group: layout (manual) + AI content (safe, non-destructive). */}
@@ -315,8 +315,7 @@ export default function SlideEditor() {
               title="Ask the AI to pick the best layout for this slide's content. The text is untouched — only the layout changes (pick Auto to clear it)."
               className="flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-2.5 py-1 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-40"
             >
-              <SparklesIcon className="h-4 w-4" /> AI layout
-            </button>
+              <SparklesIcon className="h-4 w-4" />{t("AI layout")}</button>
             {/* Req 2: detach a slide (its own AI summary) vs re-link it to the prose.
                 A rewrite that edits the shared document text ("Bulletize") lives as a
                 per-paragraph action in ChunkAiMenu instead — this is the only slide-level
@@ -325,26 +324,26 @@ export default function SlideEditor() {
               <>
                 <span
                   className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700"
-                  title="This slide shows its own summary, independent of the document text"
+                  title={t("This slide shows its own summary, independent of the document text")}
                 >
                   ✂ Detached
                 </span>
                 <button
                   onClick={() => leadId && setSlideBody(leadId, null)}
-                  title="Re-link this slide to the document text (discards the summary)"
+                  title={t("Re-link this slide to the document text (discards the summary)")}
                   className="rounded-md border border-gray-300 bg-white px-2.5 py-1 text-sm text-ink-soft hover:bg-gray-100"
                 >
-                  Re-link
+                  {t("Re-link")}
                 </button>
               </>
             ) : (
               <button
                 onClick={() => leadId && void summarizeSlide(currentTextIds, leadId)}
                 disabled={!!globalBusy || currentTextIds.length === 0 || !leadId}
-                title="Summarize this slide's text into its own bullets (AI). Non-destructive — the document text is unchanged; layout stays on Auto unless you pin one above."
+                title={t("Summarize this slide's text into its own bullets (AI). Non-destructive — the document text is unchanged; layout stays on Auto unless you pin one above.")}
                 className="flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-2.5 py-1 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-40"
               >
-                <SparklesIcon className="h-4 w-4" /> Summarize → slide
+                <SparklesIcon className="h-4 w-4" /> {t("Summarize → slide")}
               </button>
             )}
           </div>
@@ -356,10 +355,10 @@ export default function SlideEditor() {
             // The first slide has nothing before it; a heading-less (leading)
             // slide has no delimiter to demote — only ever true for slide 1.
             disabled={selected === 0 || !current || !headingOf(current)}
-            title="Merge this slide into the previous one — its title becomes a paragraph (⌘/Ctrl+Z to undo)"
+            title={t("Merge this slide into the previous one — its title becomes a paragraph (⌘/Ctrl+Z to undo)")}
             className="rounded-md border border-gray-300 px-2.5 py-1 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-40"
           >
-            Merge into previous
+            {t("Merge into previous")}
           </button>
           <div className="flex shrink-0 overflow-hidden rounded-md border border-gray-200 text-sm">
             {(["edit", "preview"] as const).map((m) => (
@@ -370,28 +369,27 @@ export default function SlideEditor() {
                   view === m ? "bg-accent text-white" : "bg-white text-ink-soft hover:bg-gray-100"
                 }`}
               >
-                {m === "edit" ? "Edit" : "Preview"}
+                {m === "edit" ? t("Edit") : t("Preview")}
               </button>
             ))}
           </div>
           <button
             onClick={startPresent}
-            title="Present full screen"
+            title={t("Present full screen")}
             className="flex items-center gap-1.5 rounded-md border border-gray-300 px-2.5 py-1 text-sm text-ink-soft hover:bg-gray-100"
           >
-            <PresentIcon className="h-4 w-4" /> Present
-          </button>
+            <PresentIcon className="h-4 w-4" />{t("Present")}</button>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto bg-gray-100 p-6">
           <div className="mx-auto w-full max-w-[900px]">
             <div className="mb-2 flex items-center justify-between text-xs text-ink-faint">
               <span>
-                Slide {slides.length ? selected + 1 : 0} / {slides.length}
+                {t("Slide")} {slides.length ? selected + 1 : 0} / {slides.length}
               </span>
               {current && (
                 <span className="rounded-full bg-accent/10 px-2 py-0.5 font-medium text-accent">
-                  {layoutLabel(resolveLayout(current))}
+                  {t(layoutLabel(resolveLayout(current)))}
                 </span>
               )}
             </div>
@@ -418,11 +416,10 @@ export default function SlideEditor() {
                                 const id = splitSlideBefore(c.id);
                                 if (id) setAnchor(id);
                               }}
-                              title="Start a new slide here — this paragraph and everything below it move to a new slide (⌘/Ctrl+Z to undo)"
+                              title={t("Start a new slide here — this paragraph and everything below it move to a new slide (⌘/Ctrl+Z to undo)")}
                               className="mb-1 flex w-full items-center justify-center gap-1.5 rounded border border-dashed border-transparent px-2 py-0.5 text-[11px] text-ink-faint opacity-0 transition-opacity hover:border-gray-300 hover:bg-gray-50 hover:text-ink-soft group-hover/row:opacity-100"
                             >
-                              <ScissorsIcon className="h-3 w-3" /> Split slide here
-                            </button>
+                              <ScissorsIcon className="h-3 w-3" />{t("Split slide here")}</button>
                           )}
                           <ChunkView
                             chunkId={c.id}
@@ -502,6 +499,7 @@ function LayoutPicker({
   disabled: boolean;
   onPick: (layout: SlideLayout | null) => void;
 }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -524,19 +522,19 @@ function LayoutPicker({
       <button
         onClick={() => setOpen((v) => !v)}
         disabled={disabled}
-        title="Slide layout — where the title, bullets and image sit"
+        title={t("Slide layout — where the title, bullets and image sit")}
         className={`flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-2.5 py-1 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-40 ${
           open ? "border-accent/50" : ""
         }`}
       >
-        <SlidesIcon className="h-4 w-4" /> Layout: {hasOverride ? layoutLabel(current) : "Auto"}
+        <SlidesIcon className="h-4 w-4" /> {t("Layout")}: {hasOverride ? t(layoutLabel(current)) : t("Auto")}
       </button>
       {open && (
         <div className="absolute left-0 top-9 z-30 w-[22rem] rounded-lg border border-gray-200 bg-white p-2 shadow-lg">
           <div className="grid grid-cols-3 gap-2">
             <button
               onClick={() => pick(null)}
-              title="Pick automatically from this slide's content: an image → an image layout, no body text → section, otherwise bullets."
+              title={t("Pick automatically from this slide's content: an image → an image layout, no body text → section, otherwise bullets.")}
               className={`flex flex-col items-center gap-1 rounded-md border p-1.5 hover:border-accent/50 ${
                 !hasOverride ? "border-accent ring-1 ring-accent" : "border-transparent"
               }`}
@@ -548,13 +546,13 @@ function LayoutPicker({
               <button
                 key={l.value}
                 onClick={() => pick(l.value)}
-                title={l.hint}
+                title={t(l.hint)}
                 className={`flex flex-col items-center gap-1 rounded-md border p-1.5 hover:border-accent/50 ${
                   hasOverride && current === l.value ? "border-accent ring-1 ring-accent" : "border-transparent"
                 }`}
               >
                 <LayoutGlyph kind={l.value} />
-                <span className="text-[11px] text-ink-soft">{l.label}</span>
+                <span className="text-[11px] text-ink-soft">{t(l.label)}</span>
               </button>
             ))}
           </div>
@@ -641,6 +639,7 @@ function LayoutGlyph({ kind }: { kind: SlideLayout | "auto" }) {
  * is the current body so a re-summarize replaces the text.
  */
 function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
+  const t = useT();
   const setSlideBody = useStore((s) => s.setSlideBody);
   const updateChunkContent = useStore((s) => s.updateChunkContent);
   const heading = headingOf(slide);
@@ -654,11 +653,11 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
         <input
           value={heading.content}
           onChange={(e) => updateChunkContent(heading.id, e.target.value)}
-          placeholder="Slide title"
+          placeholder={t("Slide title")}
           className="w-full bg-transparent text-2xl font-bold text-ink outline-none placeholder:text-ink-faint/40"
         />
       ) : (
-        <div className="text-2xl font-bold text-ink-faint">Untitled slide</div>
+        <div className="text-2xl font-bold text-ink-faint">{t("Untitled slide")}</div>
       )}
       <textarea
         key={body.join("|")}
@@ -669,7 +668,7 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
             e.target.value.split("\n").map((l) => l.trim()).filter(Boolean)
           )
         }
-        placeholder="One bullet per line…"
+        placeholder={t("One bullet per line…")}
         className="min-h-0 w-full flex-1 resize-none rounded-md border border-gray-200 bg-gray-50/60 p-3 font-serif text-[1.05rem] leading-8 text-ink-soft outline-none focus:border-accent/40"
       />
       <div className="shrink-0 text-xs text-ink-faint">
@@ -696,6 +695,7 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
  * placeholder covers, or populated).
  */
 function SpeakerNotes({ slide }: { slide: SlideGroup }) {
+  const t = useT();
   const setChunkNotes = useStore((s) => s.setChunkNotes);
   const heading = headingOf(slide);
   const notes = slideNotes(slide);
@@ -705,7 +705,7 @@ function SpeakerNotes({ slide }: { slide: SlideGroup }) {
         htmlFor="speaker-notes"
         className="mb-1.5 block text-xs font-semibold text-ink-soft"
       >
-        Speaker notes
+        {t("Speaker notes")}
       </label>
       <textarea
         id="speaker-notes"
@@ -715,8 +715,8 @@ function SpeakerNotes({ slide }: { slide: SlideGroup }) {
         disabled={!heading}
         placeholder={
           heading
-            ? "Add speaker notes…"
-            : "This slide has no title yet — add one to attach speaker notes."
+            ? t("Add speaker notes…")
+            : t("This slide has no title yet — add one to attach speaker notes.")
         }
         rows={3}
         className="w-full resize-y rounded-md border border-gray-200 bg-gray-50/60 p-2 font-serif text-sm leading-6 text-ink-soft outline-none focus:border-accent/40 disabled:cursor-not-allowed disabled:opacity-60"
@@ -806,7 +806,8 @@ export const SlideStage = memo(function SlideStage({ slide, layout, docTitle, pl
 
 /** The slide content at design size (1280×720). Mirrors the PPTX layouts. */
 function SlideContent({ slide, layout, docTitle, placeholders }: StageProps) {
-  const title = slideTitle(slide, docTitle) || "Untitled slide";
+  const t = useT();
+  const title = slideTitle(slide, docTitle) || t("Untitled slide");
   const bullets = slideBullets(slide);
   const visuals = slideImages(slide); // ordered visuals (multi-image grid)
   const diagramCount = slideDiagrams(slide).length;
@@ -1018,6 +1019,7 @@ function ImageRegionGrid({ layout, visuals }: { layout: SlideLayout; visuals: Ch
  * fallback for pptx.rs parity.
  */
 function ImagePlaceholder() {
+  const t = useT();
   return (
     <div
       style={{
@@ -1033,7 +1035,6 @@ function ImagePlaceholder() {
         fontSize: 26,
       }}
     >
-      <ImageIcon width={32} height={32} /> Image
-    </div>
+      <ImageIcon width={32} height={32} />{t("Image")}</div>
   );
 }

@@ -132,6 +132,16 @@ pub fn chunk_reference_text(text: &str) -> Vec<String> {
     passages
 }
 
+/// Build the stable synthetic source path for a confirmed chunk (開発.txt
+/// Stage 3, item 3-1 auto-accumulation; Q11/Q16): `"{doc_path}#{chunk_id}"`.
+/// Stable across saves of the SAME chunk (same document path + same chunk
+/// id), so `Index::add_source`'s replace-not-accumulate behavior keeps that
+/// one chunk's indexed passages in sync with its latest confirmed text,
+/// rather than growing a new entry every save.
+pub fn confirmed_chunk_source_path(doc_path: &str, chunk_id: &str) -> String {
+    format!("{doc_path}#{chunk_id}")
+}
+
 // ----- embedding -------------------------------------------------------------
 
 /// Injectable embedding function so storage/retrieval logic is testable
@@ -395,6 +405,26 @@ impl Index {
         Ok(count == 0)
     }
 
+    /// Auto-accumulation of confirmed content (開発.txt Stage 3, item 3-1;
+    /// Q11/Q16): (re-)index every `(source_path, text)` pair — the caller
+    /// (`commands::rag_sync_confirmed_chunks`) has already filtered this down
+    /// to chunks with `ChunkMetadata::confirmed == true` and non-empty
+    /// content, and computed each stable synthetic `source_path` (see
+    /// `confirmed_chunk_source_path`). Each call to `add_source` already
+    /// replaces any prior entries for that exact path (see its own doc
+    /// comment), so re-saving a document with edited confirmed-chunk text
+    /// updates that chunk's passages in place rather than accumulating stale
+    /// duplicates alongside fresh ones — this is what makes re-save
+    /// idempotent. Returns the total number of passages (re-)indexed across
+    /// all pairs.
+    pub fn add_confirmed_chunks(&mut self, chunks: &[(String, String)]) -> AppResult<usize> {
+        let mut total = 0usize;
+        for (source_path, text) in chunks {
+            total += self.add_source(source_path, text)?;
+        }
+        Ok(total)
+    }
+
     /// Find the `top_k` passages most similar to `query` (cosine distance,
     /// ascending — closer first).
     pub fn search(&mut self, query: &str, top_k: usize) -> AppResult<Vec<SearchHit>> {
@@ -617,6 +647,102 @@ mod tests {
         let sources = idx.list_sources().unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].passage_count, 1, "stale passages from the old version must be gone");
+    }
+
+    // ----- confirmed-chunk auto-accumulation (開発.txt Stage 3; Q11/Q16) -----
+
+    #[test]
+    fn confirmed_chunk_source_path_is_stable_per_doc_and_chunk() {
+        assert_eq!(
+            confirmed_chunk_source_path("/Users/me/paper.aix", "chunk-1"),
+            "/Users/me/paper.aix#chunk-1"
+        );
+        // Same document + same chunk id → the SAME path every time (this is
+        // what makes re-save replace rather than accumulate).
+        assert_eq!(
+            confirmed_chunk_source_path("/Users/me/paper.aix", "chunk-1"),
+            confirmed_chunk_source_path("/Users/me/paper.aix", "chunk-1")
+        );
+        // Different chunk id → a different path (each confirmed chunk is its
+        // own independent passage, not merged into one blob per document).
+        assert_ne!(
+            confirmed_chunk_source_path("/Users/me/paper.aix", "chunk-1"),
+            confirmed_chunk_source_path("/Users/me/paper.aix", "chunk-2")
+        );
+    }
+
+    #[test]
+    fn add_confirmed_chunks_indexes_only_the_given_pairs() {
+        // Mirrors the command-layer contract: the caller has ALREADY filtered
+        // to confirmed + non-empty chunks before calling this, so 2 confirmed
+        // + 1 unconfirmed chunk means exactly 2 pairs reach here.
+        let mut idx = test_index();
+        let doc_path = "/Users/me/paper.aix";
+        let pairs = vec![
+            (
+                confirmed_chunk_source_path(doc_path, "c1"),
+                "First confirmed paragraph.".to_string(),
+            ),
+            (
+                confirmed_chunk_source_path(doc_path, "c2"),
+                "Second confirmed paragraph.".to_string(),
+            ),
+            // c3 is deliberately NOT included here — it represents the
+            // unconfirmed chunk the command layer already excluded.
+        ];
+        let total = idx.add_confirmed_chunks(&pairs).unwrap();
+        assert_eq!(total, 2);
+
+        let sources = idx.list_sources().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().any(|s| s.path == confirmed_chunk_source_path(doc_path, "c1")));
+        assert!(sources.iter().any(|s| s.path == confirmed_chunk_source_path(doc_path, "c2")));
+        // The excluded chunk's synthetic path must never appear.
+        assert!(!sources.iter().any(|s| s.path == confirmed_chunk_source_path(doc_path, "c3")));
+    }
+
+    #[test]
+    fn re_saving_an_edited_confirmed_chunk_replaces_not_duplicates() {
+        // Round-trip/idempotency (testing rule 4): re-sync the SAME chunk id
+        // with edited text must replace its old passages, not accumulate them
+        // alongside the new ones.
+        let mut idx = test_index();
+        let doc_path = "/Users/me/paper.aix";
+        let path = confirmed_chunk_source_path(doc_path, "c1");
+
+        idx.add_confirmed_chunks(&[(path.clone(), "Old text, version one.".to_string())])
+            .unwrap();
+        let sources = idx.list_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].passage_count, 1);
+
+        // Re-save with edited content for the SAME chunk id.
+        idx.add_confirmed_chunks(&[(
+            path.clone(),
+            "Completely rewritten text, version two, with more words in it.".to_string(),
+        )])
+        .unwrap();
+
+        let sources_after = idx.list_sources().unwrap();
+        assert_eq!(sources_after.len(), 1, "must still be exactly one source, not two");
+        assert_eq!(sources_after[0].path, path);
+        // Still exactly one passage under this path — the old passage was
+        // replaced, not kept alongside the new one (accumulation would show
+        // up here as passage_count == 2).
+        assert_eq!(sources_after[0].passage_count, 1);
+
+        // The OLD passage text itself must be gone (not just out-ranked) —
+        // every remaining passage under this source path must be the NEW
+        // text, never the pre-edit text.
+        let hits = idx.search("Completely rewritten text, version two, with more words in it.", 10).unwrap();
+        let this_source_hits: Vec<_> = hits.iter().filter(|h| h.source_path == path).collect();
+        assert!(!this_source_hits.is_empty(), "expected to find the re-saved passage");
+        assert!(
+            this_source_hits
+                .iter()
+                .all(|h| h.snippet != "Old text, version one."),
+            "stale passage text from the pre-edit version must not still be indexed: {this_source_hits:?}"
+        );
     }
 
     #[test]

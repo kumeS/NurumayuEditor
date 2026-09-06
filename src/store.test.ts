@@ -4,6 +4,7 @@ import { groupSlides, hasLayoutOverride, resolveLayout } from "./slides";
 import {
   clampPresentIndex,
   hashContent,
+  makeWelcomeExampleDoc,
   pruneAnalysis,
   staleSummaryChunkIds,
   useStore,
@@ -14,6 +15,7 @@ import type {
   Chunk,
   ChunkType,
   Document,
+  Settings,
   SlideLayout,
 } from "./types";
 
@@ -85,6 +87,38 @@ describe("B3 — per-tab in-flight state", () => {
   });
 });
 
+describe("Markdown source mutation", () => {
+  beforeEach(() => reset([chunk("a", "text", "Original")]))
+
+  it("is undoable and keeps the parsed chunk projection in sync", () => {
+    st().setMode("markdown");
+    const source = "# 日本語タイトル\n\n## 概要\n\n- [x] 完了\n";
+
+    st().setMarkdownSource(source);
+    expect(st().doc.markdownSource).toBe(source);
+    expect(st().doc.title).toBe("日本語タイトル");
+    expect(st().doc.chunks.map((c) => c.metadata.chunkType)).toEqual([
+      "heading",
+      "text",
+    ]);
+
+    st().undo();
+    expect(st().doc.markdownSource).toContain("Original");
+    st().redo();
+    expect(st().doc.markdownSource).toBe(source);
+  });
+
+  it("clears stale raw source after a chunk-side edit", () => {
+    st().setMode("markdown");
+    st().setMarkdownSource("# Title\n\nBody\n");
+    const bodyId = st().doc.chunks[0].id;
+    st().setMode("editor");
+    st().updateChunkContent(bodyId, "Changed in paragraph editor");
+
+    expect(st().doc.markdownSource).toBeUndefined();
+  });
+});
+
 describe("B8 — setChunkSummary is undoable", () => {
   beforeEach(() => reset([chunk("c1", "text", "hello")]));
 
@@ -103,6 +137,34 @@ describe("B8 — setChunkSummary is undoable", () => {
   it("does not mark the relationship graph stale", () => {
     useStore.setState({ analysisStale: false });
     st().setChunkSummary("c1", "s");
+    expect(st().analysisStale).toBe(false);
+  });
+});
+
+describe("Personal RAG auto-accumulation (開発.txt Stage 3; Q11/Q16) — setChunkConfirmed", () => {
+  beforeEach(() => reset([chunk("c1", "text", "Some paragraph.")]));
+
+  it("toggles the confirmed flag and persists it on the chunk's metadata", () => {
+    expect(st().doc.chunks[0].metadata.confirmed).toBeFalsy();
+    st().setChunkConfirmed("c1", true);
+    expect(st().doc.chunks[0].metadata.confirmed).toBe(true);
+    st().setChunkConfirmed("c1", false);
+    expect(st().doc.chunks[0].metadata.confirmed).toBe(false);
+  });
+
+  it("is undoable like its metadata-toggle peers (setChunkSubtitle/setChunkLayout)", () => {
+    const before = st().past.length;
+    st().setChunkConfirmed("c1", true);
+    expect(st().past.length).toBe(before + 1);
+    st().undo();
+    expect(st().doc.chunks[0].metadata.confirmed).toBeFalsy();
+    st().redo();
+    expect(st().doc.chunks[0].metadata.confirmed).toBe(true);
+  });
+
+  it("does not mark the relationship graph stale (metadata-only, not a content edit)", () => {
+    useStore.setState({ analysisStale: false });
+    st().setChunkConfirmed("c1", true);
     expect(st().analysisStale).toBe(false);
   });
 });
@@ -247,6 +309,44 @@ describe("B7 — duplicateChunksAfter placement", () => {
     reset([chunk("a", "text", "a"), chunk("x", "text", "x"), chunk("b", "text", "b")]);
     const ids = st().duplicateChunksAfter(["a", "b"]);
     expect(st().doc.chunks.map((c) => c.id)).toEqual(["a", ids[0], "x", "b", ids[1]]);
+  });
+});
+
+describe("insertLocalImageAfter — local image insertion (v1 No.1 priority feature)", () => {
+  it("inserts an image chunk after the given id, marked imageSource:'local' with no imagePrompt", () => {
+    reset([chunk("a", "text", "a")]);
+    const id = st().insertLocalImageAfter("a", "data:image/png;base64,AAA", "photo.png");
+    const order = st().doc.chunks.map((c) => c.id);
+    expect(order).toEqual(["a", id]);
+    const img = st().doc.chunks.find((c) => c.id === id)!;
+    expect(img.content).toBe("data:image/png;base64,AAA");
+    expect(img.metadata.chunkType).toBe("image");
+    expect(img.metadata.imageSource).toBe("local");
+    expect(img.metadata.imagePrompt).toBeUndefined();
+    expect(img.metadata.summary).toBe("photo.png");
+  });
+
+  it("appends at the end when id is null", () => {
+    reset([chunk("a", "text", "a"), chunk("b", "text", "b")]);
+    const id = st().insertLocalImageAfter(null, "data:image/png;base64,AAA", "x.png");
+    expect(st().doc.chunks.map((c) => c.id)).toEqual(["a", "b", id]);
+  });
+
+  it("differs from insertImageAfter (AI path), which sets imageSource:'ai' and stores the prompt", () => {
+    reset([chunk("a", "text", "a")]);
+    const aiId = st().insertImageAfter("a", "data:image/png;base64,BBB", "a cat");
+    const aiImg = st().doc.chunks.find((c) => c.id === aiId)!;
+    expect(aiImg.metadata.imageSource).toBe("ai");
+    expect(aiImg.metadata.imagePrompt).toBe("a cat");
+  });
+
+  it("is undoable", () => {
+    reset([chunk("a", "text", "a")]);
+    const before = st().doc.chunks.map((c) => c.id);
+    st().insertLocalImageAfter("a", "data:image/png;base64,AAA", "x.png");
+    expect(st().doc.chunks.length).toBe(2);
+    st().undo();
+    expect(st().doc.chunks.map((c) => c.id)).toEqual(before);
   });
 });
 
@@ -502,6 +602,64 @@ describe("review panel flags", () => {
     expect(st().reviewTargetChunkId).toBeNull();
     st().toggleReviewPanel(true);
     expect(st().reviewPanelOpen).toBe(true);
+  });
+});
+
+describe("Markdown preview zoom", () => {
+  it("defaults to 100%", () => {
+    reset([chunk("c1", "text", "one")]);
+    expect(st().markdownZoom).toBe(1);
+  });
+
+  it("zooms in and out in steps and clamps to a readable range", () => {
+    reset([chunk("c1", "text", "one")]);
+    st().setMarkdownZoom(1.25);
+    expect(st().markdownZoom).toBe(1.25);
+    // Far outside the range on both ends: clamped, never 0 or unreadably huge.
+    st().setMarkdownZoom(99);
+    expect(st().markdownZoom).toBe(2.5);
+    st().setMarkdownZoom(0.01);
+    expect(st().markdownZoom).toBe(0.6);
+  });
+
+  it("rounds to whole percent so the readout can never show 109.99999%", () => {
+    reset([chunk("c1", "text", "one")]);
+    st().setMarkdownZoom(1.1 + 0.2); // 1.3000000000000003 in binary floating point
+    expect(st().markdownZoom).toBe(1.3);
+  });
+
+  it("ignores a non-finite value instead of blanking the preview", () => {
+    reset([chunk("c1", "text", "one")]);
+    st().setMarkdownZoom(1.4);
+    st().setMarkdownZoom(Number.NaN);
+    expect(st().markdownZoom).toBe(1.4);
+  });
+});
+
+describe("folder tree sidebar flags", () => {
+  it("folderTreeOpen defaults to true and folderRoot to null", () => {
+    reset([chunk("c1", "text", "one")]);
+    expect(st().folderTreeOpen).toBe(true);
+    expect(st().folderRoot).toBeNull();
+  });
+
+  it("toggleFolderTree follows the networkOpen pattern", () => {
+    reset([chunk("c1", "text", "one")]);
+    st().toggleFolderTree(false);
+    expect(st().folderTreeOpen).toBe(false);
+    st().toggleFolderTree();
+    expect(st().folderTreeOpen).toBe(true);
+    st().toggleFolderTree(false);
+    expect(st().folderTreeOpen).toBe(false);
+  });
+
+  it("setFolderRoot sets the root and opening a folder implies the sidebar is shown", () => {
+    reset([chunk("c1", "text", "one")]);
+    st().toggleFolderTree(false);
+    st().setFolderRoot("/Users/me/notes");
+    expect(st().folderRoot).toBe("/Users/me/notes");
+    st().setFolderRoot(null);
+    expect(st().folderRoot).toBeNull();
   });
 });
 
@@ -882,5 +1040,109 @@ describe("2-4 — ghost-text inline completion", () => {
     // suggestion here would show a ghost overlay for text that doesn't match
     // what's now in the box, and a second Tab would duplicate content.
     expect(st().ghostSuggestion).toBeNull();
+  });
+});
+
+/** Minimal valid Settings fixture; override just the field(s) under test. */
+function settings(overrides: Partial<Settings> = {}): Settings {
+  return {
+    endpoint: "https://openrouter.ai/api/v1/chat/completions",
+    model: "m",
+    models: ["m"],
+    imageModel: "im",
+    imageModels: ["im"],
+    defaultTargetLanguage: "English",
+    writingTone: "neutral",
+    temperature: 0.3,
+    ...overrides,
+  };
+}
+
+describe("Blindspot QA v1 (project.md Q13) — first-run worked example", () => {
+  describe("makeWelcomeExampleDoc", () => {
+    it("produces a heading, three progress-note text chunks, and one local-image chunk captioned as this week's plot", () => {
+      const doc = makeWelcomeExampleDoc();
+      expect(doc.chunks).toHaveLength(5);
+      expect(doc.chunks.map((c) => c.metadata.chunkType)).toEqual([
+        "heading",
+        "text",
+        "text",
+        "text",
+        "image",
+      ]);
+
+      // Heading explicitly connects the dots: this doc IS the slides too.
+      const heading = doc.chunks[0];
+      expect(heading.content.length).toBeGreaterThan(0);
+      const intro = doc.chunks[1];
+      expect(intro.content.toLowerCase()).toContain("slides");
+
+      // The two remaining text chunks carry genuine progress-note content
+      // (non-empty, not placeholder-empty like emptyChunk()).
+      for (const c of doc.chunks.slice(2, 4)) {
+        expect(c.metadata.chunkType).toBe("text");
+        expect(c.content.trim().length).toBeGreaterThan(10);
+      }
+
+      // The image chunk demonstrates the own-figures feature: imageSource
+      // "local" (not "ai"), a data URL (no remote fetch), and a caption
+      // identifying it as this week's plot.
+      const image = doc.chunks[4];
+      expect(image.metadata.imageSource).toBe("local");
+      expect(image.content.startsWith("data:image/svg+xml,")).toBe(true);
+      expect(image.metadata.summary?.toLowerCase()).toContain("this week");
+    });
+
+    it("does not hardcode a real date in the heading", () => {
+      const doc = makeWelcomeExampleDoc();
+      // A real date would contain a 4-digit year; the label must stay generic.
+      expect(doc.chunks[0].content).not.toMatch(/\b(19|20)\d{2}\b/);
+    });
+  });
+
+  describe("loadWelcomeExampleIfFirstRun", () => {
+    it("on first run (flag false, pristine tab) loads the example doc and reports it fired", () => {
+      reset([chunk("a", "text", "")]); // pristine: blank, untitled, undirtied
+      const fired = st().loadWelcomeExampleIfFirstRun(
+        settings({ hasSeenWelcomeExample: false })
+      );
+      expect(fired).toBe(true);
+      expect(st().doc.chunks).toHaveLength(5);
+      expect(st().doc.chunks[4].metadata.imageSource).toBe("local");
+      expect(st().doc.title).toBe("Weekly progress note (example)");
+    });
+
+    it("subsequent calls with the flag already true leave the existing blank document unchanged", () => {
+      reset([chunk("a", "text", "")]);
+      const before = st().doc;
+      const fired = st().loadWelcomeExampleIfFirstRun(
+        settings({ hasSeenWelcomeExample: true })
+      );
+      expect(fired).toBe(false);
+      expect(st().doc).toBe(before); // untouched, same object identity
+      expect(st().doc.chunks).toHaveLength(1);
+      expect(st().doc.chunks[0].content).toBe("");
+    });
+
+    it("does not fire when the active tab is no longer pristine, even with the flag false", () => {
+      reset([chunk("a", "text", "already typing something")]);
+      const before = st().doc;
+      const fired = st().loadWelcomeExampleIfFirstRun(
+        settings({ hasSeenWelcomeExample: false })
+      );
+      expect(fired).toBe(false);
+      expect(st().doc).toBe(before);
+    });
+  });
+
+  describe("newTab — ongoing behavior is unaffected by the welcome example", () => {
+    it("newTab() always produces the existing blank single-paragraph document, regardless of the flag", () => {
+      reset([chunk("a", "text", "x")]);
+      st().newTab();
+      expect(st().doc.chunks).toHaveLength(1);
+      expect(st().doc.chunks[0].metadata.chunkType).toBe("text");
+      expect(st().doc.chunks[0].content).toBe("");
+      expect(st().doc.title).toBe("");
+    });
   });
 });

@@ -1,4 +1,4 @@
-# Homebrew formula — builds NurumayuFacet from source on the user's Mac.
+# Homebrew formula — builds NurumayuEditor from source on the user's Mac.
 # A local source build carries no `com.apple.quarantine` flag, so the app opens
 # with no Gatekeeper / notarization prompt, and it targets the host CPU
 # (Apple Silicon or Intel) automatically.
@@ -42,24 +42,24 @@ class Nurumayufacet < Formula
     # which is unavailable in Homebrew's non-interactive sandbox.
     system "npx", "tauri", "build", "--bundles", "app"
 
-    prefix.install "src-tauri/target/release/bundle/macos/NurumayuFacet.app"
+    prefix.install "src-tauri/target/release/bundle/macos/NurumayuEditor.app"
 
-    # Convenience CLI launcher: `nurumayufacet` opens the app.
-    (bin/"nurumayufacet").write <<~SH
+    # Convenience CLI launcher: `nurumayueditor` opens the app.
+    (bin/"nurumayueditor").write <<~SH
       #!/bin/bash
-      exec open -a "#{opt_prefix}/NurumayuFacet.app" "$@"
+      exec open -a "#{opt_prefix}/NurumayuEditor.app" "$@"
     SH
   end
 
   def caveats
     <<~EOS
-      NurumayuFacet was built from source — it has no quarantine flag and opens
+      NurumayuEditor was built from source — it has no quarantine flag and opens
       without any Gatekeeper / notarization prompt.
 
       Launch it:
-        nurumayufacet
+        nurumayueditor
       …or add it to /Applications:
-        ln -sfn #{opt_prefix}/NurumayuFacet.app /Applications/NurumayuFacet.app
+        ln -sfn #{opt_prefix}/NurumayuEditor.app /Applications/NurumayuEditor.app
 
       On first run, open Settings (gear icon, or Cmd-,) and paste your OpenRouter
       API key. It is stored in the macOS keychain, never on disk in plaintext.
@@ -67,6 +67,6 @@ class Nurumayufacet < Formula
   end
 
   test do
-    assert_path_exists prefix/"NurumayuFacet.app/Contents/MacOS/nurumayufacet"
+    assert_path_exists prefix/"NurumayuEditor.app/Contents/MacOS/nurumayueditor"
   end
 end

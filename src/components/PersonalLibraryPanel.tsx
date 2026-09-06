@@ -24,6 +24,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { create } from "zustand";
 import { api } from "../api";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import type { RagSearchHit, RagSourceInfo } from "../types";
 import { CloseIcon, FolderIcon, PlusIcon, SpinnerIcon, TrashIcon } from "./icons";
@@ -57,6 +58,7 @@ function message(e: unknown): string {
 }
 
 export default function PersonalLibraryPanel() {
+  const t = useT();
   const open_ = usePersonalLibraryPanelStore((s) => s.open);
   const setOpen = usePersonalLibraryPanelStore((s) => s.setOpen);
   const settings = useStore((s) => s.settings);
@@ -162,13 +164,13 @@ export default function PersonalLibraryPanel() {
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <FolderIcon className="h-4 w-4" />
-          Personal library
+          {t("Personal library")}
         </div>
         <button
           onClick={() => setOpen(false)}
           className="text-ink-faint hover:text-ink"
-          aria-label="Close personal library panel"
-          title="Close"
+          aria-label={t("Close personal library panel")}
+          title={t("Close")}
         >
           <CloseIcon className="h-4 w-4" />
         </button>
@@ -204,13 +206,13 @@ export default function PersonalLibraryPanel() {
               className="flex items-center gap-1 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white hover:bg-accent-soft disabled:opacity-50"
             >
               {adding ? <SpinnerIcon className="h-3.5 w-3.5" /> : <PlusIcon className="h-3.5 w-3.5" />}
-              Add file…
+              {t("Add file…")}
             </button>
           </div>
 
           {/* Loading state. */}
           {loading && (
-            <p className="mt-3 text-center text-xs text-ink-faint">Loading your library…</p>
+            <p className="mt-3 text-center text-xs text-ink-faint">{t("Loading your library…")}</p>
           )}
 
           {/* Error state — persistent, not just a toast. */}
@@ -223,7 +225,7 @@ export default function PersonalLibraryPanel() {
           {/* Empty state: enabled, loaded, but nothing indexed yet. */}
           {!loading && sources !== null && sources.length === 0 && !error && (
             <p className="mt-3 rounded-md bg-gray-50/60 px-2 py-3 text-center text-xs text-ink-faint">
-              Nothing indexed yet. Add a .txt/.md/.rtf/.pdf file above.
+              {t("Nothing indexed yet. Add a .txt/.md/.rtf/.pdf file above.")}
             </p>
           )}
 
@@ -246,7 +248,7 @@ export default function PersonalLibraryPanel() {
                     disabled={removingPath === s.path}
                     className="shrink-0 text-ink-faint hover:text-red-600 disabled:opacity-50"
                     aria-label={`Remove ${fileName(s.path)} from the personal library`}
-                    title="Remove from library"
+                    title={t("Remove from library")}
                   >
                     {removingPath === s.path ? (
                       <SpinnerIcon className="h-3.5 w-3.5" />
@@ -262,7 +264,7 @@ export default function PersonalLibraryPanel() {
           {/* Manual search/preview. */}
           <div className="mt-3 border-t border-gray-100 pt-2">
             <label className="mb-1 block text-xs font-medium text-ink-soft">
-              Preview search
+              {t("Preview search")}
             </label>
             <div className="flex gap-1.5">
               <input
@@ -271,7 +273,7 @@ export default function PersonalLibraryPanel() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void runSearch();
                 }}
-                placeholder="Try a phrase from your writing…"
+                placeholder={t("Try a phrase from your writing…")}
                 className="w-full rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-accent"
               />
               <button
@@ -284,7 +286,7 @@ export default function PersonalLibraryPanel() {
             </div>
 
             {results !== null && results.length === 0 && (
-              <p className="mt-2 text-center text-[11px] text-ink-faint">No matches.</p>
+              <p className="mt-2 text-center text-[11px] text-ink-faint">{t("No matches.")}</p>
             )}
             {results !== null && results.length > 0 && (
               <ul className="mt-2 max-h-48 space-y-1.5 overflow-y-auto pr-1">

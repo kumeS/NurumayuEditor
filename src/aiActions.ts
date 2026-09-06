@@ -5,6 +5,7 @@
 import { api } from "./api";
 import { validateMermaid } from "./mermaidRender";
 import { groupSlides, slideBullets, slideImages, slideTitle } from "./slides";
+import { tNow } from "./i18n";
 import { staleSummaryChunkIds, useStore } from "./store";
 import type { AiAction, Chunk, RagSearchHit, SlideLayout } from "./types";
 
@@ -168,6 +169,29 @@ function message(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 }
 
+/** Last path segment (works for both '/' and '\' separators), for a compact
+ * "Grounded from: x, y" notice rather than full absolute paths. */
+function baseName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+/**
+ * Personal RAG (開発.txt Stage 3, item 3-1), Part B: after an AI action that
+ * attached personal-library grounding completes, tell the user which source
+ * file(s) it came from — grounding is otherwise invisible once folded into the
+ * prompt. A no-op when `hits` is empty (nothing was attached), so ungrounded
+ * actions are unaffected. Deduplicates by source path (a chunk's top-K matches
+ * can include multiple passages from the same file) and keeps the notice
+ * short (basenames only, via the same "info" toast every other transient
+ * status uses — see `runChunkAction`'s own notify calls).
+ */
+export function notifyRagSources(hits: RagSearchHit[]): void {
+  if (hits.length === 0) return;
+  const names = Array.from(new Set(hits.map((h) => baseName(h.sourcePath))));
+  useStore.getState().notify(`Grounded from: ${names.join(", ")}`, "info");
+}
+
 /** Endpoints served from the local machine (e.g. Ollama) don't need an API key. */
 function isLocalEndpoint(endpoint: string | undefined): boolean {
   const e = (endpoint ?? "").toLowerCase();
@@ -327,7 +351,7 @@ async function refreshStaleSummaries(
   if (failed) {
     useStore
       .getState()
-      .notify("Some context summaries could not be refreshed", "info");
+      .notify(tNow("Some context summaries could not be refreshed"), "info");
   }
 }
 
@@ -344,7 +368,7 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
   const s = useStore.getState();
   if (!ids.length) return;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -354,7 +378,7 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
     .filter((c) => idSet.has(c.id) && c.metadata.chunkType === "text" && c.content.trim())
     .map((c) => c.content.trim());
   if (!texts.length) {
-    s.notify("Nothing to bulletize.", "info");
+    s.notify(tNow("Nothing to bulletize."), "info");
     return;
   }
 
@@ -371,12 +395,12 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
       tone: s.settings?.writingTone || undefined,
     });
     if (useStore.getState().activeTabId !== tab) {
-      s.notify("Switched tabs — bulletize discarded.", "info");
+      s.notify(tNow("Switched tabs — bulletize discarded."), "info");
       return;
     }
     const lines = parseBulletLines(result);
     if (!lines.length) {
-      s.notify("The model returned no bullets.", "info");
+      s.notify(tNow("The model returned no bullets."), "info");
       return;
     }
     useStore.getState().replaceChunksWithTexts(ids, lines);
@@ -398,7 +422,7 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
   const s = useStore.getState();
   if (!leadId) return;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -407,7 +431,7 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
     .filter((c) => idSet.has(c.id) && c.metadata.chunkType === "text" && c.content.trim())
     .map((c) => c.content.trim());
   if (!texts.length) {
-    s.notify("This slide has no text to summarize.", "info");
+    s.notify(tNow("This slide has no text to summarize."), "info");
     return;
   }
   const tab = s.activeTabId;
@@ -429,12 +453,12 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
       tone: s.settings?.writingTone || undefined,
     });
     if (useStore.getState().activeTabId !== tab) {
-      s.notify("Switched tabs — summary discarded.", "info");
+      s.notify(tNow("Switched tabs — summary discarded."), "info");
       return;
     }
     const lines = parseBulletLines(result);
     if (!lines.length) {
-      s.notify("The model returned no summary.", "info");
+      s.notify(tNow("The model returned no summary."), "info");
       return;
     }
     useStore.getState().setSlideBody(leadId, lines);
@@ -458,7 +482,7 @@ export async function suggestSlideLayout(hostChunkId: string): Promise<void> {
   const s = useStore.getState();
   if (!hostChunkId) return;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -486,7 +510,7 @@ export async function suggestSlideLayout(hostChunkId: string): Promise<void> {
         "section | title-content | title-image | title-image-left | image-top",
     });
     if (useStore.getState().activeTabId !== tab || !chunkStillActive(hostChunkId)) {
-      s.notify("Switched away — layout suggestion discarded.", "info");
+      s.notify(tNow("Switched away — layout suggestion discarded."), "info");
       return;
     }
     // Tolerant parse: the FIRST known layout name in the reply. Longest names
@@ -510,7 +534,7 @@ export async function suggestSlideLayout(hostChunkId: string): Promise<void> {
       }
     }
     if (!layout) {
-      s.notify("The model didn't name a layout — nothing changed.", "info");
+      s.notify(tNow("The model didn't name a layout — nothing changed."), "info");
       return;
     }
     useStore.getState().setChunkLayout(hostChunkId, layout);
@@ -539,11 +563,11 @@ export async function runChunkAction(
   const target = s.doc.chunks.find((c) => c.id === chunkId);
   if (!target) return;
   if (!target.content.trim() && action !== "custom") {
-    s.notify("This paragraph is empty.", "info");
+    s.notify(tNow("This paragraph is empty."), "info");
     return;
   }
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -565,11 +589,11 @@ export async function runChunkAction(
   // library matches as grounding context, but ONLY when the setting is on and
   // at least one source is indexed — `gatherRagSnippets` itself is the
   // zero-overhead-when-disabled guard (no query attempted otherwise). The
-  // Rust `AiRequest` struct does not read this field yet (that wiring, plus
-  // surfacing which sources were used near the result, is the citation-
-  // management follow-up) — sending it as an extra JSON key is harmless
-  // (ignored by serde) until then, so grounding can be exercised/tested here
-  // in isolation ahead of that change landing.
+  // Rust `AiRequest` (ai.rs) reads this field: `context_block` folds every
+  // non-empty snippet into a "[From your personal library]" prompt section
+  // labeled with its source path, so the model actually sees this grounding
+  // text. After the action completes, `notifyRagSources` below tells the user
+  // which source file(s) were attached, so grounding is never silent.
   const ragSnippets = await gatherRagSnippets(chunkId, sectionHeading);
 
   const request = {
@@ -613,16 +637,16 @@ export async function runChunkAction(
         })
       : await api.aiProcess(request);
     if (canceledChunks.has(chunkId)) {
-      s.notify("Stopped — result discarded.", "info");
+      s.notify(tNow("Stopped — result discarded."), "info");
       return;
     }
     if (!chunkStillActive(chunkId)) {
-      s.notify("Switched away from that paragraph — result discarded.", "info");
+      s.notify(tNow("Switched away from that paragraph — result discarded."), "info");
       return;
     }
     if (action === "summarize") {
       useStore.getState().setChunkSummary(chunkId, result);
-      s.notify("Summary added to paragraph metadata.", "success");
+      s.notify(tNow("Summary added to paragraph metadata."), "success");
     } else {
       useStore.getState().replaceChunkContent(chunkId, result);
       s.notify(
@@ -632,6 +656,9 @@ export async function runChunkAction(
         "success"
       );
     }
+    // Part B: name the source(s) this result was actually grounded against, so
+    // personal-library grounding is never silent once folded into the prompt.
+    notifyRagSources(ragSnippets);
   } catch (e) {
     // A stopped action's late failure isn't news the user needs.
     if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
@@ -654,11 +681,11 @@ export async function generateDiagramFromChunk(
   const tab = s.activeTabId; // B3: keep the chunk's busy state on its own tab
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
-    s.notify("This paragraph is empty.", "info");
+    s.notify(tNow("This paragraph is empty."), "info");
     return;
   }
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -679,11 +706,11 @@ export async function generateDiagramFromChunk(
       parseError = await validateMermaid(code);
     }
     if (canceledChunks.has(chunkId)) {
-      s.notify("Stopped — diagram discarded.", "info");
+      s.notify(tNow("Stopped — diagram discarded."), "info");
       return;
     }
     if (!chunkStillActive(chunkId)) {
-      s.notify("Switched away from that paragraph — diagram discarded.", "info");
+      s.notify(tNow("Switched away from that paragraph — diagram discarded."), "info");
       return;
     }
     if (parseError) {
@@ -694,7 +721,7 @@ export async function generateDiagramFromChunk(
       return;
     }
     useStore.getState().insertDiagramAfter(chunkId, code);
-    s.notify("Diagram generated below the paragraph.", "success");
+    s.notify(tNow("Diagram generated below the paragraph."), "success");
   } catch (e) {
     if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
@@ -708,11 +735,11 @@ export async function generateImageFromChunk(chunkId: string): Promise<void> {
   const tab = s.activeTabId; // B3: keep the chunk's busy state on its own tab
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
-    s.notify("This paragraph is empty.", "info");
+    s.notify(tNow("This paragraph is empty."), "info");
     return;
   }
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -721,15 +748,15 @@ export async function generateImageFromChunk(chunkId: string): Promise<void> {
   try {
     const url = await api.aiGenerateImage(chunk.content);
     if (canceledChunks.has(chunkId)) {
-      s.notify("Stopped — image discarded.", "info");
+      s.notify(tNow("Stopped — image discarded."), "info");
       return;
     }
     if (!chunkStillActive(chunkId)) {
-      s.notify("Switched away from that paragraph — image discarded.", "info");
+      s.notify(tNow("Switched away from that paragraph — image discarded."), "info");
       return;
     }
     useStore.getState().insertImageAfter(chunkId, url, chunk.content);
-    s.notify("Image generated below the paragraph.", "success");
+    s.notify(tNow("Image generated below the paragraph."), "success");
   } catch (e) {
     if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
@@ -743,7 +770,7 @@ export async function generateImageFromSelection(): Promise<void> {
   const ids = s.selectedChunkIds;
   if (ids.length === 0) return;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -757,7 +784,7 @@ export async function generateImageFromSelection(): Promise<void> {
     .join("\n\n")
     .trim();
   if (!prompt) {
-    s.notify("Select one or more text paragraphs first.", "info");
+    s.notify(tNow("Select one or more text paragraphs first."), "info");
     return;
   }
   const insertAfterId = selectedInOrder[selectedInOrder.length - 1]?.id ?? null;
@@ -766,12 +793,12 @@ export async function generateImageFromSelection(): Promise<void> {
   try {
     const url = await api.aiGenerateImage(prompt);
     if (useStore.getState().activeTabId !== tab) {
-      s.notify("Switched tabs — image discarded.", "info");
+      s.notify(tNow("Switched tabs — image discarded."), "info");
       return;
     }
     useStore.getState().insertImageAfter(insertAfterId, url, prompt);
     useStore.getState().clearSelection();
-    s.notify("Image generated from selection.", "success");
+    s.notify(tNow("Image generated from selection."), "success");
   } catch (e) {
     s.notify(message(e), "error");
   } finally {
@@ -799,11 +826,11 @@ export async function generatePresentationFromChunk(chunkId: string): Promise<vo
   const tab = s.activeTabId; // B3: keep the chunk's busy state on its own tab
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
-    s.notify("This paragraph is empty.", "info");
+    s.notify(tNow("This paragraph is empty."), "info");
     return;
   }
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -813,15 +840,15 @@ export async function generatePresentationFromChunk(chunkId: string): Promise<vo
   try {
     const url = await api.aiGenerateImage(prompt);
     if (canceledChunks.has(chunkId)) {
-      s.notify("Stopped — figure discarded.", "info");
+      s.notify(tNow("Stopped — figure discarded."), "info");
       return;
     }
     if (!chunkStillActive(chunkId)) {
-      s.notify("Switched away from that paragraph — figure discarded.", "info");
+      s.notify(tNow("Switched away from that paragraph — figure discarded."), "info");
       return;
     }
     useStore.getState().insertImageAfter(chunkId, url, prompt);
-    s.notify("Presentation figure generated below the paragraph.", "success");
+    s.notify(tNow("Presentation figure generated below the paragraph."), "success");
   } catch (e) {
     if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
@@ -840,11 +867,11 @@ export async function regenerateImageChunk(chunkId: string): Promise<void> {
   if (!chunk || chunk.metadata.chunkType !== "image") return;
   const prompt = chunk.metadata.imagePrompt || chunk.metadata.summary || "";
   if (!prompt.trim()) {
-    s.notify("No source prompt is stored for this image.", "info");
+    s.notify(tNow("No source prompt is stored for this image."), "info");
     return;
   }
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -853,17 +880,17 @@ export async function regenerateImageChunk(chunkId: string): Promise<void> {
   try {
     const url = await api.aiGenerateImage(prompt);
     if (canceledChunks.has(chunkId)) {
-      s.notify("Stopped — regenerated image discarded.", "info");
+      s.notify(tNow("Stopped — regenerated image discarded."), "info");
       return;
     }
     if (!chunkStillActive(chunkId)) {
-      s.notify("Switched away — regenerated image discarded.", "info");
+      s.notify(tNow("Switched away — regenerated image discarded."), "info");
       return;
     }
     // replaceChunkContent stores the previous URL in history, so every
     // alternative stays selectable.
     useStore.getState().replaceChunkContent(chunkId, url);
-    s.notify("New image version generated.", "success");
+    s.notify(tNow("New image version generated."), "success");
   } catch (e) {
     if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
   } finally {
@@ -881,7 +908,7 @@ export async function editSelection(instruction: string): Promise<void> {
   const ids = s.selectedChunkIds;
   if (ids.length === 0) return;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -895,7 +922,7 @@ export async function editSelection(instruction: string): Promise<void> {
       c.content.trim()
   );
   if (ordered.length === 0) {
-    s.notify("Select one or more non-empty text paragraphs first.", "info");
+    s.notify(tNow("Select one or more non-empty text paragraphs first."), "info");
     return;
   }
   const tab = s.activeTabId;
@@ -959,7 +986,7 @@ export async function speakChunk(
   if (!opts?.fromQueue) s.setSpeechQueue([]);
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
-    s.notify("Nothing to read here.", "info");
+    s.notify(tNow("Nothing to read here."), "info");
     return;
   }
   try {
@@ -988,7 +1015,7 @@ export async function speakChunks(ids: string[]): Promise<void> {
     return t === "text" || t === "heading";
   });
   if (speakable.length === 0) {
-    s.notify("Nothing to read.", "info");
+    s.notify(tNow("Nothing to read."), "info");
     return;
   }
   s.setSpeechQueue(speakable.slice(1));
@@ -1032,7 +1059,7 @@ export async function analyzeDocument(): Promise<void> {
   // start parallel analyses that waste tokens and flicker the graph.
   if (s.globalBusy) return;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -1041,7 +1068,7 @@ export async function analyzeDocument(): Promise<void> {
   try {
     const result = await api.aiAnalyzeDocument(s.doc);
     if (useStore.getState().activeTabId !== tab) {
-      s.notify("Switched tabs — analysis discarded.", "info");
+      s.notify(tNow("Switched tabs — analysis discarded."), "info");
       return;
     }
     // applyAnalysis persists the relationships into the document (spec §5) so
@@ -1049,7 +1076,7 @@ export async function analyzeDocument(): Promise<void> {
     useStore.getState().applyAnalysis(result);
     useStore.getState().toggleNetwork(true);
     if (result.nodes.length === 0) {
-      s.notify("No relationships were found.", "info");
+      s.notify(tNow("No relationships were found."), "info");
     } else {
       s.notify(
         `Found ${result.nodes.length} nodes and ${result.edges.length} relations.`,
@@ -1105,7 +1132,7 @@ export async function reviewDocument(): Promise<void> {
   const s = useStore.getState();
   if (s.globalBusy) return; // one global AI pass at a time (UI2 pattern)
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -1116,7 +1143,7 @@ export async function reviewDocument(): Promise<void> {
 
   const { ids, listing } = reviewListing(useStore.getState().doc.chunks);
   if (!listing) {
-    s.notify("Nothing to review yet — write something first.", "info");
+    s.notify(tNow("Nothing to review yet — write something first."), "info");
     return;
   }
   const language = s.settings?.defaultTargetLanguage;
@@ -1138,14 +1165,14 @@ export async function reviewDocument(): Promise<void> {
         (language ? ` Write each comment's text in ${language}.` : ""),
     });
     if (useStore.getState().activeTabId !== tab) {
-      s.notify("Switched tabs — review discarded.", "info");
+      s.notify(tNow("Switched tabs — review discarded."), "info");
       return;
     }
     const parsed = extractJsonObject(raw) as {
       comments?: { chunkId?: unknown; text?: unknown }[];
     } | null;
     if (!parsed || !Array.isArray(parsed.comments)) {
-      s.notify("The model returned no readable review.", "error");
+      s.notify(tNow("The model returned no readable review."), "error");
       return;
     }
     const findings = parsed.comments.filter(
@@ -1167,7 +1194,7 @@ export async function reviewDocument(): Promise<void> {
       store.toggleReviewPanel(true);
       s.notify(`AI review: ${added} comment${added === 1 ? "" : "s"}.`, "success");
     } else {
-      s.notify("AI review: no issues found.", "success");
+      s.notify(tNow("AI review: no issues found."), "success");
     }
   } catch (e) {
     s.notify(message(e), "error");
@@ -1219,26 +1246,27 @@ function buildGraphAndParagraphContext():
 }
 
 /**
- * Integrity lens (report ch.7 Task 4): feed the RELATIONSHIP GRAPH plus the
+ * "Map logic" (report ch.7 Task 4): feed the RELATIONSHIP GRAPH plus the
  * paragraph texts to the model and ask for (a) claims with no supporting
  * evidence edge AND no evidential text in the document, (b) pairs of
- * statements that contradict each other. Requires a fresh analysis — the graph
- * IS the input, so a stale/missing one would produce junk findings. Findings
- * land as AI comments (kind = "unsupported-claim" | "contradiction") and open
- * the review panel.
+ * statements that contradict each other. This is the model's OPINION, not a
+ * verified audit — an optional, occasional-use tool, not a weekly-loop
+ * essential (project.md Q8). Requires a fresh analysis — the graph IS the
+ * input, so a stale/missing one would produce junk findings. Findings land
+ * as AI comments (kind = "unsupported-claim" | "contradiction") and open the
+ * review panel.
  */
 export async function checkIntegrity(): Promise<void> {
   const s = useStore.getState();
   if (s.globalBusy) return;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
   const analysis = s.doc.analysis;
   if (!analysis || s.analysisStale) {
-    s.notify(
-      "Run Analyze first so integrity checking has a fresh relationship graph.",
+    s.notify(tNow("Run Analyze first so logic-mapping has a fresh relationship graph."),
       "info"
     );
     return;
@@ -1246,12 +1274,12 @@ export async function checkIntegrity(): Promise<void> {
   const tab = s.activeTabId;
   const ctx = buildGraphAndParagraphContext();
   if (!ctx) {
-    s.notify("Nothing to check yet — write something first.", "info");
+    s.notify(tNow("Nothing to check yet — write something first."), "info");
     return;
   }
   const { ids, text } = ctx;
   const language = s.settings?.defaultTargetLanguage;
-  s.setGlobalBusy("Checking integrity…", tab);
+  s.setGlobalBusy("Mapping logic…", tab);
   try {
     const raw = await api.aiProcess({
       action: "custom",
@@ -1271,7 +1299,7 @@ export async function checkIntegrity(): Promise<void> {
         (language ? ` Write each note in ${language}.` : ""),
     });
     if (useStore.getState().activeTabId !== tab) {
-      s.notify("Switched tabs — integrity check discarded.", "info");
+      s.notify(tNow("Switched tabs — integrity check discarded."), "info");
       return;
     }
     const parsed = extractJsonObject(raw) as {
@@ -1283,7 +1311,7 @@ export async function checkIntegrity(): Promise<void> {
       }[];
     } | null;
     if (!parsed || !Array.isArray(parsed.findings)) {
-      s.notify("The model returned no readable findings.", "error");
+      s.notify(tNow("The model returned no readable findings."), "error");
       return;
     }
     const knownKinds = new Set(INTEGRITY_KINDS);
@@ -1320,11 +1348,11 @@ export async function checkIntegrity(): Promise<void> {
     if (added) {
       store.toggleReviewPanel(true);
       s.notify(
-        `Integrity check: ${added} finding${added === 1 ? "" : "s"}.`,
+        `Map logic: ${added} finding${added === 1 ? "" : "s"} (AI opinion, not a verified audit).`,
         "success"
       );
     } else {
-      s.notify("Integrity check: no issues found.", "success");
+      s.notify(tNow("Map logic: no issues found."), "success");
     }
   } catch (e) {
     s.notify(message(e), "error");
@@ -1417,19 +1445,18 @@ export async function checkAgainstCriteria(
   const s = useStore.getState();
   if (s.globalBusy) return null;
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return null;
   }
   const cleaned = criteria.map((c) => c.trim()).filter(Boolean);
   if (!cleaned.length) {
-    s.notify("Add at least one review criterion first.", "info");
+    s.notify(tNow("Add at least one review criterion first."), "info");
     return null;
   }
   const analysis = s.doc.analysis;
   if (!analysis || s.analysisStale) {
-    s.notify(
-      "Run Analyze first so criteria checking has a fresh relationship graph.",
+    s.notify(tNow("Run Analyze first so criteria checking has a fresh relationship graph."),
       "info"
     );
     return null;
@@ -1437,7 +1464,7 @@ export async function checkAgainstCriteria(
   const tab = s.activeTabId;
   const ctx = buildGraphAndParagraphContext();
   if (!ctx) {
-    s.notify("Nothing to check yet — write something first.", "info");
+    s.notify(tNow("Nothing to check yet — write something first."), "info");
     return null;
   }
   const { ids, text } = ctx;
@@ -1461,7 +1488,7 @@ export async function checkAgainstCriteria(
         'with "supportingChunkIds":[].',
     });
     if (useStore.getState().activeTabId !== tab) {
-      s.notify("Switched tabs — criteria check discarded.", "info");
+      s.notify(tNow("Switched tabs — criteria check discarded."), "info");
       return null;
     }
     const results = parseCriteriaResults(raw, cleaned, ids);
@@ -1472,7 +1499,7 @@ export async function checkAgainstCriteria(
         "info"
       );
     } else {
-      s.notify("Criteria check: every criterion is covered.", "success");
+      s.notify(tNow("Criteria check: every criterion is covered."), "success");
     }
     return results;
   } catch (e) {

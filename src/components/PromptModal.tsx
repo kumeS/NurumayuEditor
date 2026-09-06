@@ -4,6 +4,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CloseIcon } from "./icons";
+import { useT } from "../i18n";
 
 interface PromptOptions {
   title: string;
@@ -26,6 +27,7 @@ export function promptDialog(opts: PromptOptions): Promise<string | null> {
 }
 
 export function PromptHost() {
+  const t = useT();
   const [opts, setOpts] = useState<PromptOptions | null>(null);
   const [value, setValue] = useState("");
   const resolverRef = useRef<Resolver | null>(null);
@@ -74,7 +76,7 @@ export function PromptHost() {
           <button
             className="text-ink-faint hover:text-ink"
             onClick={() => finish(null)}
-            aria-label="Close"
+            aria-label={t("Close")}
           >
             <CloseIcon />
           </button>
@@ -91,7 +93,7 @@ export function PromptHost() {
                 onClick={() => finish(p.value)}
                 className="rounded-full border border-gray-200 px-3 py-1 text-sm text-ink-soft transition-colors hover:border-accent hover:bg-accent/10 hover:text-accent"
               >
-                {p.label}
+                {t(p.label)}
               </button>
             ))}
           </div>
@@ -131,7 +133,7 @@ export function PromptHost() {
             className="rounded-md px-3 py-1.5 text-sm text-ink-soft hover:bg-gray-100"
             onClick={() => finish(null)}
           >
-            Cancel
+            {t("Cancel")}
           </button>
           <button
             className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-soft"

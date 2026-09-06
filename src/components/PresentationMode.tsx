@@ -33,12 +33,14 @@
 // testing rules require a guard for.
 
 import { useEffect, useState } from "react";
+import { useT } from "../i18n";
 import { clampPresentIndex, useStore } from "../store";
 import { groupSlides, resolveLayout, slideNotes } from "../slides";
 import { SlideStage } from "./SlideEditor";
 import { CloseIcon } from "./icons";
 
 export default function PresentationMode() {
+  const t = useT();
   const chunks = useStore((s) => s.doc.chunks);
   const title = useStore((s) => s.doc.title);
   const focusedChunkId = useStore((s) => s.focusedChunkId);
@@ -92,16 +94,16 @@ export default function PresentationMode() {
   if (!current) {
     return (
       <div className="fixed inset-0 z-[200] flex flex-col items-center justify-center gap-4 bg-black text-white">
-        <div className="text-lg font-medium">This deck has no slides yet</div>
+        <div className="text-lg font-medium">{t("This deck has no slides yet")}</div>
         <div className="text-sm text-white/60">
-          Add a slide in the Slides view, then present again.
+          {t("Add a slide in the Slides view, then present again.")}
         </div>
         <button
           onClick={closePresentation}
-          title="Exit presentation"
+          title={t("Exit presentation")}
           className="mt-2 rounded-md border border-white/30 px-4 py-1.5 text-sm text-white hover:bg-white/10"
         >
-          Exit presentation
+          {t("Exit presentation")}
         </button>
       </div>
     );
@@ -113,8 +115,8 @@ export default function PresentationMode() {
     <div className="fixed inset-0 z-[200] flex flex-col bg-black">
       <button
         onClick={closePresentation}
-        title="Exit presentation (Esc)"
-        aria-label="Exit presentation"
+        title={t("Exit presentation (Esc)")}
+        aria-label={t("Exit presentation")}
         className="absolute right-4 top-4 z-10 rounded-md p-1.5 text-white/50 hover:bg-white/10 hover:text-white"
       >
         <CloseIcon className="h-5 w-5" />
@@ -129,9 +131,9 @@ export default function PresentationMode() {
         <div className="mx-auto mb-2 w-full max-w-[1280px] shrink-0 px-6">
           <div className="rounded-lg border border-white/15 bg-white/5 p-3 text-sm leading-6 text-white/80">
             <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-white/40">
-              Speaker notes
+              {t("Speaker notes")}
             </div>
-            {notes ? notes : <span className="italic text-white/40">No notes for this slide.</span>}
+            {notes ? notes : <span className="italic text-white/40">{t("No notes for this slide.")}</span>}
           </div>
         </div>
       )}
@@ -140,10 +142,10 @@ export default function PresentationMode() {
         <button
           onClick={() => setIdx((i) => clampPresentIndex(i, -1, slides.length))}
           disabled={idx === 0}
-          title="Previous slide (←)"
+          title={t("Previous slide (←)")}
           className="hover:text-white disabled:opacity-30"
         >
-          ‹ Prev
+          ‹ {t("Prev")}
         </button>
         <span className="tabular-nums">
           {idx + 1} / {slides.length}
@@ -151,20 +153,20 @@ export default function PresentationMode() {
         <button
           onClick={() => setIdx((i) => clampPresentIndex(i, 1, slides.length))}
           disabled={idx === slides.length - 1}
-          title="Next slide (→ / Space)"
+          title={t("Next slide (→ / Space)")}
           className="hover:text-white disabled:opacity-30"
         >
-          Next ›
+          {t("Next")} ›
         </button>
         <button
           onClick={() => setNotesOpen((v) => !v)}
-          title="Toggle speaker notes (N)"
+          title={t("Toggle speaker notes (N)")}
           className={`rounded px-2 py-0.5 hover:text-white ${notesOpen ? "text-white" : ""}`}
         >
-          Notes (N)
+          {t("Notes (N)")}
         </button>
-        <button onClick={closePresentation} title="Exit presentation" className="hover:text-white">
-          Esc to exit
+        <button onClick={closePresentation} title={t("Exit presentation")} className="hover:text-white">
+          {t("Esc to exit")}
         </button>
       </div>
     </div>

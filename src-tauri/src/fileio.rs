@@ -7,8 +7,100 @@
 //! promotes fenced ```mermaid blocks into diagram chunks. Export reverses this.
 
 use crate::error::{AppError, AppResult};
-use crate::models::{Chunk, Document, DIAGRAM_FORMAT_MERMAID};
-use std::path::Path;
+use crate::models::{Chunk, Document, DIAGRAM_FORMAT_MERMAID, DOC_MODE_MARKDOWN};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+
+const MAX_DIRECTORY_ENTRIES: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_directory: bool,
+    /// True for files the app can actually open (`.aix`/`.md`/`.markdown`).
+    /// Directories are never directly "openable" — the tree expands them
+    /// instead. The frontend uses this to grey out unsupported file types
+    /// rather than duplicating the extension check itself.
+    pub is_openable: bool,
+}
+
+fn canonical_child(root: &str, path: &str) -> AppResult<(PathBuf, PathBuf)> {
+    let root = std::fs::canonicalize(root)?;
+    let path = std::fs::canonicalize(path)?;
+    if !path.starts_with(&root) {
+        return Err(AppError::Other(
+            "That path is outside the selected folder.".to_string(),
+        ));
+    }
+    Ok((root, path))
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "md" | "markdown"
+    )
+}
+
+fn is_openable_path(path: &Path) -> bool {
+    is_markdown_path(path)
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .eq_ignore_ascii_case("aix")
+}
+
+/// List every non-hidden entry (directories and files, of any type) directly
+/// below a user-selected root. Canonical containment prevents `..` and symlink
+/// traversal; the entry cap keeps a huge or hostile directory from consuming
+/// unbounded resources. Used to render the folder tree sidebar — a real file
+/// explorer, not a Markdown-only browser, so nothing here filters by extension
+/// except `is_openable` (a hint, not a filter).
+pub fn list_directory(root: &str, path: &str) -> AppResult<Vec<DirectoryEntry>> {
+    let (root, directory) = canonical_child(root, path)?;
+    if !directory.is_dir() {
+        return Err(AppError::Other(
+            "The selected path is not a folder.".to_string(),
+        ));
+    }
+
+    let mut entries = Vec::new();
+    for item in std::fs::read_dir(&directory)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let raw_path = item.path();
+        let canonical = match std::fs::canonicalize(&raw_path) {
+            Ok(value) if value.starts_with(&root) => value,
+            _ => continue,
+        };
+        let is_directory = canonical.is_dir();
+        entries.push(DirectoryEntry {
+            name,
+            path: canonical.to_string_lossy().to_string(),
+            is_directory,
+            is_openable: !is_directory && is_openable_path(&canonical),
+        });
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            break;
+        }
+    }
+    entries.sort_by(|a, b| {
+        b.is_directory
+            .cmp(&a.is_directory)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
 
 /// Read a file and build a `Document` from its contents.
 pub fn import_from_path(path: &str) -> AppResult<Document> {
@@ -40,7 +132,14 @@ pub fn import_from_path(path: &str) -> AppResult<Document> {
         }
     }
 
-    Ok(text_to_document(&title, &text))
+    let mut doc = text_to_document(&title, &text);
+    if matches!(ext.as_str(), "md" | "markdown") {
+        // Keep the bytes the user opened as the source of truth. The parsed
+        // chunks are a projection for the app's existing AI/slide features.
+        doc.mode = DOC_MODE_MARKDOWN.to_string();
+        doc.markdown_source = Some(std::fs::read_to_string(p)?);
+    }
+    Ok(doc)
 }
 
 /// Extract plain reference text from a file for use as Draft supporting
@@ -245,6 +344,16 @@ fn chunk_as_markdown(chunk: &Chunk) -> String {
 }
 
 fn document_to_md(doc: &Document) -> String {
+    // `markdown_source` is only authoritative while the doc is IN the Markdown
+    // workspace: the frontend doesn't clear it on ordinary chunk edits after
+    // switching away (see `Document::markdown_source` doc comment), so once
+    // `mode` has moved on, a leftover source is stale and must be ignored in
+    // favor of deriving fresh text from `chunks`.
+    if doc.mode == DOC_MODE_MARKDOWN {
+        if let Some(source) = &doc.markdown_source {
+            return source.clone();
+        }
+    }
     let mut out = String::new();
     if !doc.title.trim().is_empty() {
         out.push_str(&format!("# {}\n\n", doc.title.trim()));
@@ -660,6 +769,117 @@ mod tests {
     use super::*;
     use crate::models::{CHUNK_TYPE_DIAGRAM, CHUNK_TYPE_HEADING, CHUNK_TYPE_TEXT};
 
+    fn preview_test_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("nurumayu-preview-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn directory_listing_is_sorted_dirs_first_and_includes_every_file_type() {
+        let root = preview_test_dir();
+        let nested = root.join("Notes");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(root.join("z.md"), "# 日本語\n\n本文。\n").unwrap();
+        std::fs::write(root.join("a.png"), b"not text").unwrap();
+        std::fs::write(root.join("doc.aix"), "{}").unwrap();
+
+        let entries = list_directory(root.to_str().unwrap(), root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.is_directory))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Notes", true),
+                ("a.png", false),
+                ("doc.aix", false),
+                ("z.md", false),
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_marks_openable_by_extension_only() {
+        let root = preview_test_dir();
+        std::fs::create_dir(root.join("Notes")).unwrap();
+        std::fs::write(root.join("z.md"), "text").unwrap();
+        std::fs::write(root.join("w.markdown"), "text").unwrap();
+        std::fs::write(root.join("doc.aix"), "{}").unwrap();
+        std::fs::write(root.join("a.png"), b"not text").unwrap();
+
+        let entries = list_directory(root.to_str().unwrap(), root.to_str().unwrap()).unwrap();
+        let openable = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("missing entry {name}"))
+                .is_openable
+        };
+        assert!(!openable("Notes")); // directories are never directly "openable"
+        assert!(openable("z.md"));
+        assert!(openable("w.markdown"));
+        assert!(openable("doc.aix"));
+        assert!(!openable("a.png"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_excludes_dotfiles() {
+        let root = preview_test_dir();
+        std::fs::write(root.join(".hidden.md"), "text").unwrap();
+        std::fs::write(root.join("visible.md"), "text").unwrap();
+
+        let entries = list_directory(root.to_str().unwrap(), root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["visible.md"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_reads_cjk_names() {
+        let root = preview_test_dir();
+        std::fs::write(root.join("日本語.md"), "本文").unwrap();
+
+        let entries = list_directory(root.to_str().unwrap(), root.to_str().unwrap()).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.name == "日本語.md")
+            .expect("CJK-named file should be listed");
+        assert!(entry.is_openable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_caps_at_max_entries() {
+        let root = preview_test_dir();
+        for i in 0..(MAX_DIRECTORY_ENTRIES + 20) {
+            std::fs::write(root.join(format!("f{i:04}.txt")), "x").unwrap();
+        }
+        let entries = list_directory(root.to_str().unwrap(), root.to_str().unwrap()).unwrap();
+        assert_eq!(entries.len(), MAX_DIRECTORY_ENTRIES);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_rejects_paths_outside_its_root() {
+        let root = preview_test_dir();
+        let outside = preview_test_dir();
+        std::fs::write(outside.join("private.md"), "secret").unwrap();
+        let err = list_directory(
+            root.to_str().unwrap(),
+            outside.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("outside the selected folder"));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
     #[test]
     fn splits_paragraphs_on_blank_lines() {
         let doc = text_to_document("T", "Para one.\nstill one.\n\nPara two.");
@@ -946,5 +1166,43 @@ mod tests {
         let twice = import_from_path(p).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(twice.chunks.len(), 2, "chunks: {:?}", twice.chunks);
+    }
+
+    #[test]
+    fn markdown_open_and_export_preserve_exact_source() {
+        let source = "# 日本語タイトル\r\n\r\n- [x] **完了**  \r\n- [ ] 次\r\n\r\n|項目|値|\r\n|---|---:|\r\n|速度|42|\r\n";
+        let path = std::env::temp_dir().join("nurumayu_markdown_exact_source.md");
+        std::fs::write(&path, source.as_bytes()).unwrap();
+
+        let doc = import_from_path(path.to_str().unwrap()).unwrap();
+        assert_eq!(doc.mode, DOC_MODE_MARKDOWN);
+        assert_eq!(doc.markdown_source.as_deref(), Some(source));
+        assert_eq!(document_to_md(&doc), source);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A document that once passed through the Markdown workspace keeps a
+    /// `markdown_source` even after switching away (the frontend does not clear
+    /// it on chunk edits — see `Document::markdown_source` doc comment). Once the
+    /// doc has left Markdown mode, that source is stale: `document_to_md` must
+    /// derive fresh text from `chunks` instead of returning it verbatim, or a
+    /// Save-As-.md from Editor/Slide mode could silently write old content.
+    #[test]
+    fn document_to_md_ignores_stale_markdown_source_outside_markdown_mode() {
+        let mut doc = Document::new("Untitled");
+        doc.mode = "editor".to_string();
+        doc.chunks.push(Chunk::new_text(0, "Fresh paragraph."));
+        doc.markdown_source = Some("# Stale\n\nOld text from a past Markdown session.".to_string());
+
+        let md = document_to_md(&doc);
+        assert!(
+            md.contains("Fresh paragraph."),
+            "expected fresh chunk content, got: {md}"
+        );
+        assert!(
+            !md.contains("Old text from a past Markdown session."),
+            "stale markdown_source leaked through: {md}"
+        );
     }
 }

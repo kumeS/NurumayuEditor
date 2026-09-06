@@ -5,10 +5,15 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { aiReady } from "./aiActions";
 import { api } from "./api";
 import { renderMermaidToPng, renderMermaidToSvg } from "./mermaidRender";
+import { tNow } from "./i18n";
 import { useStore } from "./store";
 import type { Document, ExportFormat } from "./types";
 
 const NATIVE_EXT = "aix";
+
+function isMarkdownPath(path: string): boolean {
+  return /\.(md|markdown)$/i.test(path);
+}
 
 function message(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
@@ -26,21 +31,56 @@ function clearSessionIfAllSaved(): void {
   if (!dirtyLeft) void api.clearSession().catch(() => {});
 }
 
+/**
+ * Personal RAG (開発.txt Stage 3, item 3-1) auto-accumulation (Q11/Q16): after
+ * a successful save, push every chunk the user has marked `metadata.confirmed`
+ * (with non-empty content) into the on-device personal library, keyed by a
+ * stable per-chunk synthetic path derived from the just-saved document path —
+ * so re-saving an edited confirmed chunk updates its indexed passages rather
+ * than duplicating them (`rag_sync_confirmed_chunks`/`Index::add_source`'s
+ * existing replace-not-accumulate behavior).
+ *
+ * Mirrors `aiActions.ts::gatherRagSnippets`'s zero-overhead-when-disabled
+ * pattern: the setting check happens before assembling anything, so a
+ * document with confirmed chunks costs nothing extra on save while the
+ * setting is off — but for symmetry with `rag_sync_confirmed_chunks` (which
+ * ALSO no-ops when the setting is off) this is a belt-and-suspenders guard,
+ * not the only one. Best-effort: any failure (index error, model not ready)
+ * is swallowed with an "info" notice rather than treated as a failed save —
+ * the document is already safely on disk by the time this runs.
+ */
+export async function syncConfirmedChunksToRag(doc: Document, path: string): Promise<void> {
+  const s = useStore.getState();
+  if (!s.settings?.personalRagEnabled) return;
+
+  const pairs: Array<[string, string]> = doc.chunks
+    .filter((c) => c.metadata.confirmed && c.content.trim())
+    .map((c) => [c.id, c.content]);
+  if (pairs.length === 0) return;
+
+  try {
+    await api.ragSyncConfirmedChunks(path, pairs);
+  } catch (e) {
+    useStore.getState().notify(
+      `Saved, but couldn't update your personal library: ${message(e)}`,
+      "info"
+    );
+  }
+}
+
 function safeName(title: string): string {
   const base = title.trim() || "Untitled";
   return base.replace(/[\\/:*?"<>|]/g, "_");
 }
 
 /**
- * True if the active tab is an untouched blank EDITOR document we can reuse.
- * Slide-mode tabs are never reused for opened/imported/drafted (editor) content,
- * so a tab's mode stays fixed for its lifetime.
+ * True if the active tab is an untouched blank document we can reuse.
  */
 function activeIsPristine(): boolean {
   const s = useStore.getState();
   const c = s.doc.chunks;
   return (
-    (s.doc.mode ?? "editor") === "editor" &&
+    (s.doc.mode ?? "editor") !== "slide" &&
     !s.dirty &&
     !s.filePath &&
     c.length === 1 &&
@@ -55,6 +95,34 @@ function openInTab(doc: Document, filePath: string | null, dirty = false): void 
 }
 
 /**
+ * Open one file at `path` in a new tab, dispatching by extension. Shared by
+ * `openNative()` (the file picker) and the folder tree sidebar's file click —
+ * ONE implementation, so the two surfaces can never drift on how a file gets
+ * opened.
+ */
+export async function openPath(path: string): Promise<void> {
+  try {
+    if (isMarkdownPath(path)) {
+      const document = await api.importDocument(path);
+      openInTab(document, path, false);
+      useStore.getState().notify(tNow("Markdown document opened."), "success");
+      return;
+    }
+    const { document, notes } = await api.openDocumentJson(path);
+    // If the file had to be repaired on load (A1), open it dirty so the cleaned
+    // version can be saved back, and tell the user exactly what changed.
+    openInTab(document, path, notes.length > 0);
+    if (notes.length > 0) {
+      useStore.getState().notify(`Opened and repaired this file: ${notes.join(" ")}`, "info");
+    } else {
+      useStore.getState().notify(tNow("Document opened."), "success");
+    }
+  } catch (e) {
+    useStore.getState().notify(message(e), "error");
+  }
+}
+
+/**
  * Generate a fresh document draft on a theme into a new tab, streaming the
  * result into the editor in real time.
  */
@@ -65,7 +133,7 @@ export async function draftDocument(
 ): Promise<void> {
   const s = useStore.getState();
   if (!aiReady()) {
-    s.notify("Set your OpenRouter API key in Settings first.", "error");
+    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
@@ -113,7 +181,35 @@ export async function importDocument(): Promise<void> {
     if (typeof selected !== "string") return;
     const doc = await api.importDocument(selected);
     openInTab(doc, null, true); // imported doc has no .aix backing → dirty (B2)
-    useStore.getState().notify("Document imported.", "success");
+    useStore.getState().notify(tNow("Document imported."), "success");
+  } catch (e) {
+    useStore.getState().notify(message(e), "error");
+  }
+}
+
+/**
+ * File-picker entry point for inserting a local image (v1 "No.1" priority
+ * feature): open a native file dialog filtered to image extensions, read the
+ * chosen file via the Rust `read_local_image` command (the webview never
+ * reads disk directly), and insert it as an image chunk after `chunkId` (or
+ * at the end when `chunkId` is null). The other two entry points — drag-drop
+ * and paste — read the in-memory File/Blob client-side instead, since that
+ * content already arrived in the browser and isn't a disk path.
+ */
+export async function pickAndInsertLocalImage(chunkId: string | null): Promise<void> {
+  try {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] },
+      ],
+    });
+    if (typeof selected !== "string") return;
+    const dataUrl = await api.readLocalImage(selected);
+    const fileName = selected.split(/[/\\]/).pop() ?? "";
+    useStore.getState().insertLocalImageAfter(chunkId, dataUrl, fileName);
+    useStore.getState().notify(tNow("Image inserted."), "success");
   } catch (e) {
     useStore.getState().notify(message(e), "error");
   }
@@ -223,7 +319,7 @@ export async function exportPdf(): Promise<void> {
     const iwin = iframe.contentWindow;
     if (!idoc || !iwin) {
       iframe.remove();
-      s.notify("Could not prepare the PDF view.", "error");
+      s.notify(tNow("Could not prepare the PDF view."), "error");
       return;
     }
     idoc.open();
@@ -320,18 +416,25 @@ export async function openNative(): Promise<void> {
     const selected = await open({
       multiple: false,
       directory: false,
-      filters: [{ name: "AIX Document", extensions: [NATIVE_EXT] }],
+      filters: [
+        { name: "NurumayuEditor documents", extensions: [NATIVE_EXT, "md", "markdown"] },
+      ],
     });
     if (typeof selected !== "string") return;
-    const { document, notes } = await api.openDocumentJson(selected);
-    // If the file had to be repaired on load (A1), open it dirty so the cleaned
-    // version can be saved back, and tell the user exactly what changed.
-    openInTab(document, selected, notes.length > 0);
-    if (notes.length > 0) {
-      useStore.getState().notify(`Opened and repaired this file: ${notes.join(" ")}`, "info");
-    } else {
-      useStore.getState().notify("Document opened.", "success");
-    }
+    await openPath(selected);
+  } catch (e) {
+    useStore.getState().notify(message(e), "error");
+  }
+}
+
+/** Open Folder…: pick a directory and show it in the folder tree sidebar. */
+export async function openFolder(): Promise<void> {
+  try {
+    const selected = await open({ multiple: false, directory: true });
+    if (typeof selected !== "string") return;
+    const s = useStore.getState();
+    s.setFolderRoot(selected);
+    s.toggleFolderTree(true);
   } catch (e) {
     useStore.getState().notify(message(e), "error");
   }
@@ -340,9 +443,16 @@ export async function openNative(): Promise<void> {
 export async function saveNativeAs(): Promise<void> {
   const s = useStore.getState();
   try {
+    // Both formats are always offered — Save is no longer locked to .aix for
+    // Editor/Slide-mode docs — but the DEFAULT (pre-selected filter and
+    // suggested filename) still follows the doc's mode, preserving today's
+    // one-click behavior for anyone who doesn't change it.
+    const markdownDefault = (s.doc.mode ?? "editor") === "markdown";
+    const nativeFilter = { name: "NurumayuEditor Document", extensions: [NATIVE_EXT] };
+    const markdownFilter = { name: "Markdown", extensions: ["md", "markdown"] };
     const path = await save({
-      defaultPath: `${safeName(s.doc.title)}.${NATIVE_EXT}`,
-      filters: [{ name: "AIX Document", extensions: [NATIVE_EXT] }],
+      defaultPath: `${safeName(s.doc.title)}.${markdownDefault ? "md" : NATIVE_EXT}`,
+      filters: markdownDefault ? [markdownFilter, nativeFilter] : [nativeFilter, markdownFilter],
     });
     if (!path) return;
     // Capture the exact document being written — the save is awaited without
@@ -350,10 +460,27 @@ export async function saveNativeAs(): Promise<void> {
     // keystroke) before this resolves. markClean must anchor the new baseline
     // to what actually reached disk, not to whatever is live when it returns.
     const written = s.doc;
-    await api.saveDocumentJson(written, path);
+    // Which format to WRITE is decided by the extension the user actually
+    // chose, not by mode — that's what makes Save As able to write .md for a
+    // non-Markdown-mode document (rust.md rule 4 / CLAUDE.md invariant 5:
+    // this is a lossy, one-way conversion for those modes — mode and any
+    // slide-only metadata don't round-trip — so it's reported as a warning on
+    // the persistent health-bar surface, not silently degraded).
+    const savingAsMarkdown = isMarkdownPath(path);
+    if (savingAsMarkdown) {
+      await api.exportDocument(written, path, "md");
+      if ((written.mode ?? "editor") !== "markdown") {
+        s.setLastExportReport("md", [
+          "Saved as Markdown — view mode and any slide-only details won't round-trip; reopening this file will load it as a Markdown document.",
+        ]);
+      }
+    } else {
+      await api.saveDocumentJson(written, path);
+    }
     s.markClean(path, written);
     clearSessionIfAllSaved();
-    s.notify("Document saved.", "success");
+    s.notify(tNow("Document saved."), "success");
+    await syncConfirmedChunksToRag(written, path);
   } catch (e) {
     s.notify(message(e), "error");
   }
@@ -367,10 +494,15 @@ export async function saveNative(): Promise<void> {
   }
   try {
     const written = s.doc;
-    await api.saveDocumentJson(written, s.filePath);
+    if (isMarkdownPath(s.filePath)) {
+      await api.exportDocument(written, s.filePath, "md");
+    } else {
+      await api.saveDocumentJson(written, s.filePath);
+    }
     s.markClean(undefined, written);
     clearSessionIfAllSaved();
-    s.notify("Document saved.", "success");
+    s.notify(tNow("Document saved."), "success");
+    await syncConfirmedChunksToRag(written, s.filePath);
   } catch (e) {
     s.notify(message(e), "error");
   }

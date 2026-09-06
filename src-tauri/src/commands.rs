@@ -70,6 +70,12 @@ fn api_key_for(endpoint: &str) -> AppResult<String> {
 fn load_llm_config(app: &AppHandle) -> AppResult<LlmConfig> {
     let settings = Settings::load(&config_dir(app)?);
     let api_key = api_key_for(&settings.endpoint)?;
+    // The keychain is the source of truth; if the cached existence flag
+    // disagrees with what we just read, correct it rather than let the UI keep
+    // showing a stale "key set" dot.
+    if settings.api_key_present != Some(!api_key.is_empty()) && !is_local_endpoint(&settings.endpoint) {
+        record_api_key_presence(app, !api_key.is_empty());
+    }
     Ok(LlmConfig {
         endpoint: settings.endpoint,
         model: settings.model,
@@ -101,7 +107,11 @@ pub fn import_document(path: String) -> AppResult<Document> {
 
 #[tauri::command]
 pub async fn export_document(mut document: Document, path: String, format: String) -> AppResult<()> {
-    check_ext(&path, &[format.as_str()])?;
+    if format.eq_ignore_ascii_case("md") || format.eq_ignore_ascii_case("markdown") {
+        check_ext(&path, &["md", "markdown"])?;
+    } else {
+        check_ext(&path, &[format.as_str()])?;
+    }
     if format.eq_ignore_ascii_case("rtf") {
         // Same as the PPTX path: fetch remote image URLs so the RTF writer can
         // embed them; a failed fetch falls back to the text placeholder.
@@ -154,6 +164,27 @@ pub fn open_document_json(path: String) -> AppResult<OpenedDocument> {
     Ok(OpenedDocument { document, notes })
 }
 
+/// GUI-only folder tree browsing (the sidebar file explorer). The core
+/// canonicalizes both paths, enforces root containment, and caps returned
+/// entries; it does not filter by extension (see `DirectoryEntry::is_openable`).
+#[tauri::command]
+pub fn list_directory(root: String, path: String) -> AppResult<Vec<fileio::DirectoryEntry>> {
+    fileio::list_directory(&root, &path)
+}
+
+/// Rebuild the native menu bar in `language` (the Settings "Default language").
+/// The menu is native and built once at startup, so switching languages has to
+/// replace it explicitly — otherwise the menu bar would stay in the old
+/// language until the next launch while the rest of the UI switched instantly.
+#[tauri::command]
+pub fn set_menu_language(app: AppHandle, language: String) -> AppResult<()> {
+    let menu = crate::menu::build(&app, &language)
+        .map_err(|e| AppError::Other(format!("Could not rebuild the menu: {e}")))?;
+    app.set_menu(menu)
+        .map_err(|e| AppError::Other(format!("Could not apply the menu: {e}")))?;
+    Ok(())
+}
+
 // ----- settings & secret storage ------------------------------------------
 
 #[tauri::command]
@@ -166,19 +197,55 @@ pub fn save_settings(app: AppHandle, settings: Settings) -> AppResult<()> {
     settings.save(&config_dir(&app)?)
 }
 
-#[tauri::command]
-pub fn set_api_key(key: String) -> AppResult<()> {
-    settings::set_api_key(&key)
+/// Persist the non-secret "a key exists" flag so `has_api_key` never has to
+/// open the keychain (each keychain read is a macOS permission prompt for a
+/// binary the system doesn't already trust for that item). Best-effort: the
+/// keychain, not this flag, remains the source of truth.
+fn record_api_key_presence(app: &AppHandle, present: bool) {
+    if let Ok(dir) = config_dir(app) {
+        // Never materialise a settings file from defaults just to store this
+        // flag: on a corrupt/missing file `Settings::load` returns defaults, and
+        // writing those back would overwrite the user's real configuration.
+        if !dir.join("settings.json").exists() {
+            return;
+        }
+        let mut settings = Settings::load(&dir);
+        if settings.api_key_present != Some(present) {
+            settings.api_key_present = Some(present);
+            let _ = settings.save(&dir);
+        }
+    }
 }
 
 #[tauri::command]
-pub fn has_api_key() -> bool {
-    matches!(settings::get_api_key(), Ok(Some(_)))
+pub fn set_api_key(app: AppHandle, key: String) -> AppResult<()> {
+    settings::set_api_key(&key)?;
+    // An empty value deletes the entry (see settings::set_api_key).
+    record_api_key_presence(&app, !key.trim().is_empty());
+    Ok(())
+}
+
+/// Does the user have an API key configured? Answered from the saved existence
+/// flag, so launching the app does NOT open the keychain. Only a settings file
+/// predating the flag (`None`) falls back to a single real read, whose answer is
+/// then persisted — so an upgrading user is asked at most once.
+#[tauri::command]
+pub fn has_api_key(app: AppHandle) -> bool {
+    if let Ok(dir) = config_dir(&app) {
+        if let Some(present) = Settings::load(&dir).api_key_present {
+            return present;
+        }
+    }
+    let present = matches!(settings::get_api_key(), Ok(Some(_)));
+    record_api_key_presence(&app, present);
+    present
 }
 
 #[tauri::command]
-pub fn delete_api_key() -> AppResult<()> {
-    settings::delete_api_key()
+pub fn delete_api_key(app: AppHandle) -> AppResult<()> {
+    settings::delete_api_key()?;
+    record_api_key_presence(&app, false);
+    Ok(())
 }
 
 /// "Zero external transmission" visibility (開発.txt Stage 2, item 2-2):
@@ -326,6 +393,16 @@ pub async fn ai_draft_stream(
 pub async fn ai_generate_image(app: AppHandle, prompt: String) -> AppResult<String> {
     let config = load_image_llm_config(&app)?;
     ai::generate_image(&config, &prompt).await
+}
+
+/// Read a local image file (chosen via the file-picker dialog — the webview
+/// never reads disk directly) and return it as an inline data URL, so the
+/// frontend can insert the user's own picture as an image chunk (v1 "No.1"
+/// priority feature — previously image chunks could only come from AI
+/// generation). Extension allowlist + size cap enforced in `imageio`.
+#[tauri::command]
+pub fn read_local_image(path: String) -> AppResult<String> {
+    imageio::read_local_image_file(&path)
 }
 
 #[tauri::command]
@@ -528,6 +605,42 @@ pub fn rag_search(app: AppHandle, query: String, top_k: usize) -> AppResult<Vec<
     }
     let mut index = rag::Index::open(&dir)?;
     Ok(index.search(&query, top_k)?.into_iter().map(RagSearchHit::from).collect())
+}
+
+/// Auto-accumulation of confirmed content (開発.txt Stage 3, item 3-1;
+/// Q11/Q16): called by `fileActions.ts` right after a successful save, with
+/// exactly the `(chunkId, content)` pairs for chunks the user has marked
+/// `metadata.confirmed == true` AND whose content is non-empty (the frontend
+/// filters both — this command does no confirmed/empty filtering of its own,
+/// mirroring how `rag_add_source` trusts its caller for which path to index).
+/// Silently does nothing (`Ok(0)`, no directory/model touched) when the
+/// setting is off, so a save on a document with confirmed chunks costs
+/// nothing extra unless the user opted in — matching every other command in
+/// this section's zero-cost-while-disabled guard. Each chunk is (re-)indexed
+/// under the stable synthetic path `"{doc_path}#{chunkId}"`
+/// (`rag::confirmed_chunk_source_path`), so re-saving the SAME chunk replaces
+/// its passages rather than accumulating duplicates (`Index::add_source`'s
+/// existing replace behavior). Returns the total passage count (re-)indexed.
+#[tauri::command]
+pub fn rag_sync_confirmed_chunks(
+    app: AppHandle,
+    doc_path: String,
+    chunks: Vec<(String, String)>,
+) -> AppResult<usize> {
+    let dir = config_dir(&app)?;
+    let settings = Settings::load(&dir);
+    if !settings.personal_rag_enabled {
+        return Ok(0);
+    }
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    let pairs: Vec<(String, String)> = chunks
+        .into_iter()
+        .map(|(chunk_id, text)| (rag::confirmed_chunk_source_path(&doc_path, &chunk_id), text))
+        .collect();
+    let mut index = rag::Index::open(&dir)?;
+    index.add_confirmed_chunks(&pairs)
 }
 
 // ----- Citation management (開発.txt Stage 3, item 3-2) ---------------------

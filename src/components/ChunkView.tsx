@@ -20,7 +20,9 @@ import {
 } from "../aiActions";
 import { caretVerticalEdge } from "../caret";
 import { changed, wordDiff } from "../diff";
+import { pickAndInsertLocalImage } from "../fileActions";
 import { editorBodyFontStyle } from "../fonts";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import ChunkAiMenu from "./ChunkAiMenu";
 import MermaidChunk from "./MermaidChunk";
@@ -34,6 +36,7 @@ import {
   FlowIcon,
   HistoryIcon,
   ImageIcon,
+  ImportIcon,
   PlusIcon,
   RegenerateIcon,
   SpeakerIcon,
@@ -76,6 +79,7 @@ interface Props {
 }
 
 export default function ChunkView({ chunkId, index, total, slideScope }: Props) {
+  const t = useT();
   const chunk = useStore((s) => s.doc.chunks.find((c) => c.id === chunkId));
   const busy = useStore((s) => !!s.busyChunks[chunkId]);
   const isFocused = useStore((s) => s.focusedChunkId === chunkId);
@@ -95,6 +99,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const setChunkType = useStore((s) => s.setChunkType);
   const setHeadingLevel = useStore((s) => s.setHeadingLevel);
   const setChunkSubtitle = useStore((s) => s.setChunkSubtitle);
+  const setChunkConfirmed = useStore((s) => s.setChunkConfirmed);
   const convertToHeading = useStore((s) => s.convertToHeading);
   const isSelected = useStore((s) => s.selectedChunkIds.includes(chunkId));
   const toggleSelectChunk = useStore((s) => s.toggleSelectChunk);
@@ -223,6 +228,11 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const isText = type === "text";
   const isHeading = type === "heading";
   const isImage = type === "image";
+  // A locally-inserted image (file picker / drag-drop / paste) has no
+  // generation prompt, so "Regenerate" (which re-runs the AI image prompt)
+  // doesn't apply to it — only to an AI-generated image (the default for
+  // pre-v1.3 documents predating this distinction; see models.rs normalize()).
+  const isLocalImage = isImage && chunk.metadata.imageSource === "local";
   const isSubtitle = isText && !!chunk.metadata.subtitle; // Req 3
   // A subtitle renders larger and lighter than a body paragraph. Body prose
   // follows the user's editor font settings (提案5 — family/size as inline
@@ -422,13 +432,26 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           {chunk.content ? (
             <img
               src={chunk.content}
-              alt={chunk.metadata.summary || "Generated image"}
+              alt={chunk.metadata.summary || (isLocalImage ? t("Inserted image") : t("Generated image"))}
               className="max-h-[28rem] max-w-full rounded-lg border border-gray-200"
             />
           ) : (
             <div className="rounded-lg border border-dashed border-gray-300 p-6 text-center text-sm text-ink-faint">
               (empty image)
             </div>
+          )}
+          {chunk.content && (
+            <Tooltip
+              label={
+                isLocalImage
+                  ? "Your figure — inserted from a file on your computer"
+                  : "AI-generated image"
+              }
+            >
+              <span className="mt-1 inline-block rounded-full border border-gray-200 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink-faint">
+                {isLocalImage ? t("Your figure") : t("AI-generated")}
+              </span>
+            </Tooltip>
           )}
           {chunk.metadata.summary && (
             <div className="mt-1 text-xs italic text-ink-faint">
@@ -437,7 +460,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           )}
           {imageVersions.length > 1 && (
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              <span className="text-xs text-ink-faint">Versions:</span>
+              <span className="text-xs text-ink-faint">{t("Versions:")}</span>
               {imageVersions.map((v, i) => (
                 <Tooltip
                   key={v}
@@ -477,7 +500,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
               ref={textRef}
               value={chunk.content}
               spellCheck
-              placeholder={`Heading ${headingLevel}`}
+              placeholder={`${t("Heading")} ${headingLevel}`}
               onFocus={() => setFocused(chunkId)}
               onChange={(e) => updateChunkContent(chunkId, e.target.value)}
               onKeyDown={onKeyDown}
@@ -518,9 +541,9 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
               spellCheck
               placeholder={
                 isSubtitle
-                  ? "Subtitle"
+                  ? t("Subtitle")
                   : index === 0
-                    ? "Start writing your first paragraph…"
+                    ? t("Start writing your first paragraph…")
                     : "…"
               }
               onFocus={() => setFocused(chunkId)}
@@ -559,7 +582,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
         <button
           onClick={() => cancelChunkAction(chunkId)}
           className="mt-1 flex items-center gap-1 text-xs text-ink-faint hover:text-red-500"
-          title="Stop this AI action (the result will be discarded)"
+          title={t("Stop this AI action (the result will be discarded)")}
         >
           <StopIcon className="h-3 w-3" /> Stop
         </button>
@@ -581,7 +604,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           <div className="mt-1.5 rounded-md border border-gray-200 bg-gray-50/80 p-2">
             <div className="mb-1 flex items-center justify-between">
               <span className="text-xs font-medium text-ink-soft">
-                {showDiff && hasTextDiff ? "What changed (vs previous)" : "Version history"}
+                {showDiff && hasTextDiff ? t("What changed (vs previous)") : t("Version history")}
               </span>
               <div className="flex items-center gap-2">
                 {prevVersion && (
@@ -593,12 +616,12 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
                       dismissAiEdit();
                     }}
                   >
-                    Revert
+                    {t("Revert")}
                   </button>
                 )}
                 <button
                   className="text-ink-faint hover:text-ink"
-                  aria-label="Dismiss"
+                  aria-label={t("Dismiss")}
                   onClick={() => {
                     setShowDiff(false);
                     setShowHistory(false);
@@ -628,7 +651,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             ) : (
               <div className="space-y-1">
                 {history.length === 0 && (
-                  <div className="px-2 py-1 text-xs text-ink-faint">No earlier versions.</div>
+                  <div className="px-2 py-1 text-xs text-ink-faint">{t("No earlier versions.")}</div>
                 )}
                 {[...history].reverse().map((v, i) => (
                   <button
@@ -651,9 +674,10 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
         className="absolute -right-11 top-0 flex flex-col gap-0.5 opacity-0 pointer-events-none transition-opacity focus-within:opacity-100 data-[on=true]:opacity-100 data-[on=true]:pointer-events-auto"
         data-on={isFocused || isSelected}
       >
-        <Tooltip label={isSelected ? "Deselect paragraph" : "Select for batch edit / image generation"}>
+        <Tooltip label={isSelected ? t("Deselect paragraph") : t("Select for batch edit / image generation")}>
           <button
             className={`${gutterBtn} ${isSelected ? "text-accent" : ""}`}
+            aria-label={isSelected ? t("Deselect paragraph") : t("Select for batch edit / image generation")}
             aria-pressed={isSelected}
             onClick={() => toggleSelectChunk(chunkId)}
           >
@@ -661,9 +685,10 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           </button>
         </Tooltip>
         {(isText || isHeading) && (
-          <Tooltip label={speaking ? "Stop reading" : "Read this paragraph aloud"}>
+          <Tooltip label={speaking ? t("Stop reading") : t("Read this paragraph aloud")}>
             <button
               className={`${gutterBtn} hover:text-accent ${speaking ? "text-accent" : ""}`}
+              aria-label={speaking ? t("Stop reading") : t("Read this paragraph aloud")}
               onClick={() => {
                 if (speaking) void stopSpeaking();
                 else void speakChunk(chunkId);
@@ -677,6 +702,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           <Tooltip label="Generate an image from this paragraph">
             <button
               className={`${gutterBtn} hover:text-accent`}
+              aria-label={t("Generate an image from this paragraph")}
               disabled={busy}
               onClick={() => void generateImageFromChunk(chunkId)}
             >
@@ -684,10 +710,21 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             </button>
           </Tooltip>
         )}
-        {isImage && (
+        <Tooltip label="Insert an image from a file on your computer">
+          <button
+            className={`${gutterBtn} hover:text-accent`}
+            aria-label={t("Insert an image from a file on your computer")}
+            disabled={busy}
+            onClick={() => void pickAndInsertLocalImage(chunkId)}
+          >
+            <ImportIcon />
+          </button>
+        </Tooltip>
+        {isImage && !isLocalImage && (
           <Tooltip label="Regenerate this image (keeps previous versions)">
             <button
               className={`${gutterBtn} hover:text-accent`}
+              aria-label={t("Regenerate this image (keeps previous versions)")}
               disabled={busy}
               onClick={() => void regenerateImageChunk(chunkId)}
             >
@@ -699,6 +736,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           <Tooltip label="Version history (swap to an earlier version)">
             <button
               className={`${gutterBtn} ${showHistory ? "text-accent" : ""}`}
+              aria-label={t("Version history (swap to an earlier version)")}
               onClick={() => {
                 setShowHistory((v) => !v);
                 setShowDiff(false);
@@ -719,6 +757,11 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             className={`${gutterBtn} relative hover:text-accent ${
               unresolvedComments ? "text-accent" : ""
             }`}
+            aria-label={
+              unresolvedComments
+                ? `Review comments (${unresolvedComments} open)`
+                : "Add a review comment"
+            }
             onClick={() => {
               setReviewTarget(chunkId);
               toggleReviewPanel(true);
@@ -734,13 +777,18 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           </button>
         </Tooltip>
         <Tooltip label="Add a paragraph below">
-          <button className={gutterBtn} onClick={() => addChunkAfter(chunkId, "text")}>
+          <button
+            className={gutterBtn}
+            aria-label={t("Add a paragraph below")}
+            onClick={() => addChunkAfter(chunkId, "text")}
+          >
             <PlusIcon />
           </button>
         </Tooltip>
         <Tooltip label="Move up">
           <button
             className={gutterBtn}
+            aria-label={t("Move up")}
             // B2: in a slide, the move range is the slide itself (not the whole
             // document), so a reorder can't reach into the neighbouring slide.
             disabled={slideScope ? !slideScope.canMoveUp : index === 0}
@@ -752,6 +800,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
         <Tooltip label="Move down">
           <button
             className={gutterBtn}
+            aria-label={t("Move down")}
             disabled={slideScope ? !slideScope.canMoveDown : index === total - 1}
             onClick={() => (slideScope ? slideScope.moveDown() : moveChunk(chunkId, 1))}
           >
@@ -759,9 +808,10 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           </button>
         </Tooltip>
         {isText && (
-          <Tooltip label={chunk.metadata.subtitle ? "Unmark as subtitle" : "Mark as subtitle"}>
+          <Tooltip label={chunk.metadata.subtitle ? t("Unmark as subtitle") : t("Mark as subtitle")}>
             <button
               className={`${gutterBtn} ${chunk.metadata.subtitle ? "text-accent" : ""}`}
+              aria-label={chunk.metadata.subtitle ? t("Unmark as subtitle") : t("Mark as subtitle")}
               aria-pressed={!!chunk.metadata.subtitle}
               onClick={() => setChunkSubtitle(chunkId, !chunk.metadata.subtitle)}
             >
@@ -769,10 +819,27 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             </button>
           </Tooltip>
         )}
+        {isText && (
+          // Personal RAG (開発.txt Stage 3, item 3-1) auto-accumulation
+          // (Q11/Q16): mark this paragraph as vetted enough to feed into the
+          // user's own personal library — synced into the index on the next
+          // save, only when Settings' "Personal knowledge base" is on.
+          <Tooltip label={chunk.metadata.confirmed ? t("Confirmed — click to unmark") : t("Mark as confirmed")}>
+            <button
+              className={`${gutterBtn} ${chunk.metadata.confirmed ? "text-accent" : ""}`}
+              aria-label={chunk.metadata.confirmed ? t("Confirmed — click to unmark") : t("Mark as confirmed")}
+              aria-pressed={!!chunk.metadata.confirmed}
+              onClick={() => setChunkConfirmed(chunkId, !chunk.metadata.confirmed)}
+            >
+              <CheckSquareIcon className={chunk.metadata.confirmed ? "" : "opacity-40"} />
+            </button>
+          </Tooltip>
+        )}
         {!isImage && !slideScope && (
-          <Tooltip label={isText ? "Convert to diagram" : "Convert to text"}>
+          <Tooltip label={isText ? t("Convert to diagram") : t("Convert to text")}>
             <button
               className={gutterBtn}
+              aria-label={isText ? t("Convert to diagram") : t("Convert to text")}
               onClick={() => setChunkType(chunkId, isText ? "diagram" : "text")}
             >
               <FlowIcon />
@@ -782,6 +849,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
         <Tooltip label="Delete this paragraph">
           <button
             className={`${gutterBtn} hover:text-red-500`}
+            aria-label={t("Delete this paragraph")}
             onClick={() => deleteChunk(chunkId)}
           >
             <TrashIcon />

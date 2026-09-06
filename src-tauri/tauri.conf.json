@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "NurumayuFacet",
+  "productName": "NurumayuEditor",
   "version": "1.3.0",
   "identifier": "com.aix.texteditor",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "NurumayuFacet",
+        "title": "NurumayuEditor",
         "width": 1280,
         "height": 860,
         "minWidth": 800,
@@ -30,8 +30,8 @@
     "category": "Productivity",
     "copyright": "Copyright (c) 2026 Satoshi Kume. Released under the Artistic License 2.0.",
     "licenseFile": "../LICENSE",
-    "shortDescription": "LLM-augmented chunk-based editor for papers and reports.",
-    "longDescription": "NurumayuFacet is a writing app where every document is already a slide deck: it manages documents as paragraph chunks and provides context-aware AI assistance (translate, proofread, diagram generation, and relationship analysis) via OpenRouter.",
+    "shortDescription": "Local-first Markdown, document, and slide editor with AI assistance.",
+    "longDescription": "NurumayuEditor edits and previews Markdown while retaining its paragraph-based writing, slide, and context-aware AI workflows.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -2,14 +2,14 @@
 
 <br/>
 
-<img src="src-tauri/icons/128x128@2x.png" alt="NurumayuFacet icon" width="160" />
+<img src="src-tauri/icons/128x128@2x.png" alt="NurumayuEditor icon" width="160" />
 
 <br/>
 
-# NurumayuFacet
+# NurumayuEditor
 
 <h3>
-  <em>Write it. Present it. One file.</em>
+  <em>Write it. Share it this week. One file.</em>
 </h3>
 
 <br/>
@@ -32,7 +32,7 @@
 
 ---
 
-<h2>Every document is already a slide deck.</h2>
+<h2>Write Markdown. Preview it. Present it.</h2>
 
 <em>One source. Two facets — the page and the stage.</em>
 
@@ -54,8 +54,8 @@
 <p>Per-paragraph AI with full-document<br/>context — <strong>translate, proofread, expand, draft</strong>.</p>
 </td>
 <td align="center" width="33%">
-<h3>🔗 Relationship graph</h3>
-<p>Map the logic between paragraphs and<br/><strong>catch unsupported claims</strong> before you present.</p>
+<h3>📚 Grounded in your own library</h3>
+<p>Drop in your own figures, and let AI<br/>draw on your <strong>accumulating personal library</strong> of confirmed notes and papers.</p>
 </td>
 </tr>
 </table>
@@ -63,15 +63,15 @@
 
 <br/>
 
-> ### ✨ What is NurumayuFacet?
+> ### ✨ What is NurumayuEditor?
 >
-> **NurumayuFacet is a writing app where every document is already a slide deck.**
+> **NurumayuEditor is a local-first Markdown, document, and slide editor.**
 >
 > Every paragraph lives as an independent **chunk** — think Jupyter Notebook cells, but for writing. One ordered list of chunks is projected two ways: as a **document** you edit, and as a **slide deck** you present. Change the writing, and the slides follow — same file, no export step, no second tool.
 >
-> Each chunk is also a self-contained unit for AI: **translate · proofread · summarize · expand · generate diagrams · generate images · analyze relationships** — all with full awareness of the surrounding context.
+> Each chunk is also a self-contained unit for AI: **translate · proofread · summarize · expand · generate diagrams · generate images** — grounded in your own inserted figures and your growing personal library of confirmed notes and papers, all with full awareness of the surrounding context.
 >
-> _Write papers, reports, talks, decks — **one document, every way it needs to be seen.**_
+> _A scratchpad for rough weekly progress — not a finishing tool. Polish and formal presentation still happen in your usual external apps._
 
 <br/>
 
@@ -80,10 +80,10 @@
 ### 1. The writing canvas
 
 <div align="center">
-  <img src="docs/01.png" alt="NurumayuFacet main window — a clean, distraction-free writing canvas with a minimal toolbar" width="560" />
+  <img src="docs/01.png" alt="NurumayuEditor main window — a clean, distraction-free writing canvas with a minimal toolbar" width="560" />
 </div>
 
-> **A distraction-free, chunk-based canvas.** Every document is an ordered list of _chunks_ — paragraphs, headings, diagrams, images. The toolbar keeps the essentials one click away (**Open / Save**, **Import / Export**, **Undo / Redo**, **Draft by AI**, **Analyze**, **Editor / Slides**, **Help**) while the page itself stays quiet so you can focus on writing.
+> **A distraction-free writing canvas.** Use the paragraph editor for focused writing, the Markdown workspace for exact source plus live GFM preview, and Slides for presenting the same content. The toolbar keeps the essentials one click away (**Open / Save**, **Import / Export**, **Undo / Redo**, **Draft by AI**, **Review**, **Editor / Markdown / Slides**, **Help**).
 
 **Quick start**
 
@@ -133,6 +133,7 @@
 
 | Area | What it does |
 | --- | --- |
+| **Markdown edit + preview** | Open `.md`/`.markdown` files directly, edit their exact source in CodeMirror, and switch between **Edit**, **Preview**, or side-by-side **Split**. GFM tables, task lists, links, code blocks, images, and Mermaid fences render in the preview. `⌘/Ctrl+S` writes back to the opened Markdown file without reformatting its source. |
 | **Document ⟷ Slides** | One document, two faces. The same chunks render as an editable **document** and as a **slide deck** — flip with the toolbar toggle; switching preserves your place and loses nothing. Slides are a projection of the writing, not a separate file. |
 | **Multiple tabs** | Open and edit several documents at once. New tab via the tab-bar **＋** or `⌘/Ctrl+T`; each tab keeps its own document, file path, undo/redo history and analysis. |
 | **Chunk editing** | Document = an ordered list of chunks. Split (`⌘/Ctrl+Shift+Enter`), merge (Backspace at start, or select 2+ adjacent paragraphs → **Merge**), reorder (↑/↓), add/delete, and move between chunks with the Up/Down arrows. |
@@ -142,12 +143,14 @@
 | **Draft (streaming)** | Generate a full structured first draft from a theme; it **streams into a new tab in real time**, split into heading + paragraph chunks. |
 | **Diagrams** | The model emits **Mermaid** code, rendered inline as SVG; diagram chunks keep an editable code area. |
 | **Image generation** | Generate an image from a single paragraph (right-gutter button), or select multiple paragraphs (checkbox → floating **Generate image**) to combine them. Images are inserted as **image chunks** and can be reordered. Uses a separate image model (see Settings). |
-| **Relationship graph** | **Analyze** builds a two-level network — **paragraph** nodes plus per-**sentence** nodes — with typed relations (cause, evidence, elaboration, contrast, …), drawn with **Cytoscape** (sentences nested under their paragraph). Click a node to jump to its paragraph; click an edge to flash both endpoints. Relations are color-coded with a legend, and the panel shows when the analysis ran. The graph is saved inside the `.aix` file. |
-| **Import / Export** | One **Import / Export** menu: import `.txt`/`.md`/`.rtf`; export `.txt`, `.md`, `.rtf` (with embedded images & diagram snapshots), `.pdf`, `.pptx`. Native **`.aix`** format (Save/Open) preserves the full document — chunks, metadata, comments and the analysis graph — written atomically. |
+| **Your own figures** | Insert your own images — file picker (command palette → *Insert image from file…*), drag-and-drop onto the editor, or paste from the clipboard. They land as ordinary **image chunks**, reorderable alongside AI-generated ones, with no round-trip through a model. |
+| **Personal library (RAG)** | An on-device, growing corpus of your own confirmed notes and papers. Mark a chunk **confirmed** to make it eligible; embeddings and search run **entirely locally** (no network call beyond a one-time model download). AI actions ground their answer in the top matches from your library, and the sources used are surfaced back to you — open it from the command palette (*Open personal library (RAG)*). |
+| **Relationship graph** _(optional)_ | **Analyze** builds a two-level network — **paragraph** nodes plus per-**sentence** nodes — with typed relations (cause, evidence, elaboration, contrast, …), drawn with **Cytoscape** (sentences nested under their paragraph). Click a node to jump to its paragraph; click an edge to flash both endpoints. Relations are color-coded with a legend, and the panel shows when the analysis ran. The graph is saved inside the `.aix` file. An occasional-use tool, not part of the core weekly loop — reachable from the command palette or the toolbar's quiet secondary cluster. |
+| **Open / Import / Export** | Open and save `.md`/`.markdown` directly, or use the native `.aix` format to preserve chunks, metadata, comments, and analysis. Import `.txt`/`.md`/`.rtf`; export `.txt`, `.md`, `.rtf`, `.pdf`, and `.pptx`. All disk I/O and atomic writes stay in Rust. |
 | **Native menu** | The macOS/Windows menu bar (File / Edit / AI / Window) mirrors the in-app toolbar; its custom items drive the same actions. |
 | **Security** | The API key is stored in the **OS keychain** (macOS Keychain / Windows Credential Manager / Linux Secret Service) — never written to disk in plaintext, never sent to the frontend. All network calls happen in Rust. |
 | **Resilience** | Free models are rate-limited; API calls retry on HTTP 429 / transient 5xx with exponential backoff, and surface actionable errors. |
-| **Review comments** | Per-paragraph comments in a right-docked panel (add/edit/resolve/delete, persisted in `.aix`). **AI review** writes targeted comments; **Check integrity** uses the relationship graph to flag unsupported claims and contradictions. |
+| **Review comments** | Per-paragraph comments in a right-docked panel (add/edit/resolve/delete, persisted in `.aix`). **AI review** writes targeted comments; **Map logic** _(optional)_ uses the relationship graph to surface the model's opinion on possibly-unsupported claims and contradictions — not a verified audit. |
 | **Read aloud** | Read one paragraph, a selection, or the whole document from the cursor (toolbar **Read/Stop**); the voice follows your default output language. macOS `say`-based. |
 | **Command palette** | `⌘/Ctrl+K` — search and run every major action (export, analyze, review, read aloud, tabs, settings…). |
 | **Health bar** | A persistent status strip: save state, word count, AI freshness, stale-summary count, and the last export's warnings (kept reviewable, not just a toast). |
@@ -180,7 +183,7 @@ Open with the gear icon or `⌘/Ctrl+,`:
 | `⌘/Ctrl + Shift + Enter` | Split paragraph at the caret |
 | `Backspace` (at start) | Merge with previous paragraph (empty heading → text) |
 | `⌘/Ctrl + T` | New tab |
-| `⌘/Ctrl + S` / `O` | Save / Open `.aix` document |
+| `⌘/Ctrl + S` / `O` | Save / Open `.aix` or Markdown document |
 | `⌘/Ctrl + Z` / `Shift+Z` | Undo / Redo |
 | `⌘/Ctrl + ,` | Settings |
 | `⌘/Ctrl + K` | Command palette |
@@ -189,7 +192,7 @@ Open with the gear icon or `⌘/Ctrl+,`:
 
 ### 🔀 High-level data flow
 
-NurumayuFacet is deliberately split into a **stateful authoring workbench** in
+NurumayuEditor is deliberately split into a **stateful authoring workbench** in
 React and a **capability boundary** in Rust. The frontend decides _what the user is
 doing_; the backend owns everything that touches the outside world — files, the
 network, the OS keychain, native menus and speech.
@@ -361,26 +364,26 @@ brew install kumeS/tap/nurumayufacet
 > `kumeS/homebrew-tap` repo containing the formula, `brew install
 > kumeS/tap/nurumayufacet` works on its own, with no `brew tap` step.)
 
-This **builds NurumayuFacet from source on your Mac**, so there is no notarization
+This **builds NurumayuEditor from source on your Mac**, so there is no notarization
 / *"app is damaged"* Gatekeeper prompt, and the binary matches your own CPU (Apple
 Silicon or Intel). Homebrew installs Node and Rust automatically (Xcode Command
 Line Tools required); the first build takes a few minutes.
 
-Launch it from Spotlight as **NurumayuFacet**, or:
+Launch it from Spotlight as **NurumayuEditor**, or:
 
 ```bash
-nurumayufacet                                            # CLI launcher
+nurumayueditor                                           # CLI launcher
 # …or add it to /Applications:
-ln -sfn "$(brew --prefix)/opt/nurumayufacet/NurumayuFacet.app" /Applications/
+ln -sfn "$(brew --prefix)/opt/nurumayufacet/NurumayuEditor.app" /Applications/
 ```
 
 The same binary is a headless CLI for agents and scripts:
 
 ```bash
-nurumayufacet capabilities                 # machine-readable self-description (JSON)
-nurumayufacet info document.aix [--json]   # structure; --json includes full chunk content
-nurumayufacet show document.aix <chunkId>  # one chunk's raw content (diagram source, text…)
-nurumayufacet export document.aix out.pdf  # txt / md / rtf / pdf / pptx
+nurumayueditor capabilities                 # machine-readable self-description (JSON)
+nurumayueditor info document.aix [--json]   # structure; --json includes full chunk content
+nurumayueditor show document.aix <chunkId>  # one chunk's raw content (diagram source, text…)
+nurumayueditor export document.aix out.pdf  # txt / md / rtf / pdf / pptx
 ```
 
 On first run, open **Settings** (gear icon, or `⌘/Ctrl+,`) and paste your
@@ -394,7 +397,7 @@ disk in plaintext.
 > Homebrew **cask** [`Casks/nurumayufacet.rb`](Casks/nurumayufacet.rb)). That
 > build is *not notarized*, so macOS quarantines it on download — after installing,
 > clear the flag once with
-> `xattr -dr com.apple.quarantine "/Applications/NurumayuFacet.app"`. The
+> `xattr -dr com.apple.quarantine "/Applications/NurumayuEditor.app"`. The
 > source build above avoids this entirely.
 
 ### Building from source manually (optional)
@@ -413,8 +416,10 @@ npm run tauri build    # → .app / .dmg under src-tauri/target/release/bundle/
 - `.rtf` conversion is pragmatic (text + paragraph structure), not full
   rich-text fidelity. `\'hh` byte escapes are decoded through Windows-1252, so
   smart quotes / dashes / bullets from Word-exported `.rtf` survive import.
-- **The document round-trips losslessly only in the native `.aix` format.**
-  Plain-text exports (`.txt`/`.md`/`.rtf`) are inherently flat: a blank line
+- **Markdown source opened in the Markdown workspace is kept verbatim** and
+  saves back without syntax rewriting. The native `.aix` format remains the
+  lossless format for chunk-only metadata such as comments, slide layouts, and
+  analysis. Other flat conversions (`.txt`/`.rtf`) are inherently lossy: a blank line
   inside one paragraph chunk is indistinguishable from a chunk break on
   re-import. `.txt` exports images/diagrams as placeholders by design; `.rtf`
   embeds PNG/JPEG images and diagram snapshots (GIF/BMP stay placeholders);
@@ -430,11 +435,9 @@ npm run tauri build    # → .app / .dmg under src-tauri/target/release/bundle/
 
 ## About the name
 
-**Facet** is the product; **Nurumayu** is the project (studio) it ships under —
-"NurumayuFacet", the way *Cultured Code* ships *Things* or *Tapbots* ships
-*Ivory*. The name is the idea: one document has many **facets** — the page you
-write and the stage you present — and each export (PDF, PPTX, Markdown) is
-another facet of the same source.
+**NurumayuEditor** is the application name. It brings exact-source Markdown
+editing, document-oriented chunk tools, and slide presentation into one local
+workspace.
 
 The native document format keeps the **`.aix`** extension, and the internal
 bundle identifier (`com.aix.texteditor`) is unchanged, so documents and saved

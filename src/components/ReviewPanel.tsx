@@ -2,10 +2,13 @@
 // per-paragraph comments, grouped by chunk in document order. Group headers
 // jump to (and flash) their paragraph; resolved comments collapse into a
 // dimmed section at the bottom. Also hosts the two AI generators — the
-// document reviewer and the relationship-graph integrity lens.
+// document reviewer and "Map logic" (an optional, occasional-use tool that
+// surfaces the model's opinion on possibly-unsupported claims/contradictions
+// via the relationship graph — not a verified audit; see project.md Q8).
 
 import { useState } from "react";
 import { checkIntegrity, reviewDocument } from "../aiActions";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import type { Chunk, ReviewComment } from "../types";
 import { CloseIcon, CommentIcon, PlusIcon, TrashIcon } from "./icons";
@@ -53,6 +56,7 @@ function AuthorChip({ comment }: { comment: ReviewComment }) {
 
 /** One comment row: chip + time + text, with edit / resolve / delete actions. */
 function CommentRow({ chunkId, comment }: { chunkId: string; comment: ReviewComment }) {
+  const t = useT();
   const updateComment = useStore((s) => s.updateComment);
   const deleteComment = useStore((s) => s.deleteComment);
   const toggleCommentResolved = useStore((s) => s.toggleCommentResolved);
@@ -88,14 +92,14 @@ function CommentRow({ chunkId, comment }: { chunkId: string; comment: ReviewComm
                 setEditing((v) => !v);
               }}
             >
-              Edit
+              {t("Edit")}
             </button>
           )}
           <button
             className="text-[11px] text-ink-faint hover:text-ink"
             onClick={() => toggleCommentResolved(chunkId, comment.id)}
           >
-            {comment.resolved ? "Unresolve" : "Resolve"}
+            {comment.resolved ? t("Unresolve") : t("Resolve")}
           </button>
           <Tooltip label="Delete comment">
             <button
@@ -121,13 +125,13 @@ function CommentRow({ chunkId, comment }: { chunkId: string; comment: ReviewComm
               className="text-[11px] text-ink-faint hover:text-ink"
               onClick={() => setEditing(false)}
             >
-              Cancel
+              {t("Cancel")}
             </button>
             <button
               className="text-[11px] font-medium text-accent hover:underline"
               onClick={saveEdit}
             >
-              Save
+              {t("Save")}
             </button>
           </div>
         </div>
@@ -141,6 +145,7 @@ function CommentRow({ chunkId, comment }: { chunkId: string; comment: ReviewComm
 }
 
 export default function ReviewPanel() {
+  const t = useT();
   const chunks = useStore((s) => s.doc.chunks);
   const globalBusy = useStore((s) => s.globalBusy);
   const flashChunk = useStore((s) => s.flashChunk);
@@ -183,29 +188,28 @@ export default function ReviewPanel() {
     <aside className="flex h-full w-80 shrink-0 flex-col border-l border-gray-200 bg-white">
       <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-          <CommentIcon /> Review
-        </div>
+          <CommentIcon />{t("Review")}</div>
         <div className="flex items-center gap-1">
           <button
             onClick={() => void reviewDocument()}
             className="rounded px-2 py-1 text-xs text-ink-soft hover:bg-gray-100 disabled:opacity-40 disabled:hover:bg-transparent"
             disabled={!!globalBusy}
-            title="AI reviews every paragraph and leaves actionable comments"
+            title={t("AI reviews every paragraph and leaves actionable comments")}
           >
-            AI review
+            {t("AI review")}
           </button>
           <button
             onClick={() => void checkIntegrity()}
             className="rounded px-2 py-1 text-xs text-ink-soft hover:bg-gray-100 disabled:opacity-40 disabled:hover:bg-transparent"
             disabled={!!globalBusy}
-            title="Find unsupported claims and contradictions using the relationship graph (run Analyze first)"
+            title="AI's opinion on possibly-unsupported claims and contradictions, using the relationship graph (run Analyze first) — not a verified audit"
           >
-            Check integrity
+            {t("Map logic")}
           </button>
           <button
             onClick={() => toggleReviewPanel(false)}
             className="rounded p-1 text-ink-faint hover:bg-gray-100 hover:text-ink"
-            aria-label="Close panel"
+            aria-label={t("Close panel")}
           >
             <CloseIcon />
           </button>
@@ -220,7 +224,7 @@ export default function ReviewPanel() {
             <button
               className="block w-full truncate text-left text-xs font-medium text-ink hover:text-accent"
               onClick={() => flashChunk(composerChunk.id)}
-              title="Jump to this paragraph"
+              title={t("Jump to this paragraph")}
             >
               {chunkTitle(composerChunk)}
             </button>
@@ -229,7 +233,7 @@ export default function ReviewPanel() {
               onChange={(e) => setComposerText(e.target.value)}
               rows={2}
               autoFocus
-              placeholder="Add a comment…"
+              placeholder={t("Add a comment…")}
               className="mt-1.5 w-full resize-none rounded border border-gray-200 bg-white p-1.5 text-xs text-ink-soft outline-none focus:border-accent"
             />
             <div className="mt-1 flex justify-end gap-2">
@@ -240,23 +244,22 @@ export default function ReviewPanel() {
                   setReviewTarget(null);
                 }}
               >
-                Cancel
+                {t("Cancel")}
               </button>
               <button
                 className="text-[11px] font-medium text-accent hover:underline disabled:opacity-40"
                 disabled={!composerText.trim()}
                 onClick={submitComment}
               >
-                Add comment
+                {t("Add comment")}
               </button>
             </div>
           </div>
         )}
 
         {isEmpty && !composerChunk && (
-          <div className="px-1 py-6 text-center text-xs leading-5 text-ink-faint">
-            No comments yet. Use a paragraph's <CommentIcon className="inline h-3.5 w-3.5" />{" "}
-            button to add one, or run “AI review” / “Check integrity” above.
+          <div className="px-1 py-6 text-center text-xs leading-5 text-ink-faint">{t("No comments yet. Use a paragraph's")}<CommentIcon className="inline h-3.5 w-3.5" />{" "}
+            button to add one, or run “AI review” / “Map logic” above.
           </div>
         )}
 
@@ -266,7 +269,7 @@ export default function ReviewPanel() {
               <button
                 className="min-w-0 flex-1 truncate text-left text-xs font-medium text-ink hover:text-accent"
                 onClick={() => flashChunk(chunk.id)}
-                title="Jump to this paragraph"
+                title={t("Jump to this paragraph")}
               >
                 {chunkTitle(chunk)}
               </button>
@@ -302,7 +305,7 @@ export default function ReviewPanel() {
                     <button
                       className="mb-0.5 block w-full truncate text-left text-[11px] text-ink-faint line-through hover:text-ink"
                       onClick={() => flashChunk(chunk.id)}
-                      title="Jump to this paragraph"
+                      title={t("Jump to this paragraph")}
                     >
                       {chunkTitle(chunk)}
                     </button>
@@ -316,7 +319,7 @@ export default function ReviewPanel() {
       </div>
 
       <div className="border-t border-gray-100 px-3 py-2 text-xs text-ink-faint">
-        Click a paragraph title to jump to it in the editor.
+        {t("Click a paragraph title to jump to it in the editor.")}
       </div>
     </aside>
   );

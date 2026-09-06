@@ -4,11 +4,13 @@
 // read the selection aloud.
 
 import { editSelection, generateImageFromSelection, speakChunks } from "../aiActions";
+import { useT } from "../i18n";
 import { canMergeChunks, useStore } from "../store";
 import { promptDialog } from "./PromptModal";
 import { EditIcon, ImageIcon, MergeIcon, SpeakerIcon, SpinnerIcon } from "./icons";
 
 export default function SelectionBar() {
+  const t = useT();
   const count = useStore((s) => s.selectedChunkIds.length);
   const selectedChunkIds = useStore((s) => s.selectedChunkIds);
   const clearSelection = useStore((s) => s.clearSelection);
@@ -24,10 +26,10 @@ export default function SelectionBar() {
   const onEditAll = async () => {
     const instruction = await promptDialog({
       title: `Edit ${count} paragraphs`,
-      label: "Describe the change to apply to every selected paragraph",
+      label: t("Describe the change to apply to every selected paragraph"),
       placeholder: "e.g. Make each more concise and formal",
       multiline: true,
-      submitLabel: "Apply to all",
+      submitLabel: t("Apply to all"),
     });
     if (instruction && instruction.trim()) void editSelection(instruction);
   };
@@ -55,8 +57,7 @@ export default function SelectionBar() {
         disabled={!!globalBusy}
         className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-ink-soft hover:bg-gray-100 disabled:opacity-50"
       >
-        <EditIcon className="h-4 w-4" /> Edit all
-      </button>
+        <EditIcon className="h-4 w-4" />{t("Edit all")}</button>
       <button
         onClick={onMerge}
         disabled={!!globalBusy || !mergeable}
@@ -67,12 +68,11 @@ export default function SelectionBar() {
         }
         className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-ink-soft hover:bg-gray-100 disabled:opacity-50"
       >
-        <MergeIcon className="h-4 w-4" /> Merge
-      </button>
+        <MergeIcon className="h-4 w-4" />{t("Merge")}</button>
       <button
         onClick={onReadSelection}
         disabled={!!globalBusy}
-        title="Read the selected paragraphs aloud (document order)"
+        title={t("Read the selected paragraphs aloud (document order)")}
         className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-ink-soft hover:bg-gray-100 disabled:opacity-50"
       >
         <SpeakerIcon className="h-4 w-4" /> Read
@@ -87,13 +87,13 @@ export default function SelectionBar() {
         ) : (
           <ImageIcon className="h-4 w-4" />
         )}
-        Generate image
+        {t("Generate image")}
       </button>
       <button
         onClick={clearSelection}
         className="text-sm text-ink-faint hover:text-ink"
       >
-        Clear
+        {t("Clear")}
       </button>
     </div>
   );

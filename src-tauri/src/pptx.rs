@@ -851,7 +851,7 @@ const THEME: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 fn core_xml(title: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>{title}</dc:title><dc:creator>NurumayuFacet</dc:creator><cp:lastModifiedBy>NurumayuFacet</cp:lastModifiedBy></cp:coreProperties>"#,
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>{title}</dc:title><dc:creator>NurumayuEditor</dc:creator><cp:lastModifiedBy>NurumayuEditor</cp:lastModifiedBy></cp:coreProperties>"#,
         title = esc(title)
     )
 }
@@ -859,7 +859,7 @@ fn core_xml(title: &str) -> String {
 fn app_xml(n_slides: usize) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>NurumayuFacet</Application><Slides>{n}</Slides><PresentationFormat>Widescreen</PresentationFormat></Properties>"#,
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>NurumayuEditor</Application><Slides>{n}</Slides><PresentationFormat>Widescreen</PresentationFormat></Properties>"#,
         n = n_slides
     )
 }

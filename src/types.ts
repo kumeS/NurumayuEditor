@@ -21,6 +21,11 @@ export interface ChunkMetadata {
   summary?: string;
   linkedChunks: string[];
   imagePrompt?: string; // image chunks: prompt used, for "regenerate"
+  // image chunks: "ai" (generated) or "local" (inserted from a file the user
+  // picked/dropped/pasted). Mirrors Rust's ChunkMetadata::image_source; older
+  // documents loaded from disk are repaired to "ai" by Document::normalize on
+  // the Rust side before reaching the frontend.
+  imageSource?: "ai" | "local";
   contentHistory?: string[]; // prior content values (text versions / image URLs)
   layout?: SlideLayout; // slide lead chunk: explicit slide-layout override
   subtitle?: boolean; // text chunk flagged as a subtitle (Req 3)
@@ -38,6 +43,14 @@ export interface ChunkMetadata {
   // Speaker notes for the slide this chunk begins (only meaningful on a
   // heading chunk that starts a slide). Mirrors Rust's ChunkMetadata::notes.
   notes?: string;
+  // Personal RAG (開発.txt Stage 3, item 3-1) auto-accumulation (Q11/Q16): the
+  // user has explicitly marked this chunk's content as vetted enough to feed
+  // into their own personal library. On save, every confirmed chunk with
+  // non-empty content is (re-)indexed under a stable per-chunk source path so
+  // edits keep that passage fresh rather than duplicating it (see
+  // fileActions.ts's save flow and Rust `rag_sync_confirmed_chunks`). Mirrors
+  // Rust's ChunkMetadata::confirmed; defaults to false/absent.
+  confirmed?: boolean;
 }
 
 export interface Chunk {
@@ -54,7 +67,7 @@ export interface Chunk {
  * migrates or drops content, it only changes presentation. Older .aix files
  * without the field load as "editor".
  */
-export type DocMode = "editor" | "slide";
+export type DocMode = "editor" | "markdown" | "slide";
 
 export interface Document {
   id: string;
@@ -62,12 +75,30 @@ export interface Document {
   chunks: Chunk[];
   mode?: DocMode; // defaults to "editor" when absent (back-compat)
   analysis?: AnalysisResult; // persisted relationship graph (spec §3.4)
+  /**
+   * Exact Markdown source captured while the Markdown workspace was
+   * authoritative. May linger stale after `mode` changes away from
+   * "markdown" (ordinary chunk edits don't clear it) — every consumer
+   * (`documentToMarkdown`/`document_to_md`) MUST ignore this field unless
+   * `mode === "markdown"`, deriving fresh text from `chunks` otherwise.
+   */
+  markdownSource?: string;
 }
 
 /** Result of opening a `.aix` file: the document plus any repairs made on load (A1). */
 export interface OpenedDocument {
   document: Document;
   notes: string[];
+}
+
+/** One entry in the folder tree sidebar. */
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  /** True for files the app can open (`.aix`/`.md`/`.markdown`). Directories
+   * are never directly "openable" — the tree expands them instead. */
+  isOpenable: boolean;
 }
 
 /** One tab persisted for crash recovery / session restore (A2). */
@@ -159,6 +190,26 @@ export interface Settings {
   // create an index — both happen lazily on the first add-source/search
   // call. Mirrors Rust `Settings.personal_rag_enabled`.
   personalRagEnabled?: boolean;
+  // Blindspot QA v1 (project.md Q13): true once the one-time first-run worked
+  // example (progress note → slides → own-figure) has been shown. The app
+  // checks this on startup; while false/absent it replaces the blank first
+  // document with the worked example, then persists this as true via
+  // api.saveSettings so it only ever shows once. Mirrors Rust
+  // `Settings.has_seen_welcome_example`.
+  hasSeenWelcomeExample?: boolean;
+  // MCP write gate (開発.txt §9 Q12/D6): opt-in to letting a connected MCP
+  // agent insert a small retrieved-reference chunk into one of your own
+  // .aix documents via mcp.rs's `search_and_summarize` tool. Off by default;
+  // every other MCP tool (read-only) is unaffected by this setting. Mirrors
+  // Rust `Settings.mcp_write_enabled`.
+  mcpWriteEnabled?: boolean;
+  /**
+   * Whether an API key exists in the OS keychain — the existence boolean only,
+   * never the key. Cached here so launching the app doesn't open the keychain
+   * (every read is a macOS permission prompt); `undefined` means "never
+   * determined" and triggers one real read on the Rust side.
+   */
+  apiKeyPresent?: boolean;
 }
 
 /** One indexed source file in the personal knowledge base (rag.rs). */
@@ -250,11 +301,11 @@ export interface AiRequest {
   linkedContent?: string;
   // Personal RAG (開発.txt Stage 3, item 3-1): top personal-library matches for
   // this chunk (see `aiActions.ts::gatherRagSnippets`), empty/omitted whenever
-  // the setting is off or nothing is indexed. NOT YET a true Rust mirror: the
-  // backend `AiRequest` (ai.rs) does not read this field yet — an unread extra
-  // JSON key is harmless (serde ignores it) — wiring it into the prompt AND
-  // surfacing which sources were used near the result is the citation-
-  // management follow-up (開発.txt Stage 3, item 3-2's adjacent work).
+  // the setting is off or nothing is indexed. Mirrors Rust `AiRequest.ragSnippets`
+  // (ai.rs), which folds every non-empty snippet into a "[From your personal
+  // library]" prompt section — this is live grounding context, not a dropped
+  // field. Which source(s) were attached is then surfaced to the user near the
+  // result (see aiActions.ts's `notifyRagSources`).
   ragSnippets?: RagSearchHit[];
 }
 

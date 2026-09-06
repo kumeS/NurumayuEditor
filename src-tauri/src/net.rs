@@ -19,7 +19,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const USER_AGENT: &str = "NurumayuFacet/1.3 (+https://github.com/kumeS/NurumayuFacet)";
+const USER_AGENT: &str = "NurumayuEditor/1.3 (+https://github.com/kumeS/NurumayuFacet)";
 const MAX_REDIRECTS: usize = 5;
 
 // ----- "zero external transmission" visibility (開発.txt Stage 2, item 2-2) --

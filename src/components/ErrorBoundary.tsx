@@ -4,6 +4,7 @@
 // "Try again" button.
 
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { tNow } from "../i18n";
 
 interface Props {
   children: ReactNode;
@@ -30,7 +31,7 @@ export default class ErrorBoundary extends Component<Props, State> {
       return (
         <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
           <div className="text-lg font-semibold text-ink">
-            Something went wrong in this view
+            {tNow("Something went wrong in this view")}
           </div>
           <div className="max-w-md break-words text-sm text-ink-faint">
             {error.message || String(error)}
@@ -39,7 +40,7 @@ export default class ErrorBoundary extends Component<Props, State> {
             onClick={() => this.setState({ error: null })}
             className="rounded-md border border-gray-300 px-3 py-1.5 text-sm text-ink-soft hover:bg-gray-100"
           >
-            Try again
+            {tNow("Try again")}
           </button>
         </div>
       );

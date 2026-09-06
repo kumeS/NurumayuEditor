@@ -6,10 +6,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { getMermaid } from "../mermaidRender";
+import { useT } from "../i18n";
 
 let mermaidSeq = 0;
 
 export default function MermaidChunk({ code }: { code: string }) {
+  const t = useT();
   const ref = useRef<HTMLDivElement>(null);
   const idRef = useRef(`mmd-${(mermaidSeq += 1)}`);
   const [error, setError] = useState<string | null>(null);
@@ -44,7 +46,7 @@ export default function MermaidChunk({ code }: { code: string }) {
   if (error) {
     return (
       <div className="my-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-        <div className="mb-1 font-medium">Diagram could not be rendered</div>
+        <div className="mb-1 font-medium">{t("Diagram could not be rendered")}</div>
         <pre className="whitespace-pre-wrap font-mono text-xs">{error}</pre>
       </div>
     );

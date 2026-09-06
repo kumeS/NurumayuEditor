@@ -4,8 +4,8 @@
 fn main() {
     // Headless CLI (Agent Experience): if invoked with a known subcommand, run it
     // and exit instead of launching the GUI. A bare launch (no args) falls through.
-    if let Some(code) = nurumayufacet_lib::cli::try_run() {
+    if let Some(code) = nurumayueditor_lib::cli::try_run() {
         std::process::exit(code);
     }
-    nurumayufacet_lib::run()
+    nurumayueditor_lib::run()
 }

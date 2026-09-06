@@ -4,19 +4,32 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // Tauri IPC — mocked here so this stays a hermetic, fast unit test (no real
 // Tauri runtime exists under vitest's plain Node environment) and so the
 // "zero query attempts when disabled/empty" assertions below can inspect
-// exactly how many times each was called.
+// exactly how many times each was called. `aiProcess` is mocked too, for the
+// Bulletize-vs-runChunkAction "reviewable diff" contract test below.
 const ragListSources = vi.fn();
 const ragSearch = vi.fn();
+const aiProcess = vi.fn();
+const aiProcessStream = vi.fn();
 vi.mock("./api", () => ({
   api: {
     ragListSources: (...args: unknown[]) => ragListSources(...args),
     ragSearch: (...args: unknown[]) => ragSearch(...args),
+    aiProcess: (...args: unknown[]) => aiProcess(...args),
+    aiProcessStream: (...args: unknown[]) => aiProcessStream(...args),
   },
 }));
 
-import { extractJsonObject, gatherRagSnippets, parseBulletLines, parseCriteriaResults } from "./aiActions";
+import {
+  bulletizeChunks,
+  extractJsonObject,
+  gatherRagSnippets,
+  notifyRagSources,
+  parseBulletLines,
+  parseCriteriaResults,
+  runChunkAction,
+} from "./aiActions";
 import { useStore } from "./store";
-import type { Chunk, Document } from "./types";
+import type { Chunk, Document, RagSearchHit } from "./types";
 
 function chunk(id: string, content: string): Chunk {
   return { id, order: 0, content, metadata: { chunkType: "text", linkedChunks: [] } };
@@ -290,5 +303,145 @@ describe("gatherRagSnippets — personal RAG (開発.txt Stage 3, item 3-1) grou
     ragSearch.mockRejectedValue(new Error("index error"));
     const hits = await gatherRagSnippets("c1");
     expect(hits).toEqual([]);
+  });
+
+  // Part A regression guard: the whole point of gatherRagSnippets is that its
+  // result is what `runChunkAction` sends as `AiRequest.ragSnippets` — this
+  // asserts the shape returned here is EXACTLY the `RagSearchHit` shape the
+  // Rust `AiRequest.ragSnippets` (ai.rs) / `context_block` expects (sourcePath
+  // + snippet + distance), so a field rename on either side would fail this
+  // test rather than silently drop the field again like the original bug.
+  it("returns hits shaped exactly like RagSearchHit (sourcePath/snippet/distance) for the request payload", async () => {
+    useStore.setState({ settings: { ...baseSettings, personalRagEnabled: true } });
+    ragListSources.mockResolvedValue([{ path: "/papers/a.md", passageCount: 1 }]);
+    const hit: RagSearchHit = { sourcePath: "/papers/a.md", snippet: "Photosynthesis...", distance: 0.1 };
+    ragSearch.mockResolvedValue([hit]);
+    const hits = await gatherRagSnippets("c1");
+    expect(hits).toEqual([hit]);
+    expect(Object.keys(hits[0]).sort()).toEqual(["distance", "snippet", "sourcePath"]);
+  });
+});
+
+describe("notifyRagSources — Part B: surfacing which sources grounded a result", () => {
+  beforeEach(() => {
+    useStore.setState({ toasts: [] });
+  });
+
+  it("does nothing when no snippets were attached", () => {
+    notifyRagSources([]);
+    expect(useStore.getState().toasts).toEqual([]);
+  });
+
+  it("names the source basename(s) an action was grounded from", () => {
+    notifyRagSources([
+      { sourcePath: "/Users/me/papers/photosynthesis.md", snippet: "x", distance: 0.1 },
+    ]);
+    const toasts = useStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].message).toBe("Grounded from: photosynthesis.md");
+    expect(toasts[0].kind).toBe("info");
+  });
+
+  it("deduplicates multiple passages from the same source into one name", () => {
+    notifyRagSources([
+      { sourcePath: "/papers/a.md", snippet: "one", distance: 0.1 },
+      { sourcePath: "/papers/a.md", snippet: "two", distance: 0.2 },
+    ]);
+    const toasts = useStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].message).toBe("Grounded from: a.md");
+  });
+
+  it("lists multiple distinct sources by basename, in first-seen order", () => {
+    notifyRagSources([
+      { sourcePath: "/papers/a.md", snippet: "one", distance: 0.1 },
+      { sourcePath: "/notes/my-notes.aix", snippet: "two", distance: 0.2 },
+    ]);
+    const toasts = useStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].message).toBe("Grounded from: a.md, my-notes.aix");
+  });
+});
+
+// ---- Bulletize vs. runChunkAction: "reviewable diff" contract (project.md
+// §5.5, item 1) --------------------------------------------------------------
+//
+// ChunkAiMenu.tsx now labels the Rewrite/Language/Translate/Proofread group as
+// "safe to try — shows a reviewable diff (Revert) after" and Bulletize as
+// "restructures immediately" with no such affordance. This test locks in the
+// actual store-level behaviour that claim depends on, so the UI copy can never
+// silently drift out of sync with what the code does:
+//   - runChunkAction's content-replacing actions go through
+//     `replaceChunkContent`, which stamps `contentHistory` (ChunkView's "What
+//     changed" word-diff + Revert reads this) AND sets `lastAiEditChunkId`
+//     (which is what makes ChunkView auto-show that diff).
+//   - bulletizeChunks goes through `replaceChunksWithTexts`, a structural N→M
+//     chunk replacement that does neither: the new chunks have no
+//     `contentHistory` to diff against, and `lastAiEditChunkId` is left
+//     unset — there is no reviewable-diff view for it, only the toast's
+//     "⌘/Ctrl+Z to undo".
+describe("Bulletize vs. runChunkAction — reviewable-diff contract", () => {
+  const settings = {
+    endpoint: "https://openrouter.ai/api/v1/chat/completions",
+    model: "m",
+    models: ["m"],
+    imageModel: "im",
+    imageModels: ["im"],
+    defaultTargetLanguage: "English",
+    writingTone: "",
+    temperature: 0.3,
+  };
+
+  beforeEach(() => {
+    aiProcess.mockReset();
+    aiProcessStream.mockReset();
+    useStore.setState({
+      doc: doc([chunk("c1", "Some long paragraph about photosynthesis.")]),
+      settings,
+      hasApiKey: true,
+      activeTabId: "tab1",
+      past: [],
+      future: [],
+      lastAiEditChunkId: null,
+    });
+  });
+
+  it("runChunkAction (e.g. expand) stamps contentHistory and sets lastAiEditChunkId — the reviewable-diff trigger", async () => {
+    aiProcessStream.mockImplementation(
+      async (_req: unknown, onDelta: (t: string) => void) => {
+        onDelta("Expanded text.");
+        return "Expanded text.";
+      }
+    );
+    await runChunkAction("c1", "expand");
+    const c = useStore.getState().doc.chunks.find((x) => x.id === "c1")!;
+    expect(c.content).toBe("Expanded text.");
+    // The previous content is preserved for the word-diff view…
+    expect(c.metadata.contentHistory).toEqual([
+      "Some long paragraph about photosynthesis.",
+    ]);
+    // …and this chunk is flagged so ChunkView auto-opens that diff.
+    expect(useStore.getState().lastAiEditChunkId).toBe("c1");
+  });
+
+  it("bulletizeChunks replaces the chunk structurally with NO contentHistory and does NOT set lastAiEditChunkId — no reviewable diff exists for it", async () => {
+    aiProcess.mockResolvedValue("- Point one\n- Point two\n- Point three");
+    await bulletizeChunks(["c1"]);
+    const chunks = useStore.getState().doc.chunks;
+    // The original chunk is gone, replaced by one chunk per bullet.
+    expect(chunks.map((c) => c.content)).toEqual([
+      "Point one",
+      "Point two",
+      "Point three",
+    ]);
+    // None of the new chunks carry a content-history to diff against — the
+    // "What changed" word-diff view (ChunkView.tsx) has nothing to render for
+    // any of them, unlike runChunkAction's result above.
+    for (const c of chunks) {
+      expect(c.metadata.contentHistory ?? []).toEqual([]);
+    }
+    // Bulletize never sets lastAiEditChunkId, so no auto-shown diff panel
+    // appears for it — only the toast's "⌘/Ctrl+Z to undo" applies.
+    expect(useStore.getState().lastAiEditChunkId).toBeNull();
   });
 });

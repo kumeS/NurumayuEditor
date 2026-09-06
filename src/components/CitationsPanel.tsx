@@ -32,6 +32,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { create } from "zustand";
 import { api } from "../api";
 import { spliceTextAtCursor } from "../citationInsert";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import type {
   CitationEntry,
@@ -106,6 +107,7 @@ function insertAtCursor(citationText: string): boolean {
 type Tab = "library" | "lookup";
 
 export default function CitationsPanel() {
+  const t = useT();
   const open_ = useCitationsPanelStore((s) => s.open);
   const setOpen = useCitationsPanelStore((s) => s.setOpen);
   const filePath = useStore((s) => s.filePath);
@@ -217,11 +219,11 @@ export default function CitationsPanel() {
       const inserted = insertAtCursor(text);
       if (inserted) {
         if (!citedIds.includes(entry.id)) setCitedIds((ids) => [...ids, entry.id]);
-        useStore.getState().notify("Citation inserted.", "success");
+        useStore.getState().notify(t("Citation inserted."), "success");
       } else {
         useStore
           .getState()
-          .notify("Click into a paragraph first, then insert the citation.", "info");
+          .notify(t("Click into a paragraph first, then insert the citation."), "info");
       }
     } catch (e) {
       setError(message(e));
@@ -280,9 +282,9 @@ export default function CitationsPanel() {
     const text = `References\n\n${bibliography.join("\n\n")}`;
     const inserted = insertAtCursor(text);
     if (inserted) {
-      useStore.getState().notify("Bibliography inserted.", "success");
+      useStore.getState().notify(t("Bibliography inserted."), "success");
     } else {
-      useStore.getState().notify("Click into a paragraph first, then insert the bibliography.", "info");
+      useStore.getState().notify(t("Click into a paragraph first, then insert the bibliography."), "info");
     }
   };
 
@@ -291,13 +293,13 @@ export default function CitationsPanel() {
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <FileIcon className="h-4 w-4" />
-          Citations
+          {t("Citations")}
         </div>
         <button
           onClick={() => setOpen(false)}
           className="text-ink-faint hover:text-ink"
-          aria-label="Close citations panel"
-          title="Close"
+          aria-label={t("Close citations panel")}
+          title={t("Close")}
         >
           <CloseIcon className="h-4 w-4" />
         </button>
@@ -324,17 +326,17 @@ export default function CitationsPanel() {
               onClick={() => setTab("library")}
               className={`px-2 py-1.5 font-medium ${tab === "library" ? "border-b-2 border-accent text-accent" : "text-ink-faint"}`}
             >
-              Library
+              {t("Library")}
             </button>
             <button
               onClick={() => setTab("lookup")}
               className={`px-2 py-1.5 font-medium ${tab === "lookup" ? "border-b-2 border-accent text-accent" : "text-ink-faint"}`}
             >
-              Look up DOI / arXiv
+              {t("Look up DOI / arXiv")}
             </button>
             <div className="ml-auto flex items-center gap-1 pr-1">
               <label className="text-[10px] text-ink-faint" htmlFor="citation-style">
-                Style
+                {t("Style")}
               </label>
               <select
                 id="citation-style"
@@ -366,7 +368,7 @@ export default function CitationsPanel() {
                   className="flex items-center gap-1 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white hover:bg-accent-soft disabled:opacity-50"
                 >
                   {importing ? <SpinnerIcon className="h-3.5 w-3.5" /> : <ImportIcon className="h-3.5 w-3.5" />}
-                  Import citations (.bib)…
+                  {t("Import citations (.bib)…")}
                 </button>
               </div>
 
@@ -382,7 +384,7 @@ export default function CitationsPanel() {
               )}
 
               {loading && (
-                <p className="mt-3 text-center text-xs text-ink-faint">Loading your citation library…</p>
+                <p className="mt-3 text-center text-xs text-ink-faint">{t("Loading your citation library…")}</p>
               )}
 
               {!loading && entries !== null && entries.length === 0 && !error && (
@@ -414,14 +416,14 @@ export default function CitationsPanel() {
                             onClick={() => void insertCitation(e)}
                             className="rounded bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent hover:bg-accent/20"
                           >
-                            Insert citation
+                            {t("Insert citation")}
                           </button>
                           <button
                             onClick={() => void removeEntry(e.id, e.title)}
                             disabled={removingId === e.id}
                             className="text-ink-faint hover:text-red-600 disabled:opacity-50"
                             aria-label={`Remove "${e.title}" from the citation library`}
-                            title="Remove from library"
+                            title={t("Remove from library")}
                           >
                             {removingId === e.id ? (
                               <SpinnerIcon className="h-3.5 w-3.5" />
@@ -460,7 +462,7 @@ export default function CitationsPanel() {
                       onClick={insertBibliography}
                       className="mt-2 w-full rounded bg-accent px-2 py-1.5 text-[11px] font-medium text-white hover:bg-accent-soft"
                     >
-                      Insert references list at cursor
+                      {t("Insert references list at cursor")}
                     </button>
                   </div>
                 )}
@@ -515,14 +517,14 @@ export default function CitationsPanel() {
                     className="mt-2 flex items-center gap-1 rounded-md bg-accent px-2.5 py-1.5 text-[11px] font-medium text-white hover:bg-accent-soft"
                   >
                     <PlusIcon className="h-3.5 w-3.5" />
-                    Add to citation library
+                    {t("Add to citation library")}
                   </button>
                 </div>
               )}
 
               {!lookupResult && !looking && (
                 <p className="mt-3 rounded-md bg-gray-50/60 px-2 py-3 text-center text-xs text-ink-faint">
-                  Enter a DOI or arXiv id above to fetch its metadata.
+                  {t("Enter a DOI or arXiv id above to fetch its metadata.")}
                 </p>
               )}
             </>

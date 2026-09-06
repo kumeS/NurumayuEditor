@@ -12,6 +12,7 @@ import type {
   CitationStyleName,
   Document,
   DraftEvent,
+  DirectoryEntry,
   ExportFormat,
   NetworkStats,
   OpenedDocument,
@@ -38,6 +39,16 @@ export const api = {
 
   openDocumentJson: (path: string) =>
     invoke<OpenedDocument>("open_document_json", { path }),
+
+  /** Rebuild the NATIVE menu bar in the given Settings "Default language" —
+   * the menu is built once at startup, so a language change has to replace it
+   * explicitly or the menu bar would lag a launch behind the rest of the UI. */
+  setMenuLanguage: (language: string) =>
+    invoke<void>("set_menu_language", { language }),
+
+  /** Folder tree sidebar: listing stays in Rust (root-jailed, capped). */
+  listDirectory: (root: string, path: string) =>
+    invoke<DirectoryEntry[]>("list_directory", { root, path }),
 
   getSettings: () => invoke<Settings>("get_settings"),
 
@@ -107,6 +118,11 @@ export const api = {
   aiGenerateImage: (prompt: string) =>
     invoke<string>("ai_generate_image", { prompt }),
 
+  /** Read a local image file (chosen via the file-picker dialog — the webview
+   * never reads disk directly) and return it as an inline `data:` URL, for
+   * inserting the user's own picture as an image chunk. */
+  readLocalImage: (path: string) => invoke<string>("read_local_image", { path }),
+
   aiGenerateDiagram: (text: string, instruction?: string) =>
     invoke<string>("ai_generate_diagram", {
       text,
@@ -142,6 +158,20 @@ export const api = {
    */
   ragSearch: (query: string, topK: number) =>
     invoke<RagSearchHit[]>("rag_search", { query, topK }),
+
+  /**
+   * Auto-accumulation of confirmed content (開発.txt Stage 3, item 3-1;
+   * Q11/Q16): called right after a successful save (see `fileActions.ts`)
+   * with the `[chunkId, text]` pairs for every chunk currently marked
+   * `metadata.confirmed` with non-empty content. A no-op (resolves `0`, no
+   * directory/model touched) when the personal-RAG setting is off — the
+   * caller does not need to check the setting itself first. Each chunk is
+   * (re-)indexed under a stable per-chunk synthetic source path, so re-saving
+   * the same confirmed chunk updates its passages instead of duplicating
+   * them. Returns the total passage count (re-)indexed.
+   */
+  ragSyncConfirmedChunks: (docPath: string, chunks: Array<[string, string]>) =>
+    invoke<number>("rag_sync_confirmed_chunks", { docPath, chunks }),
 
   // ----- Citation management (開発.txt Stage 3, item 3-2) -------------------
   // "Bring your own references and format them" — NOT a literature search

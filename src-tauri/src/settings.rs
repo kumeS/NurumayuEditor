@@ -10,7 +10,7 @@ use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-// Kept as com.aix.texteditor across the NurumayuFacet rebrand on purpose: this
+// Kept as com.aix.texteditor across the NurumayuEditor rebrand on purpose: this
 // keychain service id is invisible to users; changing it (like the matching
 // bundle identifier in tauri.conf.json) would strand every existing user's
 // stored API key. The rebrand is display-only, so internal ids stay put and
@@ -230,6 +230,45 @@ pub struct Settings {
     /// loadable.
     #[serde(default)]
     pub personal_rag_enabled: bool,
+    /// Whether an API key exists in the OS keychain — the EXISTENCE BOOLEAN
+    /// only, never the key (that stays in the keychain, per the secrets rule).
+    ///
+    /// It is cached here because macOS asks the user to authorise each keychain
+    /// read from a binary it doesn't already trust for that item, and the app
+    /// used to read the key on every launch just to render the "key set" dot.
+    /// With this flag the keychain is touched only when an AI action actually
+    /// needs the key. Maintained by `set_api_key`/`delete_api_key`, and
+    /// corrected whenever a real key read disagrees with it.
+    ///
+    /// `None` means "never determined" (a settings file written before this
+    /// field existed) — the caller falls back to a single keychain read and
+    /// then persists the answer, so upgrading users are asked at most once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_present: Option<bool>,
+    /// Blindspot QA v1 (project.md Q13): true once the one-time first-run
+    /// worked example (progress note → slides → own-figure) has been shown.
+    /// The frontend checks this flag on startup; while false it replaces the
+    /// blank first document with the worked example, then persists this as
+    /// true via the existing settings-save command so it only ever shows
+    /// once. `#[serde(default)]` keeps older settings files (without this
+    /// field) loadable — they load as `false`, which is what we want for
+    /// upgrading existing users too (they haven't seen the new example
+    /// either), not a back-compat edge case to special-case away.
+    #[serde(default)]
+    pub has_seen_welcome_example: bool,
+    /// MCP write gate (開発.txt §9 Q12/D6): opt-in to letting a connected MCP
+    /// agent (Claude Desktop, Claude Code, or any other MCP client) insert a
+    /// small retrieved-reference chunk into one of the user's own `.aix`
+    /// documents via `mcp.rs`'s `search_and_summarize` tool. This is the ONLY
+    /// thing this flag gates — every other MCP tool (`list_chunks`,
+    /// `get_chunk`, `get_document`, `analyze`, `export`) stays available
+    /// regardless of this setting, since none of them write to the source
+    /// document. Off by default, like every other opt-in in this struct: a
+    /// disabled flag means the write tool returns a clear gate error and
+    /// makes no document changes at all. `#[serde(default)]` keeps older
+    /// settings files (without this field) loadable — they load as `false`.
+    #[serde(default)]
+    pub mcp_write_enabled: bool,
 }
 
 impl Default for Settings {
@@ -249,6 +288,9 @@ impl Default for Settings {
             limit_completion_to_local_model: false,
             char_limit_warning: None,
             personal_rag_enabled: false,
+            api_key_present: None,
+            has_seen_welcome_example: false,
+            mcp_write_enabled: false,
         }
     }
 }
@@ -328,16 +370,48 @@ fn entry() -> AppResult<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(AppError::from)
 }
 
-pub fn set_api_key(key: &str) -> AppResult<()> {
-    let trimmed = key.trim();
-    if trimmed.is_empty() {
-        return delete_api_key();
+/// Process-lifetime cache of the API key.
+///
+/// macOS asks the user to authorise EVERY keychain read whose code signature it
+/// doesn't already trust for that item, so reading the key on each AI call (the
+/// previous behaviour) turned one grant into a SecurityAgent prompt per action.
+/// The key is already resident in this process's memory for the duration of any
+/// request that uses it, so caching it changes how often the keychain is
+/// touched — not what this process can see. It is never written to disk, logs,
+/// or errors, and never crosses to the frontend (see the keychain rules).
+///
+/// `None`          = not read yet
+/// `Some(None)`    = read, and there is no key stored
+/// `Some(Some(k))` = read, and this is the key
+static API_KEY_CACHE: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+/// Serve the API key from the cache, loading it once via `load` on a miss.
+/// A failed load is NOT cached: a locked keychain or a cancelled prompt must not
+/// pin "no key" for the rest of the session.
+fn cached_api_key<F>(load: F) -> AppResult<Option<String>>
+where
+    F: FnOnce() -> AppResult<Option<String>>,
+{
+    let mut cache = API_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cache.as_ref() {
+        return Ok(hit.clone());
     }
-    entry()?.set_password(trimmed)?;
-    Ok(())
+    let loaded = load()?;
+    *cache = Some(loaded.clone());
+    Ok(loaded)
 }
 
-pub fn get_api_key() -> AppResult<Option<String>> {
+/// Record the key this process just wrote (or deleted), so the next read is
+/// served without a keychain round-trip — and can never serve a stale value.
+fn prime_api_key_cache(value: Option<String>) {
+    *API_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+}
+
+fn invalidate_api_key_cache() {
+    *API_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn read_api_key_from_keychain() -> AppResult<Option<String>> {
     match entry()?.get_password() {
         Ok(p) => Ok(Some(p)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -345,17 +419,178 @@ pub fn get_api_key() -> AppResult<Option<String>> {
     }
 }
 
+pub fn set_api_key(key: &str) -> AppResult<()> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return delete_api_key();
+    }
+    entry()?.set_password(trimmed)?;
+    prime_api_key_cache(Some(trimmed.to_string()));
+    Ok(())
+}
+
+pub fn get_api_key() -> AppResult<Option<String>> {
+    cached_api_key(read_api_key_from_keychain)
+}
+
 pub fn delete_api_key() -> AppResult<()> {
-    match entry()?.delete_credential() {
+    let result = match entry()?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(AppError::Keyring(e.to_string())),
+    };
+    if result.is_ok() {
+        prime_api_key_cache(None);
     }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+
+    #[test]
+    fn api_key_present_flag_round_trips_and_defaults_to_unknown() {
+        let dir = temp_config_dir("apikeyflag");
+        // An older settings file has no idea whether a key exists — that is
+        // "unknown" (None), NOT "no key", so the app can still fall back to one
+        // keychain read instead of wrongly reporting the key as missing.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        assert_eq!(Settings::load(&dir).api_key_present, None);
+
+        let mut s = Settings::load(&dir);
+        s.api_key_present = Some(true);
+        s.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir).api_key_present, Some(true));
+
+        let mut s = Settings::load(&dir);
+        s.api_key_present = Some(false);
+        s.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir).api_key_present, Some(false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_api_key_presence_flag_is_never_the_key_itself() {
+        // Guards the keychain rule: settings.json may record THAT a key exists,
+        // never the key. A regression that stored the secret here would show up
+        // as the value appearing in the saved JSON.
+        let dir = temp_config_dir("apikeyleak");
+        let mut s = Settings::load(&dir);
+        s.api_key_present = Some(true);
+        s.save(&dir).unwrap();
+        let raw = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(raw.contains("\"apiKeyPresent\": true"), "flag missing: {raw}");
+        assert!(!raw.to_lowercase().contains("sk-"), "a key leaked into settings: {raw}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+
+    #[test]
+    fn recording_the_api_key_flag_preserves_every_other_setting() {
+        // The flag is written by loading + re-saving the settings file, so a
+        // regression there would silently reset the user's language, models and
+        // tone — the failure mode this guards.
+        let dir = temp_config_dir("apikeypreserve");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint":"http://localhost:11434/v1/chat/completions","model":"my-model","defaultTargetLanguage":"日本語","writingTone":"formal and professional","temperature":0.7,"editorFontSize":22}"#,
+        )
+        .unwrap();
+
+        let mut settings = Settings::load(&dir);
+        settings.api_key_present = Some(true);
+        settings.save(&dir).unwrap();
+
+        let reloaded = Settings::load(&dir);
+        assert_eq!(reloaded.default_target_language, "日本語");
+        assert_eq!(reloaded.model, "my-model");
+        assert_eq!(reloaded.writing_tone, "formal and professional");
+        assert_eq!(reloaded.endpoint, "http://localhost:11434/v1/chat/completions");
+        assert_eq!(reloaded.editor_font_size, 22);
+        assert_eq!(reloaded.api_key_present, Some(true));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ----- API-key cache (macOS keychain prompt reduction) -----------------
+    // These exercise the caching layer with a stub loader, so they never touch
+    // the real keychain (which would pop a SecurityAgent prompt in CI/dev).
+
+    /// The cache is process-global, so these tests must not interleave.
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn api_key_is_read_from_the_keychain_only_once_per_process() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_api_key_cache();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let load = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("sk-test".to_string()))
+        };
+
+        assert_eq!(cached_api_key(load).unwrap().as_deref(), Some("sk-test"));
+        assert_eq!(cached_api_key(load).unwrap().as_deref(), Some("sk-test"));
+        assert_eq!(cached_api_key(load).unwrap().as_deref(), Some("sk-test"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "every extra keychain read is another macOS permission prompt"
+        );
+        invalidate_api_key_cache();
+    }
+
+    #[test]
+    fn a_missing_key_is_cached_too_so_it_does_not_re_prompt() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_api_key_cache();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let load = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        };
+
+        assert_eq!(cached_api_key(load).unwrap(), None);
+        assert_eq!(cached_api_key(load).unwrap(), None);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        invalidate_api_key_cache();
+    }
+
+    #[test]
+    fn a_load_failure_is_not_cached_so_the_next_call_retries() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_api_key_cache();
+        assert!(cached_api_key(|| Err(AppError::Keyring("locked".into()))).is_err());
+        // A transient keychain failure (locked keychain, cancelled prompt) must
+        // not poison the cache into "no key" for the rest of the session.
+        assert_eq!(
+            cached_api_key(|| Ok(Some("sk-later".to_string())))
+                .unwrap()
+                .as_deref(),
+            Some("sk-later")
+        );
+        invalidate_api_key_cache();
+    }
+
+    #[test]
+    fn priming_serves_a_freshly_set_key_without_touching_the_keychain() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_api_key_cache();
+        prime_api_key_cache(Some("sk-new".to_string()));
+        let hit = cached_api_key(|| panic!("must not read the keychain after a set"));
+        assert_eq!(hit.unwrap().as_deref(), Some("sk-new"));
+
+        prime_api_key_cache(None); // delete_api_key()'s path
+        let hit = cached_api_key(|| panic!("must not read the keychain after a delete"));
+        assert_eq!(hit.unwrap(), None);
+        invalidate_api_key_cache();
+    }
 
     /// Unique per-test temp config dir (std-only; removed by each test).
     fn temp_config_dir(tag: &str) -> PathBuf {
@@ -574,6 +809,73 @@ mod tests {
         // camelCase JSON key per the frontend schema contract.
         let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
         assert!(text.contains("\"personalRagEnabled\": true"), "got: {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn has_seen_welcome_example_round_trips_and_defaults_false() {
+        let dir = temp_config_dir("welcome-example-flag");
+
+        // Back-compat: an old settings file written before this field existed
+        // has no such key at all — it must load as `false` (never having seen
+        // the example), not fail to parse.
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert!(!loaded.has_seen_welcome_example);
+
+        // A fresh Default::default() is also false (example not yet shown).
+        assert!(!Settings::default().has_seen_welcome_example);
+
+        // Explicitly set true (frontend does this right after showing the
+        // one-time example), save, reload — the value round-trips.
+        let mut settings = loaded;
+        settings.has_seen_welcome_example = true;
+        settings.save(&dir).unwrap();
+        let reloaded = Settings::load(&dir);
+        assert!(reloaded.has_seen_welcome_example);
+
+        // camelCase JSON key per the frontend schema contract.
+        let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(
+            text.contains("\"hasSeenWelcomeExample\": true"),
+            "got: {text}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mcp_write_enabled_round_trips_and_defaults_false() {
+        let dir = temp_config_dir("mcp-write-toggle");
+
+        // Back-compat: an old settings file written before this field existed
+        // has no such key at all — it must load as `false`, not fail to parse.
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert!(!loaded.mcp_write_enabled);
+
+        // A fresh Default::default() is also off.
+        assert!(!Settings::default().mcp_write_enabled);
+
+        // Explicitly set true, save, reload — the value round-trips.
+        let mut settings = loaded;
+        settings.mcp_write_enabled = true;
+        settings.save(&dir).unwrap();
+        let reloaded = Settings::load(&dir);
+        assert!(reloaded.mcp_write_enabled);
+
+        // camelCase JSON key per the frontend schema contract.
+        let text = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(text.contains("\"mcpWriteEnabled\": true"), "got: {text}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

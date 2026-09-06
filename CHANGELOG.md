@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### NurumayuEditor + Markdown workspace
+
+- Renamed the application to **NurumayuEditor** across the window, native menu,
+  help, CLI/MCP identity, package metadata, and exported presentation metadata.
+  The stable bundle id, keychain service, and `.aix` extension remain unchanged
+  so existing settings and documents continue to work.
+- Added a CodeMirror Markdown workspace with **Edit**, live GFM **Preview**, and
+  side-by-side **Split** layouts. Markdown source is retained verbatim while its
+  headings, paragraphs, images, and Mermaid blocks remain available to the
+  existing AI and slide projections.
+- `.md` and `.markdown` files now open as first-class documents and save back to
+  their original path atomically; native `.aix` documents remain supported.
+- Markdown preview text is now directly editable in Split and Preview, uses a
+  Japanese-capable Gothic/sans-serif stack, renders safe inline image data URLs
+  (including URL-encoded SVG), and exposes source links through an open popover.
+- Added a Finder-style Markdown folder browser: navigate nested folders in
+  columns and single-click a file for a non-destructive instant preview before
+  explicitly opening it for editing.
+
 ### Stage 1 (開発.txt §5 — 主戦場の完成)
 
 - **Speaker notes** — every slide's heading chunk can carry speaker notes

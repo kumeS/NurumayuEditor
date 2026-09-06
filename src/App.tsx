@@ -12,16 +12,20 @@ import {
   exportPdf,
   exportPptx,
   importDocument,
+  openFolder,
   openNative,
   saveNative,
   saveNativeAs,
 } from "./fileActions";
+import { tNow } from "./i18n";
 import { useStore } from "./store";
 import type { PersistedTab, SessionData } from "./types";
 import { useShortcuts } from "./useShortcuts";
 import CommandPalette from "./components/CommandPalette";
 import DraftModal from "./components/DraftModal";
 import Editor from "./components/Editor";
+import FolderTree from "./components/FolderTree";
+import MarkdownEditor from "./components/MarkdownEditor";
 import HealthBar from "./components/HealthBar";
 import ErrorBoundary from "./components/ErrorBoundary";
 import SlideEditor from "./components/SlideEditor";
@@ -75,12 +79,17 @@ async function okToClose(): Promise<boolean> {
 function App() {
   const networkOpen = useStore((s) => s.networkOpen);
   const reviewPanelOpen = useStore((s) => s.reviewPanelOpen);
+  const folderTreeOpen = useStore((s) => s.folderTreeOpen);
   const presentationOpen = useStore((s) => s.presentationOpen);
   const mode = useStore((s) => s.doc.mode ?? "editor");
   const activeTabId = useStore((s) => s.activeTabId);
   const setSettings = useStore((s) => s.setSettings);
   const setHasApiKey = useStore((s) => s.setHasApiKey);
   const notify = useStore((s) => s.notify);
+  // The restore prompt below is a NATIVE dialog whose copy is resolved once, at
+  // call time — so it has to wait for the saved language to land in the store,
+  // or it asks in English inside an otherwise-Japanese app.
+  const settingsLoaded = useStore((s) => s.settings !== null);
 
   useShortcuts();
 
@@ -94,6 +103,9 @@ function App() {
           break;
         case "open":
           void openNative();
+          break;
+        case "open_folder":
+          void openFolder();
           break;
         case "save":
           void saveNative();
@@ -177,6 +189,7 @@ function App() {
   // working set (debounced) so a crash/force-quit can't lose tabs — including
   // irreproducible AI drafts.
   useEffect(() => {
+    if (!settingsLoaded) return; // ask in the user's language, not the default
     let cancelled = false;
     (async () => {
       try {
@@ -184,12 +197,12 @@ function App() {
         if (cancelled || !sess?.tabs?.length) return;
         if (sess.tabs.some((t) => t.dirty)) {
           const restore = await ask(
-            "Restore unsaved documents from your last session?",
+            tNow("Restore unsaved documents from your last session?"),
             {
-              title: "Restore session",
+              title: tNow("Restore session"),
               kind: "info",
-              okLabel: "Restore",
-              cancelLabel: "Discard",
+              okLabel: tNow("Restore"),
+              cancelLabel: tNow("Discard"),
             }
           );
           if (cancelled) return;
@@ -205,7 +218,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [settingsLoaded]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -233,9 +246,22 @@ function App() {
         if (cancelled) return;
         setSettings(settings);
         setHasApiKey(hasKey);
+        // Blindspot QA v1 (project.md Q13): first-ever launch shows a filled-in
+        // worked example (progress note → slides → own figure) instead of a
+        // blank page, so the weekly loop is visible before the API-key wall
+        // below. Guarded by the store action (pristine-tab check) as well as
+        // the settings flag, so this can only ever do something once — every
+        // later getSettings() call (including a second window/session) sees
+        // `hasSeenWelcomeExample: true` and no-ops.
+        const shown = useStore.getState().loadWelcomeExampleIfFirstRun(settings);
+        if (shown) {
+          const updated = { ...settings, hasSeenWelcomeExample: true };
+          setSettings(updated);
+          await api.saveSettings(updated).catch(() => {});
+        }
         if (!hasKey) {
           notify(
-            "Add your OpenRouter API key in Settings to enable AI features.",
+            tNow("Add your OpenRouter API key in Settings to enable AI features."),
             "info"
           );
         }
@@ -249,17 +275,27 @@ function App() {
   }, [setSettings, setHasApiKey, notify]);
 
   return (
+    <ErrorBoundary>
     <div className="flex h-full flex-col bg-white text-ink">
       <TabBar />
       <Toolbar />
       <div className="flex min-h-0 flex-1">
-        <main className="min-h-0 flex-1 overflow-y-auto">
+        {folderTreeOpen && <FolderTree />}
+        <main className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           {/* Reset the boundary when the tab or view mode changes, so a crash in
               one view doesn't trap the user — they can switch away and back. The
               fade-in (keyed the same way) softens the hard remount on a mode
               switch without being a real transition between two live views. */}
           <div key={`${activeTabId}:${mode}`} className="view-fade-in h-full">
-            <ErrorBoundary>{mode === "slide" ? <SlideEditor /> : <Editor />}</ErrorBoundary>
+            <ErrorBoundary>
+              {mode === "slide" ? (
+                <SlideEditor />
+              ) : mode === "markdown" ? (
+                <MarkdownEditor />
+              ) : (
+                <Editor />
+              )}
+            </ErrorBoundary>
           </div>
         </main>
         {networkOpen && (
@@ -306,6 +342,7 @@ function App() {
       <SelectionBar />
       <Toasts />
     </div>
+    </ErrorBoundary>
   );
 }
 

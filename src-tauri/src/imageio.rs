@@ -1,15 +1,77 @@
-//! Shared image plumbing for exporters (PPTX, RTF): decode an image chunk's
-//! data-URL content, sniff its format from magic bytes, read pixel dimensions,
-//! aspect-fit it into a box, and resolve remote image URLs to inline data URLs.
-//! Pure helpers except `resolve_remote_images`, which fetches over the network.
+//! Shared image plumbing for exporters (PPTX, RTF) and for user-inserted local
+//! images: decode an image chunk's data-URL content, sniff its format from
+//! magic bytes, read pixel dimensions, aspect-fit it into a box, resolve
+//! remote image URLs to inline data URLs, and read a caller-picked local image
+//! file into an inline data URL. Pure helpers except `resolve_remote_images`
+//! (network) and `read_local_image_file` (disk), which do the I/O the rest of
+//! this module doesn't need.
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::Chunk;
 use base64::Engine;
+use std::path::Path;
 
-/// Upper bound on a single fetched remote image (A4): a hostile or accidentally
-/// huge URL can't exhaust memory during export.
+/// Upper bound on a single fetched remote image (A4), and on a single local
+/// image file picked via the file dialog: a hostile or accidentally huge
+/// source can't exhaust memory during export or on insertion.
 const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+
+/// Extensions accepted for a user-picked local image file (case-insensitive).
+/// Broader than `image_ext`'s export-embeddable set (adds `webp`) since a
+/// user's own picture may be a format the PPTX/RTF writers can't embed but the
+/// in-app `<img>` preview renders fine.
+const LOCAL_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+/// Read a user-picked local image file (from the file-picker dialog, never an
+/// arbitrary renderer-supplied path — see `commands::read_local_image`) and
+/// return it as an inline `data:<mime>;base64,...` URL for a local-image chunk.
+///
+/// Rejects an unrecognised extension and a file over `MAX_IMAGE_BYTES` before
+/// reading the full contents, so a hostile or mistaken huge/wrong-type path
+/// can't be read into memory at all.
+pub fn read_local_image_file(path: &str) -> AppResult<String> {
+    let p = Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !LOCAL_IMAGE_EXTS.iter().any(|a| *a == ext) {
+        return Err(AppError::UnsupportedImage(
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string(),
+        ));
+    }
+
+    let meta = std::fs::metadata(p)?;
+    if meta.len() > MAX_IMAGE_BYTES as u64 {
+        return Err(AppError::ImageTooLarge {
+            name: p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string(),
+            size_mb: meta.len() as f64 / (1024.0 * 1024.0),
+            limit_mb: (MAX_IMAGE_BYTES / (1024 * 1024)) as u64,
+        });
+    }
+
+    let bytes = std::fs::read(p)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{};base64,{b64}", mime_for_ext(&ext)))
+}
 
 /// Resolve remote (`http(s)://`) image-chunk URLs to inline data URLs by
 /// fetching the bytes, so the (synchronous) writers can embed them. Image chunks
@@ -197,5 +259,71 @@ mod tests {
         let (_, _, cx, cy) = fit(&png, 0, 0, 4_000_000, 4_000_000);
         // width-bound: cy/cx should be ~270/480
         assert!((cx as f64 * 270.0 / 480.0 - cy as f64).abs() < 2.0);
+    }
+
+    // ----- local image insertion (v1 "No.1" priority feature) -----
+
+    /// A tiny valid 1x1 PNG (magic bytes + IHDR chunk header enough for the
+    /// writer/format-sniffer; body doesn't need to be a complete valid image
+    /// for this round-trip test, which only exercises read → base64 → data URL).
+    fn tiny_png_bytes() -> Vec<u8> {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0, 0, 0, 0]); // IHDR length placeholder
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1u32.to_be_bytes()); // width
+        png.extend_from_slice(&1u32.to_be_bytes()); // height
+        png
+    }
+
+    #[test]
+    fn read_local_image_file_round_trips_a_valid_small_image() {
+        let dir = std::env::temp_dir().join(format!("nf-imageio-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.png");
+        std::fs::write(&path, tiny_png_bytes()).unwrap();
+
+        let data_url = read_local_image_file(path.to_str().unwrap()).unwrap();
+        assert!(data_url.starts_with("data:image/png;base64,"));
+        let decoded = decode_image(&data_url).unwrap();
+        assert_eq!(decoded, tiny_png_bytes());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn read_local_image_file_rejects_oversized_file() {
+        let dir = std::env::temp_dir().join(format!("nf-imageio-test-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.png");
+        // One byte over the cap is enough to trigger the rejection without
+        // actually allocating/writing tens of megabytes for the test.
+        let big = vec![0u8; MAX_IMAGE_BYTES + 1];
+        std::fs::write(&path, &big).unwrap();
+
+        let err = read_local_image_file(path.to_str().unwrap()).unwrap_err();
+        match err {
+            AppError::ImageTooLarge { limit_mb, .. } => {
+                assert_eq!(limit_mb, (MAX_IMAGE_BYTES / (1024 * 1024)) as u64);
+            }
+            other => panic!("expected ImageTooLarge, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn read_local_image_file_rejects_disallowed_extension() {
+        let dir = std::env::temp_dir().join(format!("nf-imageio-test-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.exe");
+        std::fs::write(&path, b"not an image").unwrap();
+
+        let err = read_local_image_file(path.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, AppError::UnsupportedImage(_)));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

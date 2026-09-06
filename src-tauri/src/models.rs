@@ -17,6 +17,10 @@ pub const CHUNK_TYPE_DIAGRAM: &str = "diagram";
 pub const CHUNK_TYPE_HEADING: &str = "heading";
 pub const CHUNK_TYPE_IMAGE: &str = "image";
 pub const DIAGRAM_FORMAT_MERMAID: &str = "mermaid";
+/// `ChunkMetadata::image_source` values: an AI-generated image, or one the
+/// user inserted from a local file (picker / drag-drop / paste).
+pub const IMAGE_SOURCE_AI: &str = "ai";
+pub const IMAGE_SOURCE_LOCAL: &str = "local";
 
 /// Generate a fresh UUID v4 string id.
 pub fn new_id() -> String {
@@ -45,6 +49,13 @@ pub struct ChunkMetadata {
     /// "regenerate" can re-run the same request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_prompt: Option<String>,
+    /// For image chunks: "ai" (generated) or "local" (inserted from a file the
+    /// user picked, dropped, or pasted). Older `.aix` files predate this field;
+    /// `Document::normalize` coerces a missing value on an image chunk to
+    /// "ai" for back-compat (every image chunk used to only be possible via
+    /// generation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<String>,
     /// Prior content values for this chunk (text: previous paragraph versions;
     /// image: previously generated image URLs) so the user can swap back to an
     /// earlier version. The current value lives in `Chunk::content`.
@@ -93,6 +104,18 @@ pub struct ChunkMetadata {
     /// `Some("")`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Personal RAG (開発.txt Stage 3, item 3-1) auto-accumulation (Q11/Q16):
+    /// the user has explicitly marked this chunk's content as "confirmed" —
+    /// vetted enough to feed into their own personal library. On save (see
+    /// `commands::rag_sync_confirmed_chunks`), every chunk with `confirmed:
+    /// true` and non-empty content is (re-)indexed under a per-chunk synthetic
+    /// source path (`"{doc_path}#{chunk_id}"`), so edits made after confirming
+    /// keep that passage fresh rather than accumulating stale duplicates. Only
+    /// takes effect when `Settings::personal_rag_enabled` is on — off by
+    /// default, and merely toggling it does no indexing work by itself (that
+    /// only happens at the next save).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
 }
 
 /// A review comment on a chunk (frontend-owned; persisted only). Mirrors the
@@ -127,6 +150,7 @@ impl Default for ChunkMetadata {
             summary: None,
             linked_chunks: Vec::new(),
             image_prompt: None,
+            image_source: None,
             content_history: Vec::new(),
             layout: None,
             subtitle: false,
@@ -136,6 +160,7 @@ impl Default for ChunkMetadata {
             summary_hash: None,
             slot: None,
             notes: None,
+            confirmed: false,
         }
     }
 }
@@ -209,6 +234,8 @@ impl Chunk {
 /// any time from the frontend toolbar. Persisted so a document reopens in the
 /// view it was last saved in.
 pub const DOC_MODE_EDITOR: &str = "editor";
+/// Exact-source Markdown editor/preview workspace.
+pub const DOC_MODE_MARKDOWN: &str = "markdown";
 /// The "slide" mode literal — set on the frontend; kept here as the documented
 /// contract for the field's valid values.
 #[allow(dead_code)]
@@ -230,6 +257,13 @@ pub struct Document {
     /// Persisted relationship graph (spec §3.4) so it survives save/reopen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<AnalysisResult>,
+    /// Exact Markdown source captured while the Markdown workspace was
+    /// authoritative. May linger stale after `mode` changes away from
+    /// "markdown" (ordinary chunk edits don't clear it) — every consumer
+    /// (`document_to_md`/`documentToMarkdown`) MUST ignore this field unless
+    /// `mode == "markdown"`, deriving fresh text from `chunks` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_source: Option<String>,
 }
 
 impl Document {
@@ -240,6 +274,7 @@ impl Document {
             chunks: Vec::new(),
             mode: default_doc_mode(),
             analysis: None,
+            markdown_source: None,
         }
     }
 
@@ -264,7 +299,10 @@ impl Document {
         }
 
         // ---- 2. Known document mode.
-        if self.mode != DOC_MODE_EDITOR && self.mode != DOC_MODE_SLIDE {
+        if self.mode != DOC_MODE_EDITOR
+            && self.mode != DOC_MODE_MARKDOWN
+            && self.mode != DOC_MODE_SLIDE
+        {
             notes.push(format!(
                 "Unknown document mode '{}'; reset to '{}'.",
                 self.mode, DOC_MODE_EDITOR
@@ -308,11 +346,14 @@ impl Document {
             SLIDE_LAYOUT_TITLE_IMAGE_LEFT,
             SLIDE_LAYOUT_IMAGE_TOP,
         ];
+        let known_image_sources = [IMAGE_SOURCE_AI, IMAGE_SOURCE_LOCAL];
         let mut coerced_types = 0usize;
         let mut clamped_levels = 0usize;
         let mut dropped_layouts = 0usize;
         let mut dropped_links = 0usize;
         let mut blanked_notes = 0usize;
+        let mut defaulted_image_sources = 0usize;
+        let mut cleared_confirmations = 0usize;
         for c in &mut self.chunks {
             if !known_types.contains(&c.metadata.chunk_type.as_str()) {
                 c.metadata.chunk_type = CHUNK_TYPE_TEXT.to_string();
@@ -338,6 +379,29 @@ impl Document {
                 c.metadata.notes = None;
                 blanked_notes += 1;
             }
+            // A "confirmed" flag on a now-empty chunk is a stale confirmation
+            // (its content was cleared out from under it) — auto-accumulation
+            // has nothing to index for it, so keeping the flag set would only
+            // mislead the "confirmed" UI toggle into showing it as still
+            // vetted. Clear it rather than silently leaving a dangling promise.
+            if c.metadata.confirmed && c.content.trim().is_empty() {
+                c.metadata.confirmed = false;
+                cleared_confirmations += 1;
+            }
+            // Pre-existing image chunks (saved before local insertion existed)
+            // have no `image_source`; every one of those was AI-generated, and
+            // an unrecognised value is just as ambiguous — coerce both to "ai"
+            // so the UI's AI/local badge always has a definite answer.
+            if c.metadata.chunk_type == CHUNK_TYPE_IMAGE
+                && !c
+                    .metadata
+                    .image_source
+                    .as_deref()
+                    .is_some_and(|s| known_image_sources.contains(&s))
+            {
+                c.metadata.image_source = Some(IMAGE_SOURCE_AI.to_string());
+                defaulted_image_sources += 1;
+            }
             let before = c.metadata.linked_chunks.len();
             c.metadata
                 .linked_chunks
@@ -346,6 +410,11 @@ impl Document {
         }
         if coerced_types > 0 {
             notes.push(format!("{coerced_types} chunk(s) had an unknown type; reset to text."));
+        }
+        if defaulted_image_sources > 0 {
+            notes.push(format!(
+                "{defaulted_image_sources} image(s) predated the AI/local distinction; marked as AI-generated."
+            ));
         }
         if clamped_levels > 0 {
             notes.push(format!("{clamped_levels} heading(s) had an out-of-range level; clamped to 1–3."));
@@ -359,6 +428,11 @@ impl Document {
         if blanked_notes > 0 {
             notes.push(format!(
                 "{blanked_notes} chunk(s) had blank speaker notes; cleared."
+            ));
+        }
+        if cleared_confirmations > 0 {
+            notes.push(format!(
+                "{cleared_confirmations} chunk(s) were marked confirmed but had no content; unmarked."
             ));
         }
 
@@ -596,6 +670,65 @@ mod tests {
     }
 
     #[test]
+    fn image_chunk_missing_image_source_defaults_to_ai_for_back_compat() {
+        // A `.aix` file saved before local image insertion existed has an
+        // image chunk with no `image_source` at all — every such image was
+        // necessarily AI-generated, so normalize() must coerce it to "ai"
+        // rather than leaving it ambiguous (None).
+        let mut doc = Document::new("D");
+        let mut img = Chunk::new_text(0, "data:image/png;base64,AAA");
+        img.metadata.chunk_type = CHUNK_TYPE_IMAGE.to_string();
+        assert_eq!(img.metadata.image_source, None);
+        doc.chunks.push(img);
+
+        let notes = doc.normalize();
+
+        assert_eq!(doc.chunks[0].metadata.image_source.as_deref(), Some(IMAGE_SOURCE_AI));
+        assert!(
+            notes.iter().any(|n| n.contains("AI-generated")),
+            "expected a repair note: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn image_chunk_with_unknown_image_source_is_coerced_to_ai() {
+        let mut doc = Document::new("D");
+        let mut img = Chunk::new_text(0, "data:image/png;base64,AAA");
+        img.metadata.chunk_type = CHUNK_TYPE_IMAGE.to_string();
+        img.metadata.image_source = Some("bogus".into());
+        doc.chunks.push(img);
+
+        doc.normalize();
+
+        assert_eq!(doc.chunks[0].metadata.image_source.as_deref(), Some(IMAGE_SOURCE_AI));
+    }
+
+    #[test]
+    fn image_chunk_with_local_image_source_survives_normalize_untouched() {
+        let mut doc = Document::new("D");
+        let mut img = Chunk::new_text(0, "data:image/png;base64,AAA");
+        img.metadata.chunk_type = CHUNK_TYPE_IMAGE.to_string();
+        img.metadata.image_source = Some(IMAGE_SOURCE_LOCAL.to_string());
+        doc.chunks.push(img);
+
+        let notes = doc.normalize();
+
+        assert_eq!(doc.chunks[0].metadata.image_source.as_deref(), Some(IMAGE_SOURCE_LOCAL));
+        assert!(notes.is_empty(), "no repairs expected: {notes:?}");
+    }
+
+    #[test]
+    fn non_image_chunk_never_gets_an_image_source_defaulted() {
+        // The repair is scoped to image chunks only — a text/heading/diagram
+        // chunk's (always-None) image_source must not be touched.
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_text(0, "body"));
+        let notes = doc.normalize();
+        assert_eq!(doc.chunks[0].metadata.image_source, None);
+        assert!(notes.is_empty(), "no repairs expected: {notes:?}");
+    }
+
+    #[test]
     fn well_formed_document_is_unchanged() {
         let mut doc = Document::new("D");
         doc.chunks.push(Chunk::new_heading(0, 1, "H"));
@@ -625,6 +758,34 @@ mod tests {
         doc.chunks.push(h);
         let notes = doc.normalize();
         assert_eq!(doc.chunks[0].metadata.notes.as_deref(), Some("Remember to mention X"));
+        assert!(notes.is_empty(), "no repairs expected: {notes:?}");
+    }
+
+    #[test]
+    fn confirmed_flag_on_empty_chunk_is_cleared_by_normalize() {
+        // A "confirmed" chunk whose content got cleared out from under it is a
+        // stale confirmation (auto-accumulation has nothing to index) — normalize
+        // must unmark it rather than leave a dangling promise.
+        let mut doc = Document::new("D");
+        let mut c = Chunk::new_text(0, "   ");
+        c.metadata.confirmed = true;
+        doc.chunks.push(c);
+        let notes = doc.normalize();
+        assert!(!doc.chunks[0].metadata.confirmed);
+        assert!(
+            notes.iter().any(|n| n.contains("confirmed")),
+            "expected a repair note: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn confirmed_flag_on_non_empty_chunk_survives_normalize_untouched() {
+        let mut doc = Document::new("D");
+        let mut c = Chunk::new_text(0, "Real content.");
+        c.metadata.confirmed = true;
+        doc.chunks.push(c);
+        let notes = doc.normalize();
+        assert!(doc.chunks[0].metadata.confirmed);
         assert!(notes.is_empty(), "no repairs expected: {notes:?}");
     }
 

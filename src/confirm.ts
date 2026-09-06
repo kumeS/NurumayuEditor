@@ -5,6 +5,7 @@
 // consistent.
 
 import { ask } from "@tauri-apps/plugin-dialog";
+import { tNow } from "./i18n";
 
 const MESSAGES = {
   quit: {
@@ -26,10 +27,10 @@ const MESSAGES = {
  */
 export async function confirmDiscard(scope: "tab" | "quit"): Promise<boolean> {
   const { message, okLabel } = MESSAGES[scope];
-  return ask(message, {
-    title: "Unsaved changes",
+  return ask(tNow(message), {
+    title: tNow("Unsaved changes"),
     kind: "warning",
-    okLabel,
-    cancelLabel: "Cancel",
+    okLabel: tNow(okLabel),
+    cancelLabel: tNow("Cancel"),
   });
 }

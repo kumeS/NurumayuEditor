@@ -5,6 +5,7 @@
 import { type ReactNode, useEffect, useState } from "react";
 import { api } from "../api";
 import { FONT_STACKS } from "../fonts";
+import { tNow, useLang, useT } from "../i18n";
 import { useStore } from "../store";
 import type { Settings } from "../types";
 import { CloseIcon } from "./icons";
@@ -40,6 +41,7 @@ const DEFAULTS: Settings = {
   limitCompletionToLocalModel: false,
   charLimitWarning: undefined,
   personalRagEnabled: false,
+  mcpWriteEnabled: false,
 };
 
 // Common languages for the default-language picker.
@@ -96,6 +98,8 @@ export default function SettingsModal() {
   const [newModel, setNewModel] = useState("");
   const [newImageModel, setNewImageModel] = useState("");
   const [saving, setSaving] = useState(false);
+  const t = useT();
+  const ja = useLang() === "ja";
 
   useEffect(() => {
     if (open) {
@@ -149,11 +153,14 @@ export default function SettingsModal() {
     try {
       await api.saveSettings(form);
       setSettings(form);
+      // The in-app chrome re-renders from the store, but the NATIVE menu bar was
+      // built at startup — rebuild it so both halves speak the same language.
+      await api.setMenuLanguage(form.defaultTargetLanguage).catch(() => {});
       if (apiKey.trim()) {
         await api.setApiKey(apiKey.trim());
         setHasApiKey(true);
       }
-      notify("Settings saved.", "success");
+      notify(t("Settings saved."), "success");
       closeSettings();
     } catch (e) {
       notify(typeof e === "string" ? e : String(e), "error");
@@ -167,7 +174,7 @@ export default function SettingsModal() {
       await api.deleteApiKey();
       setHasApiKey(false);
       setApiKey("");
-      notify("API key removed from keychain.", "success");
+      notify(tNow("API key removed from keychain."), "success");
     } catch (e) {
       notify(typeof e === "string" ? e : String(e), "error");
     }
@@ -216,8 +223,8 @@ export default function SettingsModal() {
                   onClick={() => removeModelFrom(listKey, activeKey, m)}
                   disabled={list.length <= 1}
                   className="shrink-0 rounded px-1.5 text-ink-faint hover:text-red-500 disabled:opacity-30 disabled:hover:text-ink-faint"
-                  title="Remove from list"
-                  aria-label={`Remove ${m}`}
+                  title={t("Remove from list")}
+                  aria-label={`${t("Remove")} ${m}`}
                 >
                   ×
                 </button>
@@ -244,7 +251,7 @@ export default function SettingsModal() {
             disabled={!addValue.trim()}
             className="shrink-0 rounded-md bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent-soft disabled:opacity-50"
           >
-            Add
+            {t("Add")}
           </button>
         </div>
         <p className="mt-1 text-xs text-ink-faint">{help}</p>
@@ -262,11 +269,11 @@ export default function SettingsModal() {
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex shrink-0 items-center justify-between border-b border-gray-100 px-6 pb-3 pt-6">
-          <h2 className="text-lg font-semibold text-ink">Settings</h2>
+          <h2 className="text-lg font-semibold text-ink">{t("Settings")}</h2>
           <button
             onClick={closeSettings}
             className="text-ink-faint hover:text-ink"
-            aria-label="Close"
+            aria-label={t("Close")}
           >
             <CloseIcon />
           </button>
@@ -274,7 +281,7 @@ export default function SettingsModal() {
 
         <div className="flex-1 space-y-4 overflow-y-auto px-6 py-4">
           <div className="rounded-lg border border-accent/30 bg-accent/5 p-3">
-            <label className={labelCls}>Default language</label>
+            <label className={labelCls}>{t("Default language")}</label>
             <select
               value={form.defaultTargetLanguage}
               onChange={(e) => update("defaultTargetLanguage", e.target.value)}
@@ -294,42 +301,54 @@ export default function SettingsModal() {
               ))}
             </select>
             <p className="mt-1 text-xs text-ink-faint">
-              The output language for <strong>all</strong> AI actions — translation
-              target plus the language every result (proofread, expand, summarize,
-              draft…) is written in. Set this and your text stays in this language;
-              e.g. proofreading Japanese keeps it Japanese.
+              {ja ? (
+                <>
+                  <strong>すべての</strong>AI操作の出力言語です — 翻訳先の言語に加えて、
+                  校正・加筆・要約・下書きなど、あらゆる結果がこの言語で書かれます。
+                  ここを設定しておけば文章の言語は保たれます(日本語を校正しても日本語のまま)。
+                  この設定はアプリの表示言語も切り替えます。
+                </>
+              ) : (
+                <>
+                  The output language for <strong>all</strong> AI actions — translation
+                  target plus the language every result (proofread, expand, summarize,
+                  draft…) is written in. It also switches this app's own interface
+                  language. Set this and your text stays in this language; e.g.
+                  proofreading Japanese keeps it Japanese.
+                </>
+              )}
             </p>
           </div>
 
           <div>
-            <label className={labelCls}>OpenRouter API key</label>
+            <label className={labelCls}>{t("OpenRouter API key")}</label>
             <input
               type="password"
               autoComplete="off"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder={hasApiKey ? "•••••••••• (saved in keychain)" : "sk-or-..."}
+              placeholder={hasApiKey ? t("•••••••••• (saved in keychain)") : "sk-or-..."}
               className={field}
             />
             <div className="mt-1 flex items-center justify-between">
               <span className="text-xs text-ink-faint">
                 {hasApiKey
-                  ? "A key is stored securely in your OS keychain."
-                  : "Stored in your OS keychain — never written to disk in plaintext."}
+                  ? t("A key is stored securely in your OS keychain.")
+                  : t("Stored in your OS keychain — never written to disk in plaintext.")}
               </span>
               {hasApiKey && (
                 <button
                   onClick={clearKey}
                   className="text-xs text-red-500 hover:underline"
                 >
-                  Remove key
+                  {t("Remove key")}
                 </button>
               )}
             </div>
           </div>
 
           <div>
-            <label className={labelCls}>Endpoint URL</label>
+            <label className={labelCls}>{t("Endpoint URL")}</label>
             <input
               value={form.endpoint}
               onChange={(e) => update("endpoint", e.target.value)}
@@ -337,12 +356,24 @@ export default function SettingsModal() {
               placeholder={DEFAULTS.endpoint}
             />
             <p className="mt-1 text-xs text-ink-faint">
-              <strong>Recommended:</strong> keep the OpenRouter default{" "}
-              <code>{DEFAULTS.endpoint}</code>. Any OpenAI-compatible
-              chat-completions endpoint also works — e.g. a local Ollama bridge at{" "}
-              <code>http://localhost:11434/v1/chat/completions</code> (leave the API
-              key blank for local endpoints). Image generation requires an
-              OpenRouter image model.
+              {ja ? (
+                <>
+                  <strong>推奨:</strong> OpenRouterの既定値{" "}
+                  <code>{DEFAULTS.endpoint}</code> のままご利用ください。OpenAI互換の
+                  chat-completionsエンドポイントも利用できます — 例: ローカルのOllamaブリッジ{" "}
+                  <code>http://localhost:11434/v1/chat/completions</code>
+                  (ローカルの場合APIキーは空欄で構いません)。画像生成にはOpenRouterの画像モデルが必要です。
+                </>
+              ) : (
+                <>
+                  <strong>Recommended:</strong> keep the OpenRouter default{" "}
+                  <code>{DEFAULTS.endpoint}</code>. Any OpenAI-compatible
+                  chat-completions endpoint also works — e.g. a local Ollama bridge at{" "}
+                  <code>http://localhost:11434/v1/chat/completions</code> (leave the API
+                  key blank for local endpoints). Image generation requires an
+                  OpenRouter image model.
+                </>
+              )}
             </p>
           </div>
 
@@ -354,20 +385,31 @@ export default function SettingsModal() {
                 onChange={(e) => update("limitCompletionToLocalModel", e.target.checked)}
                 className="h-4 w-4 accent-accent"
               />
-              Limit ghost-text completion to a local model
+              {t("Limit ghost-text completion to a local model")}
             </label>
             <p className="mt-1 text-xs text-ink-faint">
-              While typing, a faint inline suggestion previews how the sentence
-              might continue (Tab to accept, Esc to dismiss). When enabled, this
-              only fires if the endpoint above is local (e.g.{" "}
-              <code>localhost</code>/<code>127.0.0.1</code>) — if it isn't, no
-              suggestion is requested rather than sending your text to a remote
-              endpoint. Off by default.
+              {ja ? (
+                <>
+                  入力中に、続きの文章の候補が薄い文字で表示されます(Tabで確定、Escで却下)。
+                  有効にすると、上のエンドポイントがローカル(例:{" "}
+                  <code>localhost</code>/<code>127.0.0.1</code>)のときだけ動作します。
+                  ローカルでない場合は、文章を外部に送らず候補を要求しません。既定はオフです。
+                </>
+              ) : (
+                <>
+                  While typing, a faint inline suggestion previews how the sentence
+                  might continue (Tab to accept, Esc to dismiss). When enabled, this
+                  only fires if the endpoint above is local (e.g.{" "}
+                  <code>localhost</code>/<code>127.0.0.1</code>) — if it isn't, no
+                  suggestion is requested rather than sending your text to a remote
+                  endpoint. Off by default.
+                </>
+              )}
             </p>
           </div>
 
           <div>
-            <label className={labelCls}>Paragraph character-limit warning</label>
+            <label className={labelCls}>{t("Paragraph character-limit warning")}</label>
             <div className="flex items-center gap-2">
               <input
                 type="number"
@@ -381,7 +423,7 @@ export default function SettingsModal() {
                     raw === "" ? undefined : Math.max(1, Math.round(Number(raw)))
                   );
                 }}
-                placeholder="Off"
+                placeholder={t("Off")}
                 className={`${field} w-32`}
               />
               <button
@@ -390,14 +432,13 @@ export default function SettingsModal() {
                 disabled={form.charLimitWarning === undefined}
                 className="shrink-0 rounded-md px-3 py-2 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-40"
               >
-                Turn off
+                {t("Turn off")}
               </button>
             </div>
             <p className="mt-1 text-xs text-ink-faint">
-              Flags any paragraph longer than this many characters in the health
-              bar — useful for any length-constrained writing (grant applications,
-              abstracts, forms). CJK characters count as one character each. Off
-              (unset) by default; leave blank to disable.
+              {ja
+                ? "この文字数を超えた段落をヘルスバーで警告します — 字数制限のある文章(申請書・抄録・各種フォーム)に便利です。日本語などの全角文字も1文字として数えます。既定はオフ(未設定)、空欄で無効になります。"
+                : "Flags any paragraph longer than this many characters in the health bar — useful for any length-constrained writing (grant applications, abstracts, forms). CJK characters count as one character each. Off (unset) by default; leave blank to disable."}
             </p>
           </div>
 
@@ -409,61 +450,93 @@ export default function SettingsModal() {
                 onChange={(e) => update("personalRagEnabled", e.target.checked)}
                 className="h-4 w-4 accent-accent"
               />
-              Personal knowledge base (RAG)
+              {t("Personal knowledge base (RAG)")}
             </label>
             <p className="mt-1 text-xs text-ink-faint">
-              Let AI actions optionally pull in relevant snippets from your own
-              past papers/notes as grounding context. Fully on-device: embedding,
-              indexing, and search all run locally (a one-time embedding-model
-              download happens the first time you add a source or search, after
-              enabling this — no other network traffic). Off by default. Manage
-              indexed files from{" "}
+              {ja
+                ? "AI操作が、あなた自身の過去の論文やノートから関連する箇所を根拠として参照できるようになります。埋め込み・索引作成・検索はすべて端末内で完結します(有効化後、最初にソースを追加または検索したときだけ埋め込みモデルを1回ダウンロードします。それ以外の通信はありません)。既定はオフ。索引済みファイルの管理は"
+                : "Let AI actions optionally pull in relevant snippets from your own past papers/notes as grounding context. Fully on-device: embedding, indexing, and search all run locally (a one-time embedding-model download happens the first time you add a source or search, after enabling this — no other network traffic). Off by default. Manage indexed files from"}{" "}
               <button
                 type="button"
                 onClick={() => openPersonalLibraryPanel()}
                 className="text-accent underline decoration-dotted hover:text-accent-soft"
               >
-                the personal library panel
+                {t("the personal library panel")}
               </button>{" "}
-              (also in the command palette).
+              {ja ? "から行えます(コマンドパレットからも開けます)。" : "(also in the command palette)."}
             </p>
           </div>
 
           <div>
-            <label className={labelCls}>Model (text)</label>
+            <label className="flex items-center gap-2 text-sm font-medium text-ink-soft">
+              <input
+                type="checkbox"
+                checked={form.mcpWriteEnabled ?? false}
+                onChange={(e) => update("mcpWriteEnabled", e.target.checked)}
+                className="h-4 w-4 accent-accent"
+              />
+              {t("Allow AI agent to write into documents (MCP)")}
+            </label>
+            <p className="mt-1 text-xs text-ink-faint">
+              {ja
+                ? "接続したAIエージェントが、要約をドキュメントに書き込めるようになります。オンにすると、外部のMCPクライアント(Claude DesktopやClaude Codeなど)があなたのパーソナルナレッジベースを検索し、指定したドキュメントに明示ラベル付きの参照チャンクを挿入できます。アプリ内で独自にAI要約を実行することはありません。既定はオフで、他のMCP機能(ドキュメントの読み取り・書き出し)はこの設定の影響を受けません。"
+                : "Let a connected AI agent write summaries back into your documents. When on, an external MCP client (e.g. Claude Desktop or Claude Code) can search your personal knowledge base and insert a clearly labeled reference chunk into a document you point it at — it never runs its own AI summarization inside the app. Off by default; every other MCP capability (reading documents, exporting) is unaffected by this setting."}
+            </p>
+          </div>
+
+          <div>
+            <label className={labelCls}>{t("Model (text)")}</label>
             {renderModelList(
               "models",
               "model",
               newModel,
               setNewModel,
-              "Add model ID, e.g. anthropic/claude-3.5-sonnet",
-              <>
-                Click a model to use it for writing/AI actions. Add any OpenRouter
-                text model — free (e.g. <code>google/gemma-4-31b-it:free</code>) or
-                paid (e.g. <code>anthropic/claude-3.5-sonnet</code>).
-              </>
+              t("Add model ID, e.g. anthropic/claude-3.5-sonnet"),
+              ja ? (
+                <>
+                  モデルをクリックすると、執筆・AI操作に使うモデルになります。OpenRouterの
+                  テキストモデルを自由に追加できます — 無料(例:{" "}
+                  <code>google/gemma-4-31b-it:free</code>)でも有料(例:{" "}
+                  <code>anthropic/claude-3.5-sonnet</code>)でも構いません。
+                </>
+              ) : (
+                <>
+                  Click a model to use it for writing/AI actions. Add any OpenRouter
+                  text model — free (e.g. <code>google/gemma-4-31b-it:free</code>) or
+                  paid (e.g. <code>anthropic/claude-3.5-sonnet</code>).
+                </>
+              )
             )}
           </div>
 
           <div>
-            <label className={labelCls}>Model (image generation)</label>
+            <label className={labelCls}>{t("Model (image generation)")}</label>
             {renderModelList(
               "imageModels",
               "imageModel",
               newImageModel,
               setNewImageModel,
-              "Add image model ID, e.g. google/gemini-2.5-flash-image",
-              <>
-                Used for paragraph image generation. e.g.{" "}
-                <code>google/gemini-2.5-flash-image</code> (Nano Banana) or
-                Nano Banana Pro. <strong>Verify exact ids on
-                openrouter.ai/models</strong> — image model ids change often.
-              </>
+              t("Add image model ID, e.g. google/gemini-2.5-flash-image"),
+              ja ? (
+                <>
+                  段落の画像生成に使われます。例:{" "}
+                  <code>google/gemini-2.5-flash-image</code> (Nano Banana) や
+                  Nano Banana Pro。<strong>正確なIDは openrouter.ai/models で
+                  確認してください</strong> — 画像モデルのIDは頻繁に変わります。
+                </>
+              ) : (
+                <>
+                  Used for paragraph image generation. e.g.{" "}
+                  <code>google/gemini-2.5-flash-image</code> (Nano Banana) or
+                  Nano Banana Pro. <strong>Verify exact ids on
+                  openrouter.ai/models</strong> — image model ids change often.
+                </>
+              )
             )}
           </div>
 
           <div>
-            <label className={labelCls}>Editor font</label>
+            <label className={labelCls}>{t("Editor font")}</label>
             <div className="flex items-center gap-4">
               <select
                 value={form.editorFontFamily ?? "serif"}
@@ -475,13 +548,13 @@ export default function SettingsModal() {
                 }
                 className={`${field} w-40`}
               >
-                <option value="serif">Serif</option>
-                <option value="sans">Sans</option>
-                <option value="mono">Mono</option>
+                <option value="serif">{t("Serif")}</option>
+                <option value="sans">{t("Sans")}</option>
+                <option value="mono">{t("Mono")}</option>
               </select>
               <div className="w-44">
                 <label className="block text-xs text-ink-faint">
-                  Size: {form.editorFontSize ?? 17}px
+                  {t("Size")}: {form.editorFontSize ?? 17}px
                 </label>
                 <input
                   type="range"
@@ -504,15 +577,15 @@ export default function SettingsModal() {
               Aa — The quick brown fox / 素早い茶色の狐
             </p>
             <p className="mt-1 text-xs text-ink-faint">
-              Applies to body paragraphs in the editor (提案5 accessibility).
-              Larger sizes help low-vision readers; Sans/Mono can be easier for
-              dyslexic readers.
+              {ja
+                ? "エディタ本文の段落に適用されます。文字を大きくすると弱視の方が読みやすく、Sans/Monoはディスレクシアの方に読みやすい場合があります。"
+                : "Applies to body paragraphs in the editor (提案5 accessibility). Larger sizes help low-vision readers; Sans/Mono can be easier for dyslexic readers."}
             </p>
           </div>
 
           <div className="flex gap-4">
             <div className="flex-1">
-              <label className={labelCls}>Writing tone</label>
+              <label className={labelCls}>{t("Writing tone")}</label>
               <select
                 value={form.writingTone}
                 onChange={(e) => update("writingTone", e.target.value)}
@@ -522,19 +595,21 @@ export default function SettingsModal() {
                 {!WRITING_TONES.some((t) => t.value === form.writingTone) && (
                   <option value={form.writingTone}>{form.writingTone}</option>
                 )}
-                {WRITING_TONES.map((t) => (
-                  <option key={t.label} value={t.value}>
-                    {t.label}
+                {WRITING_TONES.map((tone) => (
+                  <option key={tone.label} value={tone.value}>
+                    {t(tone.label)}
                   </option>
                 ))}
               </select>
               <p className="mt-1 text-xs text-ink-faint">
-                Applied to every writing action (proofread, expand, draft…).
+                {ja
+                  ? "すべての執筆系操作(校正・加筆・下書きなど)に適用されます。"
+                  : "Applied to every writing action (proofread, expand, draft…)."}
               </p>
             </div>
             <div className="w-40">
               <label className={labelCls}>
-                Temperature: {form.temperature.toFixed(1)}
+                {t("Temperature")}: {form.temperature.toFixed(1)}
               </label>
               <input
                 type="range"
@@ -554,14 +629,14 @@ export default function SettingsModal() {
             onClick={closeSettings}
             className="rounded-md px-4 py-2 text-sm text-ink-soft hover:bg-gray-100"
           >
-            Cancel
+            {t("Cancel")}
           </button>
           <button
             onClick={save}
             disabled={saving}
             className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-soft disabled:opacity-50"
           >
-            {saving ? "Saving…" : "Save"}
+            {saving ? t("Saving…") : t("Save")}
           </button>
         </div>
       </div>

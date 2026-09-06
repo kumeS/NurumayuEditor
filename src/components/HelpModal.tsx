@@ -5,6 +5,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { tNow } from "../i18n";
 import { useStore } from "../store";
 import {
   CloseIcon,
@@ -49,6 +50,15 @@ interface HelpContent {
   flowIntro: string;
   steps: HelpStep[]; // exactly 6, paired with STEP_ICONS by index
   tip: string; // contains **bold** markers
+  /**
+   * Ghost-text inline completion (開発.txt Stage 2, item 2-4) — documented
+   * separately from the numbered steps since it's a passive, opt-in-by-
+   * circumstance background behaviour, not a step the user deliberately
+   * triggers. Optional: only English and 日本語 are translated for now (see
+   * the note at HELP_I18N's end); the other languages simply omit this
+   * paragraph rather than guess a translation.
+   */
+  ghostText?: { title: string; body: string };
 }
 
 // Icons for the six workflow steps, shared across all languages (paired by index).
@@ -67,7 +77,7 @@ const STEP_ICONS = [
 // match the app interface, which is English-only.
 const HELP_I18N: Record<HelpLang, HelpContent> = {
   English: {
-    heading: "How to write with NurumayuFacet",
+    heading: "How to write with NurumayuEditor",
     apiTitle: "Before you start — set an API key",
     apiIntro:
       "AI features use any OpenAI-compatible endpoint; the default is OpenRouter, which offers free models.",
@@ -106,10 +116,15 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
     ],
     tip: "Tip: set your **Default language** and **Writing tone** in Settings — every AI action then keeps that language and voice.",
+    ghostText: {
+      title: "Ghost-text suggestions",
+      body:
+        "While your cursor sits at the end of a paragraph, pausing briefly may show a faint grey inline suggestion for how the sentence continues. It only appears when AI is available (an API key set, or a local endpoint) and stays invisible otherwise — no dialog, no toast. Press Tab to accept it, or Escape (or keep typing) to dismiss it. In Settings, “Limit ghost-text completion to a local model” restricts it to a local endpoint only (e.g. Ollama), so it never reaches a remote server unless you choose one.",
+    },
   },
 
   日本語: {
-    heading: "NurumayuFacet で書くには",
+    heading: "NurumayuEditor で書くには",
     apiTitle: "始める前に — API キーを設定する",
     apiIntro:
       "AI 機能は OpenAI-compatible なエンドポイントであればどれでも利用できます。既定では、無料モデルを提供する OpenRouter を使用します。",
@@ -149,10 +164,15 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
     ],
     tip: "ヒント：Settings で **Default language** と **Writing tone** を設定しておくと、以降のすべての AI 操作がその言語と文体を保ちます。",
+    ghostText: {
+      title: "ゴーストテキスト（先読み候補）",
+      body:
+        "段落の末尾にカーソルがある状態で少し手を止めると、文の続きの候補が薄いグレーの文字でカーソルの先に表示されることがあります。これは AI が利用可能なとき（API キーが設定されている、またはローカルのエンドポイントを使っている場合）にだけ現れ、それ以外は何も表示されません — ダイアログもトーストも出ません。Tab キーで候補を確定し、Escape キー（またはそのまま入力を続ける）で消せます。Settings の「Limit ghost-text completion to a local model」を有効にすると、ローカルのエンドポイント（例：Ollama）のときにしか働かなくなり、リモートのサーバーに送られることはなくなります。",
+    },
   },
 
   中文: {
-    heading: "如何使用 NurumayuFacet 写作",
+    heading: "如何使用 NurumayuEditor 写作",
     apiTitle: "开始之前 — 设置 API 密钥",
     apiIntro:
       "AI 功能可使用任何 OpenAI-compatible 端点；默认使用 OpenRouter，它提供免费模型。",
@@ -193,7 +213,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
   },
 
   Español: {
-    heading: "Cómo escribir con NurumayuFacet",
+    heading: "Cómo escribir con NurumayuEditor",
     apiTitle: "Antes de empezar — configura una clave de API",
     apiIntro:
       "Las funciones de IA usan cualquier endpoint compatible con OpenAI; el predeterminado es OpenRouter, que ofrece modelos gratuitos.",
@@ -236,7 +256,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
   },
 
   Français: {
-    heading: "Comment écrire avec NurumayuFacet",
+    heading: "Comment écrire avec NurumayuEditor",
     apiTitle: "Avant de commencer — définissez une clé API",
     apiIntro:
       "Les fonctions d'IA utilisent n'importe quel point de terminaison OpenAI-compatible ; par défaut, il s'agit d'OpenRouter, qui propose des modèles gratuits.",
@@ -276,6 +296,10 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
     ],
     tip: "Astuce : définissez votre **Default language** et votre **Writing tone** dans Settings — chaque action d'IA conserve alors cette langue et ce ton.",
+    // `ghostText` intentionally omitted: only English and 日本語 are translated
+    // for this paragraph so far (see the interface doc comment above) — 中文/
+    // Español/Français readers simply don't see this paragraph rather than
+    // risk an unverified machine translation of a behavioural description.
   },
 };
 
@@ -354,7 +378,7 @@ export default function HelpModal() {
                   userPicked.current = true;
                   setLang(e.target.value as HelpLang);
                 }}
-                aria-label="Help language"
+                aria-label={tNow("Help language")}
                 className="rounded-md border border-gray-300 bg-white py-1 pl-1.5 pr-6 text-sm text-ink-soft hover:bg-gray-50 focus:outline-none focus:ring-1 focus:ring-accent"
               >
                 {HELP_LANGS.map((l) => (
@@ -365,7 +389,7 @@ export default function HelpModal() {
               </select>
             </div>
           </div>
-          <button onClick={close} className="text-ink-faint hover:text-ink" aria-label="Close">
+          <button onClick={close} className="text-ink-faint hover:text-ink" aria-label={tNow("Close")}>
             <CloseIcon />
           </button>
         </div>
@@ -412,6 +436,14 @@ export default function HelpModal() {
               </div>
             </div>
           ))}
+          {t.ghostText && (
+            <div className="rounded-lg border border-gray-100 bg-gray-50/60 p-3">
+              <div className="text-sm font-semibold text-ink">{t.ghostText.title}</div>
+              <p className="mt-0.5 text-sm leading-relaxed text-ink-soft">
+                {t.ghostText.body}
+              </p>
+            </div>
+          )}
           <p className="border-t border-gray-100 pt-3 text-xs text-ink-faint">
             {renderRich(t.tip, openRouter)}
           </p>

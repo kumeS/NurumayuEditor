@@ -1,11 +1,13 @@
 // Transient notifications (errors, confirmations). Auto-dismiss after a delay.
 
 import { useEffect } from "react";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import type { Toast } from "../store";
 import { CloseIcon } from "./icons";
 
 function ToastItem({ toast }: { toast: Toast }) {
+  const t = useT();
   const dismiss = useStore((s) => s.dismissToast);
   useEffect(() => {
     const ms = toast.kind === "error" ? 7000 : 3500;
@@ -28,7 +30,7 @@ function ToastItem({ toast }: { toast: Toast }) {
       <button
         onClick={() => dismiss(toast.id)}
         className="mt-0.5 opacity-60 hover:opacity-100"
-        aria-label="Dismiss"
+        aria-label={t("Dismiss")}
       >
         <CloseIcon className="h-3.5 w-3.5" />
       </button>

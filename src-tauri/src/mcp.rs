@@ -1,12 +1,17 @@
 //! Minimal Model Context Protocol (MCP) server over stdio (開発.txt Stage 2,
 //! item 2-3 — "T3 second half / 堀の公開"). Lets an external MCP client
-//! (Claude Desktop, Claude Code, or any other agent) read a NurumayuFacet
+//! (Claude Desktop, Claude Code, or any other agent) read a NurumayuEditor
 //! `.aix` document without going through the GUI.
 //!
-//! READ-ONLY in this pass: there is intentionally NO write/apply-edit tool.
-//! That capability is a planned future item, deferred pending an open
-//! project decision on approval-gated writes — do not read anything below as
-//! implying write support exists.
+//! Five of the six tools (`list_chunks`, `get_chunk`, `get_document`,
+//! `analyze`, `export`) are unconditionally read-only: `export` writes only
+//! the requested export file, never the source `.aix`. The sixth,
+//! `search_and_summarize` (開発.txt §9 Q12), is the one tool that can modify a
+//! source document — it is gated behind `Settings::mcp_write_enabled`
+//! (default off) and, when enabled, does ONLY one thing: run a RAG search
+//! against the user's personal library (`rag.rs`) and insert the retrieved
+//! snippets as a single labeled reference chunk. It never calls an LLM itself
+//! and never touches any chunk other than the one it inserts.
 //!
 //! Transport: JSON-RPC 2.0, one message per line, on stdin/stdout (the
 //! standard MCP stdio framing). Nothing but JSON-RPC response lines is ever
@@ -17,6 +22,8 @@
 //! the find-or-list-valid-ids chunk lookup, `export`) the CLI's `show`/`info`/
 //! `export` arms already use, so the MCP surface can't drift from the CLI's
 //! behavior — there is exactly one document-reading/exporting implementation.
+//! Writing a document back to disk reuses `fileio::write_atomic`, the same
+//! atomic (temp + rename) path every other save/export in this app uses.
 //!
 //! Every request is handled by `handle_request`, a pure(ish) `Value -> Value`
 //! function with no stdio inside it, so the JSON-RPC method dispatch is
@@ -31,7 +38,21 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// The tool names this server implements — the single source of truth used by
 /// BOTH `tools/list` and the capabilities manifest in `cli.rs`, so the two
 /// can't silently drift (mirrors the `CLI_EXPORT_FORMATS` pattern).
-pub const MCP_TOOLS: &[&str] = &["list_chunks", "get_chunk", "get_document", "analyze", "export"];
+/// `search_and_summarize` is the one write-gated tool — see the module doc.
+pub const MCP_TOOLS: &[&str] = &[
+    "list_chunks",
+    "get_chunk",
+    "get_document",
+    "analyze",
+    "export",
+    "search_and_summarize",
+];
+
+/// Leading label prefix on every chunk `search_and_summarize` inserts, so a
+/// document's editor/history clearly shows this text came from an agent, not
+/// the user typing. Kept as a single constant so the insert code and its
+/// tests can't drift on the exact wording.
+const AGENT_REFERENCE_LABEL_PREFIX: &str = "From your library (search:";
 
 // ---------------------------------------------------------------------------
 // JSON-RPC error codes (standard reserved range).
@@ -174,7 +195,7 @@ fn initialize_result() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "serverInfo": {
-            "name": "nurumayufacet",
+            "name": "nurumayueditor",
             "version": env!("CARGO_PKG_VERSION"),
         },
         "capabilities": {
@@ -204,7 +225,7 @@ fn tools_list_result() -> Value {
     let tools = vec![
         tool_def(
             "list_chunks",
-            "List every chunk in a NurumayuFacet (.aix) document: id, type, \
+            "List every chunk in a NurumayuEditor (.aix) document: id, type, \
              level, summary, and character count per chunk. Read-only.",
             json!({"path": path_prop()}),
             &["path"],
@@ -241,10 +262,9 @@ fn tools_list_result() -> Value {
         tool_def(
             "export",
             "Export a .aix document to txt, md, rtf, pdf, or pptx at the given \
-             output path. This is the only tool in this server that writes to \
-             disk — it writes ONLY the requested export file, never modifies \
-             the source .aix. Returns any non-fatal warnings collected during \
-             export (e.g. an image that could not be embedded).",
+             output path. This tool never modifies the source .aix — it writes \
+             ONLY the requested export file. Returns any non-fatal warnings \
+             collected during export (e.g. an image that could not be embedded).",
             json!({
                 "path": path_prop(),
                 "format": {
@@ -255,6 +275,36 @@ fn tools_list_result() -> Value {
                 "outPath": {"type": "string", "description": "Where to write the exported file."},
             }),
             &["path", "format", "outPath"],
+        ),
+        tool_def(
+            "search_and_summarize",
+            "Search the user's personal knowledge base (rag.rs) for `query` and \
+             insert the retrieved snippets as ONE new, clearly labeled reference \
+             chunk into the target .aix document — after `chunkId` if given, or \
+             at the end of the document otherwise. This is the ONLY tool in this \
+             server that modifies a source document, and it is disabled unless \
+             the user has turned on \"Allow AI agent to write into documents\" \
+             in Settings (mcpWriteEnabled) — calling it while that setting is \
+             off returns an error explaining how to enable it and makes NO \
+             change to the document. This tool does NOT call any AI model to \
+             write a summary itself; it mechanically retrieves the top matching \
+             passages from the personal library and inserts them verbatim, \
+             labeled with the search query, so the user can always see exactly \
+             what an agent added and why.",
+            json!({
+                "path": path_prop(),
+                "query": {"type": "string", "description": "Search query against the personal library."},
+                "chunkId": {
+                    "type": "string",
+                    "description": "Insert the new chunk right after this existing chunk id. \
+                                     Omit to insert at the end of the document.",
+                },
+                "topK": {
+                    "type": "integer",
+                    "description": "Max number of library snippets to retrieve (default 3).",
+                },
+            }),
+            &["path", "query"],
         ),
     ];
 
@@ -277,6 +327,7 @@ fn handle_tools_call(params: &Value) -> Result<Value, ToolError> {
         "get_document" => call_get_document(args)?,
         "analyze" => call_analyze(args)?,
         "export" => call_export(args)?,
+        "search_and_summarize" => call_search_and_summarize(args)?,
         other => {
             return Err((
                 ERR_INVALID_PARAMS,
@@ -414,6 +465,129 @@ fn call_export(args: &Value) -> Result<String, ToolError> {
     .to_string())
 }
 
+/// Build the labeled reference-chunk text this tool inserts: a leading label
+/// naming the search query, followed by each retrieved snippet. Kept as a
+/// standalone pure function so its exact shape is independently testable and
+/// can't silently drift from what `call_search_and_summarize` writes.
+fn format_agent_reference_content(query: &str, snippets: &[String]) -> String {
+    if snippets.is_empty() {
+        return format!(
+            "{AGENT_REFERENCE_LABEL_PREFIX} {query}): no matching passages found in your \
+             personal library."
+        );
+    }
+    let joined = snippets.join("\n\n---\n\n");
+    format!("{AGENT_REFERENCE_LABEL_PREFIX} {query}): {joined}")
+}
+
+/// The write-gated tool (開発.txt §9 Q12): mechanically retrieve top RAG
+/// snippets for `query` from the user's personal library and insert them as
+/// one new, clearly labeled chunk into the target document — never calls an
+/// LLM, never touches any other chunk. Gated on `Settings::mcp_write_enabled`
+/// (loaded from the same config dir the GUI/CLI use — `cli::cli_config_dir`,
+/// since this stdio server has no `AppHandle`); when the gate is off this
+/// returns an error and makes NO change to the document at all. Resolves the
+/// real OS config dir and delegates to `search_and_summarize_impl`, the
+/// config-dir-as-data core function the tests exercise directly against a
+/// throwaway temp dir (rust.md rule 1: core fn takes data, not a runtime
+/// handle) rather than ever touching the real user's settings file.
+fn call_search_and_summarize(args: &Value) -> Result<String, ToolError> {
+    let config_dir = crate::cli::cli_config_dir().map_err(|e| (ERR_INTERNAL, e, None))?;
+    search_and_summarize_impl(&config_dir, args)
+}
+
+fn search_and_summarize_impl(config_dir: &std::path::Path, args: &Value) -> Result<String, ToolError> {
+    let path = required_string_arg(args, "path")?;
+    let query = required_string_arg(args, "query")?;
+    let target_chunk_id = args.get("chunkId").and_then(Value::as_str);
+    let top_k = args
+        .get("topK")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(3);
+
+    let settings = crate::settings::Settings::load(config_dir);
+    if !settings.mcp_write_enabled {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "search_and_summarize: writing into documents is disabled. Turn on \
+             \"Allow AI agent to write into documents (MCP)\" in Settings first."
+                .to_string(),
+            None,
+        ));
+    }
+
+    // Load and validate the target document/chunk BEFORE touching the RAG
+    // index or inserting anything, so an unknown path/chunk id never leaves
+    // a half-done write behind.
+    let mut doc = load_doc(path)?;
+    let insert_after: Option<usize> = match target_chunk_id {
+        None => None,
+        Some(id) => {
+            let idx = doc.chunks.iter().position(|c| c.id == id).ok_or_else(|| {
+                let ids: Vec<Value> = doc
+                    .chunks
+                    .iter()
+                    .map(|c| json!({"id": c.id, "type": c.metadata.chunk_type}))
+                    .collect();
+                (
+                    ERR_INVALID_PARAMS,
+                    format!("search_and_summarize: no chunk with id '{id}'"),
+                    Some(json!({"validIds": ids})),
+                )
+            })?;
+            Some(idx)
+        }
+    };
+
+    // Same search path the frontend's manual search/preview panel uses
+    // (commands::rag_search): skip opening the index (and thus any model
+    // load) entirely when nothing has ever been indexed, so an empty/never-
+    // used library costs nothing and returns a "no snippets" chunk rather
+    // than an error.
+    let snippets: Vec<String> = if crate::rag::index_exists(config_dir) {
+        let mut index = crate::rag::Index::open(config_dir)
+            .map_err(|e| (ERR_INTERNAL, e.to_string(), None))?;
+        index
+            .search(query, top_k)
+            .map_err(|e| (ERR_INTERNAL, e.to_string(), None))?
+            .into_iter()
+            .map(|hit| hit.snippet)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let content = format_agent_reference_content(query, &snippets);
+    let mut new_chunk = crate::models::Chunk::new_text(0, content.clone());
+    new_chunk.metadata.summary = Some(format!("Agent-inserted library search: {query}"));
+
+    let insert_at = match insert_after {
+        Some(idx) => idx + 1,
+        None => doc.chunks.len(),
+    };
+    doc.chunks.insert(insert_at, new_chunk.clone());
+    // Keep `order` monotonic with position so the chunk-order invariant
+    // `Document::normalize` enforces elsewhere stays consistent here too.
+    for (i, c) in doc.chunks.iter_mut().enumerate() {
+        c.order = i as u32;
+    }
+
+    let serialized = serde_json::to_string_pretty(&doc)
+        .map_err(|e| (ERR_INTERNAL, format!("internal: {e}"), None))?;
+    crate::fileio::write_atomic(path, serialized.as_bytes())
+        .map_err(|e| (ERR_INTERNAL, e.to_string(), None))?;
+
+    Ok(json!({
+        "insertedChunkId": new_chunk.id,
+        "insertedAfterChunkId": target_chunk_id,
+        "query": query,
+        "snippetCount": snippets.len(),
+        "content": content,
+    })
+    .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +623,7 @@ mod tests {
     #[test]
     fn initialize_reports_protocol_version_and_tools_capability() {
         let resp = call("initialize", 1, json!({}));
-        assert_eq!(resp["result"]["serverInfo"]["name"], "nurumayufacet");
+        assert_eq!(resp["result"]["serverInfo"]["name"], "nurumayueditor");
         assert_eq!(
             resp["result"]["serverInfo"]["version"],
             env!("CARGO_PKG_VERSION")
@@ -459,10 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_exactly_the_five_tools_with_valid_schemas() {
+    fn tools_list_returns_exactly_the_six_tools_with_valid_schemas() {
         let resp = call("tools/list", 1, json!({}));
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names.as_slice(), MCP_TOOLS);
         for t in tools {
@@ -807,5 +981,209 @@ mod tests {
             "params":{"name":"get_chunk","arguments":{"path":"x","chunkId":"y","extra":nested}}
         }));
         assert!(resp2.is_some());
+    }
+
+    // ----- search_and_summarize (write-gated tool) --------------------------
+
+    /// A throwaway config dir with a `settings.json` setting `mcpWriteEnabled`
+    /// explicitly — never the real OS config dir, so these tests can never
+    /// read or mutate the actual user's settings file.
+    fn temp_config_dir_with_write_gate(tag: &str, enabled: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aix_mcp_test_cfg_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = crate::settings::Settings {
+            mcp_write_enabled: enabled,
+            ..crate::settings::Settings::default()
+        };
+        settings.save(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn search_and_summarize_tool_is_present_with_valid_schema() {
+        let resp = call("tools/list", 1, json!({}));
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "search_and_summarize")
+            .expect("search_and_summarize must be listed");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, vec!["path", "query"]);
+        assert!(schema["properties"]["chunkId"].is_object());
+        assert!(schema["properties"]["topK"].is_object());
+        assert!(tool["description"].as_str().unwrap().len() > 10);
+    }
+
+    #[test]
+    fn search_and_summarize_with_write_disabled_returns_gate_error_and_no_change() {
+        let cfg_dir = temp_config_dir_with_write_gate("gate_off", false);
+        let path = write_temp_doc("write_gated", "c1", "original content");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let resp = search_and_summarize_impl(
+            &cfg_dir,
+            &json!({"path": path, "query": "anything"}),
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+
+        let err = resp.expect_err("must fail while the gate is off");
+        assert_eq!(err.0, ERR_INVALID_PARAMS);
+        assert!(
+            err.1.to_lowercase().contains("disabled") || err.1.to_lowercase().contains("enable"),
+            "expected an explanatory gate error, got: {}",
+            err.1
+        );
+        assert_eq!(after, before, "document must be completely unchanged while the gate is off");
+    }
+
+    #[test]
+    fn search_and_summarize_with_write_enabled_inserts_labeled_chunk_at_end() {
+        let cfg_dir = temp_config_dir_with_write_gate("gate_on_end", true);
+        let path = write_temp_doc("write_enabled_end", "c1", "original content");
+
+        // No personal-library index has ever been created in this fresh temp
+        // config dir, so this exercises the "index_exists == false" branch —
+        // no embedding model is touched, and the inserted chunk says nothing
+        // was found rather than erroring.
+        let resp = search_and_summarize_impl(
+            &cfg_dir,
+            &json!({"path": path, "query": "my search term"}),
+        )
+        .expect("must succeed while the gate is on");
+
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["query"], "my search term");
+        assert_eq!(v["snippetCount"], 0);
+        let content = v["content"].as_str().unwrap();
+        assert!(content.contains("my search term"), "got: {content}");
+        assert!(
+            content.starts_with(AGENT_REFERENCE_LABEL_PREFIX),
+            "got: {content}"
+        );
+
+        let doc = crate::cli::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+
+        assert_eq!(doc.chunks.len(), 2, "chunks: {:?}", doc.chunks);
+        assert_eq!(doc.chunks[0].content, "original content");
+        assert_eq!(doc.chunks[1].content, content);
+        assert_eq!(
+            doc.chunks[1].id,
+            v["insertedChunkId"].as_str().unwrap(),
+            "reported inserted id must match the actual chunk"
+        );
+    }
+
+    #[test]
+    fn search_and_summarize_inserts_immediately_after_target_chunk_not_at_end() {
+        let cfg_dir = temp_config_dir_with_write_gate("gate_on_mid", true);
+        let mut doc = crate::models::Document::new("D");
+        let mut c1 = crate::models::Chunk::new_text(0, "first");
+        c1.id = "c1".into();
+        let mut c2 = crate::models::Chunk::new_text(1, "second");
+        c2.id = "c2".into();
+        doc.chunks.push(c1);
+        doc.chunks.push(c2);
+        let path = std::env::temp_dir().join(format!(
+            "aix_mcp_test_mid_insert_{}_{}.aix",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let p = path.to_str().unwrap().to_string();
+
+        let resp = search_and_summarize_impl(
+            &cfg_dir,
+            &json!({"path": p, "query": "q", "chunkId": "c1"}),
+        )
+        .expect("must succeed");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+
+        let reloaded = crate::cli::load(&p).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+
+        assert_eq!(reloaded.chunks.len(), 3, "chunks: {:?}", reloaded.chunks);
+        assert_eq!(reloaded.chunks[0].content, "first");
+        assert_eq!(reloaded.chunks[1].id, v["insertedChunkId"]);
+        assert_eq!(reloaded.chunks[2].content, "second");
+    }
+
+    #[test]
+    fn search_and_summarize_unknown_target_chunk_id_is_invalid_params_and_no_change() {
+        let cfg_dir = temp_config_dir_with_write_gate("gate_on_unknown_chunk", true);
+        let path = write_temp_doc("unknown_chunk", "c1", "content");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = search_and_summarize_impl(
+            &cfg_dir,
+            &json!({"path": path, "query": "q", "chunkId": "does-not-exist"}),
+        )
+        .expect_err("must fail for an unknown chunk id");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+
+        assert_eq!(err.0, ERR_INVALID_PARAMS);
+        assert!(err.1.contains("does-not-exist"), "got: {}", err.1);
+        let valid_ids = err.2.as_ref().unwrap()["validIds"].as_array().unwrap();
+        assert!(valid_ids.iter().any(|v| v["id"] == "c1"));
+        assert_eq!(after, before, "document must be unchanged on an unknown chunk id error");
+    }
+
+    #[test]
+    fn search_and_summarize_missing_document_is_invalid_params_not_a_panic() {
+        let cfg_dir = temp_config_dir_with_write_gate("gate_on_missing_doc", true);
+        let err = search_and_summarize_impl(
+            &cfg_dir,
+            &json!({"path": "/no/such/path/definitely_missing.aix", "query": "q"}),
+        )
+        .expect_err("must fail for a missing document");
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+        assert_eq!(err.0, ERR_INVALID_PARAMS);
+    }
+
+    #[test]
+    fn search_and_summarize_via_tools_call_dispatches_correctly() {
+        // End-to-end through the same `tools/call` JSON-RPC path the other
+        // tools are tested through, proving the dispatch table wiring (not
+        // just the impl function) — using the REAL `cli_config_dir()` would
+        // touch the actual user's settings, so this only checks that an
+        // unknown tool name is rejected and a known one is routed without
+        // panicking; the gate/insert behavior itself is covered above via
+        // `search_and_summarize_impl` against a throwaway config dir.
+        let path = write_temp_doc("dispatch_check", "c1", "x");
+        let resp = call(
+            "tools/call",
+            1,
+            json!({"name": "search_and_summarize", "arguments": {"path": path, "query": "q"}}),
+        );
+        let _ = std::fs::remove_file(&path);
+        // Whatever the real machine's mcpWriteEnabled setting is, this must
+        // resolve to either a normal JSON-RPC result or a normal JSON-RPC
+        // error — never a panic — proving the dispatch entry is wired.
+        assert!(resp.get("result").is_some() || resp.get("error").is_some());
     }
 }

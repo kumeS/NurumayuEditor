@@ -4,6 +4,7 @@
 
 import cytoscape from "cytoscape";
 import { useEffect, useMemo, useRef } from "react";
+import { useT } from "../i18n";
 import { pruneAnalysis, useStore } from "../store";
 import { analyzeDocument } from "../aiActions";
 import { CloseIcon, NetworkIcon, SpinnerIcon } from "./icons";
@@ -52,6 +53,7 @@ function nodeChunkId(node: cytoscape.NodeSingular): string {
 }
 
 export default function NetworkPanel() {
+  const t = useT();
   const analysis = useStore((s) => s.analysis);
   const analysisStale = useStore((s) => s.analysisStale);
   const globalBusy = useStore((s) => s.globalBusy);
@@ -309,7 +311,7 @@ export default function NetworkPanel() {
           {!isEmpty && analysisStale && (
             <span
               className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
-              title="The document changed since this graph was built — click Refresh to re-analyze."
+              title={t("The document changed since this graph was built — click Refresh to re-analyze.")}
             >
               out of date
             </span>
@@ -332,22 +334,22 @@ export default function NetworkPanel() {
                 : "text-ink-soft"
             }`}
             disabled={!!globalBusy}
-            title="Re-analyze document"
+            title={t("Re-analyze document")}
           >
-            Refresh
+            {t("Refresh")}
           </button>
           <button
             onClick={relayout}
             className="rounded px-2 py-1 text-xs text-ink-soft hover:bg-gray-100"
             disabled={isEmpty}
-            title="Re-layout graph"
+            title={t("Re-layout graph")}
           >
-            Re-layout
+            {t("Re-layout")}
           </button>
           <button
             onClick={() => toggleNetwork(false)}
             className="rounded p-1 text-ink-faint hover:bg-gray-100 hover:text-ink"
-            aria-label="Close panel"
+            aria-label={t("Close panel")}
           >
             <CloseIcon />
           </button>
@@ -385,7 +387,7 @@ export default function NetworkPanel() {
       </div>
 
       <div className="border-t border-gray-100 px-3 py-2 text-xs text-ink-faint">
-        Tap a node to jump to its paragraph; tap an edge to flash both ends.
+        {t("Tap a node to jump to its paragraph; tap an edge to flash both ends.")}
       </div>
     </aside>
   );

@@ -3,28 +3,30 @@
 //! WITHOUT the GUI, reusing the exact same pure backend functions the Tauri
 //! commands call. This loop covers the offline, network-free operations
 //! (inspect, convert, self-describe) plus the AI verbs (run/analyze/draft);
-//! the MCP wrapper (`mcp` subcommand, see `mcp.rs`) is a READ-ONLY stdio
-//! server for external agent clients — write/apply-edit is a still-open,
-//! deliberately deferred future item, not built here.
+//! the MCP wrapper (`mcp` subcommand, see `mcp.rs`) exposes five read-only
+//! tools plus one write-gated tool (`search_and_summarize`, off unless the
+//! user enables `Settings::mcp_write_enabled`) — see `mcp.rs`'s module doc
+//! for exactly what each tool can and can't do.
 //!
 //! Recognized invocations (a non-subcommand first arg returns `None` so a normal
 //! GUI launch — which may carry OS-injected args — is never hijacked):
-//!   nurumayufacet capabilities            self-describing JSON manifest
-//!   nurumayufacet info <file.aix> [--json]  document structure (ids/types/summaries)
-//!   nurumayufacet show <file.aix> <chunkId>  print one chunk's raw content
-//!   nurumayufacet export <in.aix> <out.{txt,md,rtf,pdf,pptx}>
-//!   nurumayufacet ai <verb> <file.aix> <chunkId> [instruction] [--json]
+//!   nurumayueditor capabilities            self-describing JSON manifest
+//!   nurumayueditor info <file.aix> [--json]  document structure (ids/types/summaries)
+//!   nurumayueditor show <file.aix> <chunkId>  print one chunk's raw content
+//!   nurumayueditor export <in.aix> <out.{txt,md,rtf,pdf,pptx}>
+//!   nurumayueditor ai <verb> <file.aix> <chunkId> [instruction] [--json]
 //!       runs one AI action (translate/proofread/summarize/expand/detailed/
 //!       concentrate/focus/harmonize/custom) against a single chunk and prints
 //!       the result. READ-ONLY: never writes back to the source file (a
 //!       future capability) — this pass only reads and prints.
-//!   nurumayufacet mcp
-//!       runs a minimal READ-ONLY Model Context Protocol server over stdio
-//!       (JSON-RPC 2.0, newline-delimited) for external MCP clients (Claude
-//!       Desktop, Claude Code, etc). See `mcp.rs` for the tool list and
-//!       protocol details. No file path here — each tool call carries its
-//!       own document path.
-//!   nurumayufacet help
+//!   nurumayueditor mcp
+//!       runs a minimal Model Context Protocol server over stdio (JSON-RPC
+//!       2.0, newline-delimited) for external MCP clients (Claude Desktop,
+//!       Claude Code, etc). Five tools are read-only; one (`search_and_summarize`)
+//!       can write into a document and is off by default. See `mcp.rs` for
+//!       the tool list and protocol details. No file path here — each tool
+//!       call carries its own document path.
+//!   nurumayueditor help
 
 use crate::ai::{self, AiRequest, LlmConfig};
 use crate::models::Document;
@@ -67,7 +69,7 @@ pub fn try_run() -> Option<i32> {
     let code = match run(cmd, &args[1..]) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("nurumayufacet: {e}");
+            eprintln!("nurumayueditor: {e}");
             1
         }
     };
@@ -208,6 +210,10 @@ fn prepare_ai_request(rest: &[String]) -> Result<AiInvocation, String> {
         section_heading: None,
         document_map: None,
         linked_content: None,
+        // The CLI/agent verb surface has no frontend-side personal-library
+        // search to draw on (that assembly lives in aiActions.ts); it always
+        // runs ungrounded.
+        rag_snippets: Vec::new(),
     };
 
     Ok(AiInvocation {
@@ -261,8 +267,10 @@ fn load_cli_llm_config() -> Result<LlmConfig, String> {
 /// The same per-OS config directory Tauri's `AppHandle::path().app_config_dir()`
 /// resolves to (`<OS config dir>/<bundle identifier>`), computed without an
 /// `AppHandle` — none exists outside the GUI. Kept in lockstep with
-/// `tauri.conf.json`'s `identifier`.
-fn cli_config_dir() -> Result<std::path::PathBuf, String> {
+/// `tauri.conf.json`'s `identifier`. `pub(crate)` so `mcp.rs`'s write-gated
+/// tool can resolve the same `Settings` the CLI/GUI would, since the MCP
+/// stdio server also runs with no `AppHandle`.
+pub(crate) fn cli_config_dir() -> Result<std::path::PathBuf, String> {
     const BUNDLE_IDENTIFIER: &str = "com.aix.texteditor";
     dirs::config_dir()
         .map(|d| d.join(BUNDLE_IDENTIFIER))
@@ -361,21 +369,21 @@ pub(crate) fn export(doc: &Document, output: &str) -> Result<Vec<String>, String
 /// so `mcp.rs`'s contract test can assert its tool list matches this manifest.
 pub(crate) fn capabilities_json() -> String {
     serde_json::json!({
-        "app": "NurumayuFacet",
+        "app": "NurumayuEditor",
         "version": env!("CARGO_PKG_VERSION"),
         "aixSchemaVersion": 1,
         "aiActions": CLI_AI_ACTIONS,
         // Both surfaces can run an AI action now: the GUI's one-click buttons,
-        // and `nurumayufacet ai <verb> <file.aix> <chunkId>` from a script or
+        // and `nurumayueditor ai <verb> <file.aix> <chunkId>` from a script or
         // agent. An array (not the old plain "gui" string) so a script consumer
         // can tell both are live rather than silently misreading a renamed enum.
         "aiActionsRunVia": ["gui", "cli"],
         "chunkTypes": ["text", "heading", "diagram", "image"],
         "exportFormats": CLI_EXPORT_FORMATS,
-        // Read-only MCP stdio server (`nurumayufacet mcp`) — see mcp.rs. No
-        // write/apply-edit tool yet; that's a planned future capability
-        // pending an approval-gated-writes decision, deliberately not listed
-        // here as if it existed.
+        // MCP stdio server (`nurumayueditor mcp`) — see mcp.rs. Five of the six
+        // listed tools are read-only; `search_and_summarize` can write a
+        // labeled reference chunk into a document but only when the user has
+        // opted in via `Settings::mcp_write_enabled` (off by default).
         "mcp": { "tools": crate::mcp::MCP_TOOLS },
         "cli": ["capabilities", "info", "show", "export", "ai", "mcp", "help"]
     })
@@ -428,14 +436,14 @@ fn print_info(doc: &Document) {
 
 fn print_usage() {
     eprintln!(
-        "nurumayufacet — headless CLI\n\
+        "nurumayueditor — headless CLI\n\
          \n\
          USAGE:\n\
-         \tnurumayufacet capabilities                 self-describing JSON manifest\n\
-         \tnurumayufacet info <file.aix> [--json]     document structure\n\
-         \tnurumayufacet show <file.aix> <chunkId>    print one chunk's raw content\n\
-         \tnurumayufacet export <in.aix> <out.ext>    ext = txt | md | rtf | pdf | pptx\n\
-         \tnurumayufacet ai <verb> <file.aix> <chunkId> [instruction] [--json]\n\
+         \tnurumayueditor capabilities                 self-describing JSON manifest\n\
+         \tnurumayueditor info <file.aix> [--json]     document structure\n\
+         \tnurumayueditor show <file.aix> <chunkId>    print one chunk's raw content\n\
+         \tnurumayueditor export <in.aix> <out.ext>    ext = txt | md | rtf | pdf | pptx\n\
+         \tnurumayueditor ai <verb> <file.aix> <chunkId> [instruction] [--json]\n\
          \t                                           run one AI action on a chunk\n\
          \t                                           verb = translate | proofread | summarize |\n\
          \t                                                  expand | detailed | concentrate |\n\
@@ -447,12 +455,13 @@ fn print_usage() {
          \t                                           READ-ONLY: prints the result; never writes\n\
          \t                                           back to <file.aix> (planned, not built yet).\n\
          \t                                           --json wraps the result as {{chunkId,action,result}}.\n\
-         \tnurumayufacet mcp                          run a read-only MCP stdio server\n\
-         \t                                           (JSON-RPC 2.0, one message per line) for\n\
-         \t                                           external agent clients. No write/apply-edit\n\
-         \t                                           tool yet (planned, pending an approval-gating\n\
-         \t                                           decision) — see `mcp.rs` for the tool list.\n\
-         \tnurumayufacet help\n\
+         \tnurumayueditor mcp                          run an MCP stdio server (JSON-RPC 2.0, one\n\
+         \t                                           message per line) for external agent clients.\n\
+         \t                                           5 read-only tools + 1 write-gated tool\n\
+         \t                                           (search_and_summarize, off by default —\n\
+         \t                                           enable \"mcpWriteEnabled\" in Settings) — see\n\
+         \t                                           `mcp.rs` for the tool list.\n\
+         \tnurumayueditor help\n\
          \n\
          Run with no arguments to launch the GUI."
     );
@@ -681,6 +690,7 @@ mod tests {
                 section_heading: None,
                 document_map: None,
                 linked_content: None,
+                rag_snippets: Vec::new(),
             },
             chunk_id: "c1".to_string(),
             as_json: true,
@@ -716,6 +726,7 @@ mod tests {
                 section_heading: None,
                 document_map: None,
                 linked_content: None,
+                rag_snippets: Vec::new(),
             },
             chunk_id: "c1".to_string(),
             as_json: false,

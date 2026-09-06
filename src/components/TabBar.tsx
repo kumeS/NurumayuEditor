@@ -7,12 +7,15 @@
 
 import { confirmDiscard } from "../confirm";
 import { useStore } from "../store";
+import { useT } from "../i18n";
 import type { DocMode } from "../types";
 import { CloseIcon, FileIcon, PlusIcon, SlidesIcon } from "./icons";
 
 function ModeIcon({ mode }: { mode: DocMode }) {
   return mode === "slide" ? (
     <SlidesIcon className="h-3.5 w-3.5 shrink-0 text-accent/80" />
+  ) : mode === "markdown" ? (
+    <span className="shrink-0 font-mono text-[9px] font-semibold text-accent">MD</span>
   ) : (
     <FileIcon className="h-3.5 w-3.5 shrink-0 text-ink-faint" />
   );
@@ -28,9 +31,10 @@ export default function TabBar() {
   const switchTab = useStore((s) => s.switchTab);
   const closeTab = useStore((s) => s.closeTab);
   const newTab = useStore((s) => s.newTab);
+  const t = useT();
 
   const titleOf = (id: string) =>
-    (id === activeTabId ? activeTitle : inactiveTabs[id]?.doc.title) || "Untitled";
+    (id === activeTabId ? activeTitle : inactiveTabs[id]?.doc.title) || t("Untitled");
   const dirtyOf = (id: string) =>
     id === activeTabId ? activeDirty : !!inactiveTabs[id]?.dirty;
   const modeOf = (id: string): DocMode =>
@@ -56,7 +60,13 @@ export default function TabBar() {
             <button
               onClick={() => switchTab(id)}
               className="flex items-center gap-1.5 truncate outline-none"
-              title={`${titleOf(id)} — ${modeOf(id) === "slide" ? "Slides" : "Editor"}`}
+              title={`${titleOf(id)} — ${
+                modeOf(id) === "slide"
+                  ? t("Slides")
+                  : modeOf(id) === "markdown"
+                    ? t("Markdown")
+                    : t("Editor")
+              }`}
             >
               <ModeIcon mode={modeOf(id)} />
               <span className="truncate">
@@ -68,8 +78,8 @@ export default function TabBar() {
               <button
                 onClick={() => void onClose(id)}
                 className="shrink-0 rounded p-0.5 text-ink-faint opacity-0 transition-opacity hover:bg-gray-200 hover:text-ink group-hover:opacity-100"
-                aria-label="Close tab"
-                title="Close tab"
+                aria-label={t("Close tab")}
+                title={t("Close tab")}
               >
                 <CloseIcon className="h-3 w-3" />
               </button>
@@ -82,8 +92,8 @@ export default function TabBar() {
       <button
         onClick={() => newTab("editor")}
         className="shrink-0 rounded-md p-1 text-ink-faint hover:bg-white hover:text-ink"
-        title="New tab"
-        aria-label="New tab"
+        title={t("New tab")}
+        aria-label={t("New tab")}
       >
         <PlusIcon className="h-4 w-4" />
       </button>

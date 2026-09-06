@@ -8,6 +8,7 @@ import { analyzeDocument } from "../aiActions";
 import { api } from "../api";
 import { chunksOverCharLimit } from "../charLimitWarnings";
 import { documentDiff } from "../diff";
+import { useLang, useT } from "../i18n";
 import { staleSummaryChunkIds, useStore } from "../store";
 import type { NetworkStats } from "../types";
 import CitationsPanel from "./CitationsPanel";
@@ -26,12 +27,18 @@ function countWords(text: string): number {
   return cjk + latin;
 }
 
-function relative(ts: number): string {
+function relative(ts: number, ja = false): string {
   const d = Date.now() - ts;
-  if (d < 60_000) return "just now";
-  if (d < 3_600_000) return `${Math.floor(d / 60_000)} min ago`;
-  if (d < 86_400_000) return `${Math.floor(d / 3_600_000)} h ago`;
-  return new Date(ts).toLocaleDateString();
+  if (d < 60_000) return ja ? "たった今" : "just now";
+  if (d < 3_600_000) {
+    const m = Math.floor(d / 60_000);
+    return ja ? `${m}分前` : `${m} min ago`;
+  }
+  if (d < 86_400_000) {
+    const h = Math.floor(d / 3_600_000);
+    return ja ? `${h}時間前` : `${h} h ago`;
+  }
+  return new Date(ts).toLocaleDateString(ja ? "ja-JP" : undefined);
 }
 
 export default function HealthBar() {
@@ -41,6 +48,8 @@ export default function HealthBar() {
   const analysisStale = useStore((s) => s.analysisStale);
   const globalBusy = useStore((s) => s.globalBusy);
   const speaking = useStore((s) => s.speakingChunkId !== null);
+  const t = useT();
+  const ja = useLang() === "ja";
   const lastExportReport = useStore((s) => s.lastExportReport);
   const doc = useStore((s) => s.doc);
   const savedDoc = useStore((s) => s.savedDoc);
@@ -105,13 +114,15 @@ export default function HealthBar() {
   return (
     <div className="relative flex h-7 shrink-0 items-center border-t border-gray-200 bg-gray-50/80 px-2 text-[11px] text-ink-faint">
       {/* Save state */}
-      <span className={item} title={dirty ? "Unsaved changes (⌘S to save)" : "All changes saved"}>
+      <span className={item} title={dirty ? t("Unsaved changes (⌘S to save)") : t("All changes saved")}>
         <span className={`h-1.5 w-1.5 rounded-full ${dirty ? "bg-amber-400" : "bg-emerald-500"}`} />
-        {dirty ? "Unsaved" : "Saved"}
+        {dirty ? t("Unsaved") : t("Saved")}
       </span>
 
       <span className={item}>
-        {chunks.length} paragraph{chunks.length === 1 ? "" : "s"} · ~{words} words
+        {ja
+          ? `${chunks.length}段落 · 約${words}語`
+          : `${chunks.length} paragraph${chunks.length === 1 ? "" : "s"} · ~${words} words`}
       </span>
 
       {/* "Changes since last save" (item 1-2): the at-a-glance weekly-progress
@@ -120,10 +131,14 @@ export default function HealthBar() {
       <button
         onClick={() => toggleDiffPanel()}
         className={`${item} rounded hover:bg-gray-200/70 ${changedCount > 0 ? "text-amber-600" : ""}`}
-        title="Show paragraphs added, removed, or changed since the document was last saved"
+        title={t("Show paragraphs added, removed, or changed since the document was last saved")}
       >
         <HistoryIcon className="h-3 w-3" />
-        {changedCount > 0 ? `${changedCount} changed since last save` : "No changes since last save"}
+        {changedCount > 0
+          ? ja
+            ? `前回保存から${changedCount}件変更`
+            : `${changedCount} changed since last save`
+          : t("No changes since last save")}
       </button>
 
       {/* AI understanding freshness (ズレ②): when was Analyze last run, is the
@@ -136,23 +151,25 @@ export default function HealthBar() {
         title={
           analysis
             ? analysisStale
-              ? "The document changed since the last Analyze — click to re-analyze"
-              : "Relationship graph is up to date — click to re-analyze"
-            : "Not analyzed yet — click to analyze relationships"
+              ? t("The document changed since the last Analyze — click to re-analyze")
+              : t("Relationship graph is up to date — click to re-analyze")
+            : t("Not analyzed yet — click to analyze relationships")
         }
       >
         {analysis
-          ? `AI: analyzed ${analyzedAt ? relative(analyzedAt) : "earlier"}${
-              analysisStale ? " · out of date" : ""
-            }`
-          : "AI: not analyzed"}
+          ? ja
+            ? `AI: ${analyzedAt ? relative(analyzedAt, true) : "以前"}に分析${analysisStale ? " · 最新ではありません" : ""}`
+            : `AI: analyzed ${analyzedAt ? relative(analyzedAt) : "earlier"}${
+                analysisStale ? " · out of date" : ""
+              }`
+          : t("AI: not analyzed")}
       </button>
       {staleCount > 0 && (
         <span
           className={`${item} text-amber-600`}
-          title="These paragraph summaries no longer match their text; they refresh automatically before the next AI action."
+          title={t("These paragraph summaries no longer match their text; they refresh automatically before the next AI action.")}
         >
-          {staleCount} stale summar{staleCount === 1 ? "y" : "ies"}
+          {ja ? `要約${staleCount}件が古い状態` : `${staleCount} stale summar${staleCount === 1 ? "y" : "ies"}`}
         </span>
       )}
 
@@ -170,17 +187,23 @@ export default function HealthBar() {
             overLimitChunks.length === 1 ? "" : "s"
           } over the ${settings?.charLimitWarning}-character limit set in Settings — click to list them`}
         >
-          {overLimitChunks.length} paragraph{overLimitChunks.length === 1 ? "" : "s"} over limit
+          {ja
+            ? `${overLimitChunks.length}段落が文字数超過`
+            : `${overLimitChunks.length} paragraph${overLimitChunks.length === 1 ? "" : "s"} over limit`}
         </button>
       )}
       {showCharLimit && overLimitChunks.length > 0 && (
         <div className="absolute bottom-8 left-2 z-40 w-80 rounded-lg border border-gray-200 bg-white p-3 shadow-xl">
           <div className="mb-1 flex items-center justify-between text-xs font-semibold text-ink">
-            <span>Over the {settings?.charLimitWarning}-character limit</span>
+            <span>
+              {ja
+                ? `${settings?.charLimitWarning}文字の上限を超過`
+                : `Over the ${settings?.charLimitWarning}-character limit`}
+            </span>
             <button
               onClick={() => setShowCharLimit(false)}
               className="text-ink-faint hover:text-ink"
-              aria-label="Close over-limit paragraph list"
+              aria-label={t("Close over-limit paragraph list")}
             >
               ×
             </button>
@@ -198,9 +221,9 @@ export default function HealthBar() {
                       setShowCharLimit(false);
                     }}
                     className="w-full rounded px-2 py-1 text-left text-xs text-ink-soft hover:bg-amber-50"
-                    title="Jump to this paragraph"
+                    title={t("Jump to this paragraph")}
                   >
-                    <span className="font-medium text-amber-600">{oc.count} chars</span> —{" "}
+                    <span className="font-medium text-amber-600">{ja ? `${oc.count}文字` : `${oc.count} chars`}</span> —{" "}
                     {preview}
                     {(c?.content.trim().length ?? 0) > 60 ? "…" : ""}
                   </button>
@@ -218,15 +241,17 @@ export default function HealthBar() {
       {netStats && (
         <span
           className={item}
-          title="Network calls made this session: LLM requests (ai.rs) and reference/image fetches (net.rs's guarded safe_fetch) are counted separately. Nothing else leaves this machine."
+          title={t("Network calls made this session: LLM requests (ai.rs) and reference/image fetches (net.rs's guarded safe_fetch) are counted separately. Nothing else leaves this machine.")}
         >
-          External calls: {netStats.aiCalls} AI · {netStats.fetchCalls} fetch
+          {ja
+            ? `外部通信: AI ${netStats.aiCalls}件 · 取得 ${netStats.fetchCalls}件`
+            : `External calls: ${netStats.aiCalls} AI · ${netStats.fetchCalls} fetch`}
         </span>
       )}
 
       <span className="flex-1" />
 
-      {speaking && <span className={`${item} text-accent`}>Reading aloud…</span>}
+      {speaking && <span className={`${item} text-accent`}>{t("Reading aloud…")}</span>}
       {globalBusy && <span className={`${item} text-accent`}>{globalBusy}</span>}
 
       {diffPanelOpen && (
@@ -242,21 +267,23 @@ export default function HealthBar() {
           className={`${item} rounded hover:bg-gray-200/70 ${
             lastExportReport.warnings.length ? "text-amber-600" : ""
           }`}
-          title="Details of the most recent export"
+          title={t("Details of the most recent export")}
         >
-          Export ({lastExportReport.format.toUpperCase()}):{" "}
+          {t("Export")} ({lastExportReport.format.toUpperCase()}):{" "}
           {lastExportReport.warnings.length
-            ? `${lastExportReport.warnings.length} warning${
-                lastExportReport.warnings.length === 1 ? "" : "s"
-              }`
-            : "clean"}
+            ? ja
+              ? `警告${lastExportReport.warnings.length}件`
+              : `${lastExportReport.warnings.length} warning${
+                  lastExportReport.warnings.length === 1 ? "" : "s"
+                }`
+            : t("clean")}
         </button>
       )}
       {showWarnings && lastExportReport && (
         <div className="absolute bottom-8 right-2 z-40 w-96 rounded-lg border border-gray-200 bg-white p-3 shadow-xl">
           <div className="mb-1 flex items-center justify-between text-xs font-semibold text-ink">
             <span>
-              Last export — {lastExportReport.format.toUpperCase()} (
+              {t("Last export")} — {lastExportReport.format.toUpperCase()} (
               {relative(lastExportReport.at)})
             </span>
             <button
@@ -267,7 +294,7 @@ export default function HealthBar() {
             </button>
           </div>
           {lastExportReport.warnings.length === 0 ? (
-            <p className="text-xs text-ink-soft">No warnings — nothing was omitted.</p>
+            <p className="text-xs text-ink-soft">{t("No warnings — nothing was omitted.")}</p>
           ) : (
             <ul className="list-disc space-y-1 pl-4 text-xs text-ink-soft">
               {lastExportReport.warnings.map((w, i) => (

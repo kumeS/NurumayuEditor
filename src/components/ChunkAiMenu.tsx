@@ -8,6 +8,7 @@ import {
   generateDiagramFromChunk,
   generatePresentationFromChunk,
 } from "../aiActions";
+import { useT } from "../i18n";
 import { staleSummaryChunkIds, useStore } from "../store";
 import type { ChunkType } from "../types";
 import { promptDialog } from "./PromptModal";
@@ -19,6 +20,7 @@ import {
   ExpandIcon,
   FlowIcon,
   FocusIcon,
+  HistoryIcon,
   ImageIcon,
   LanguagesIcon,
   SparklesIcon,
@@ -54,6 +56,7 @@ interface Props {
 }
 
 export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const defaultLang = useStore((s) => s.settings?.defaultTargetLanguage ?? "English");
@@ -89,11 +92,11 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   const onTranslate = async () => {
     close();
     const lang = await promptDialog({
-      title: "Translate paragraph",
-      label: "Target language",
+      title: t("Translate paragraph"),
+      label: t("Target language"),
       defaultValue: defaultLang,
       placeholder: "e.g. English, Japanese, French",
-      submitLabel: "Translate",
+      submitLabel: t("Translate"),
     });
     if (lang === null) return;
     await runChunkAction(chunkId, "translate", { targetLanguage: lang });
@@ -102,12 +105,12 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   const onProofread = async () => {
     close();
     const style = await promptDialog({
-      title: "Proofread",
-      label: "Pick a style to rewrite toward (or type your own):",
+      title: t("Proofread"),
+      label: t("Pick a style to rewrite toward (or type your own):"),
       presets: PROOFREAD_STYLES,
       defaultValue: "",
       placeholder: "e.g. concise and formal",
-      submitLabel: "Proofread",
+      submitLabel: t("Proofread"),
     });
     if (style === null) return;
     // Blank → backend default (scholarly/academic).
@@ -157,11 +160,11 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   const onDiagram = async () => {
     close();
     const instruction = await promptDialog({
-      title: "Generate diagram",
-      label: "Optional guidance for the diagram (leave blank for automatic)",
+      title: t("Generate diagram"),
+      label: t("Optional guidance for the diagram (leave blank for automatic)"),
       defaultValue: "",
       placeholder: "e.g. as a flowchart of the process",
-      submitLabel: "Generate",
+      submitLabel: t("Generate"),
     });
     if (instruction === null) return;
     await generateDiagramFromChunk(chunkId, instruction || undefined);
@@ -170,8 +173,8 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   const onCustom = async () => {
     close();
     const instruction = await promptDialog({
-      title: "Custom AI instruction",
-      label: "Describe what the AI should do with this paragraph",
+      title: t("Custom AI instruction"),
+      label: t("Describe what the AI should do with this paragraph"),
       placeholder: "e.g. Rewrite this for a general audience",
       multiline: true,
       submitLabel: "Run",
@@ -185,6 +188,13 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   // 提案4: the same boxed-cluster pattern as the SlideEditor design group — a
   // bordered rounded box with a tiny uppercase label per action family.
   const group = "rounded-md border border-gray-200 bg-gray-50/60 p-1";
+  // Bulletize's group (below): same shape as `group`, but an amber tint marks
+  // it as the one action here that restructures the paragraph immediately
+  // with no reviewable diff — matching this app's existing amber = "needs
+  // attention" convention (HealthBar, DiffPanel's "Changed" section,
+  // CriteriaPanel's uncovered rows). A distinct class string, not `group`
+  // plus overrides, so there's no same-specificity border/bg clash.
+  const warnGroup = "rounded-md border border-amber-200/70 bg-amber-50/40 p-1";
   const groupLabel =
     "px-2 pb-0.5 pt-1 text-[10px] font-semibold uppercase tracking-wider text-ink-faint";
 
@@ -210,9 +220,9 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
 
   return (
     <div ref={rootRef} className="relative">
-      <Tooltip label={isHeading ? "AI actions for this heading" : "AI actions for this paragraph"}>
+      <Tooltip label={isHeading ? t("AI actions for this heading") : t("AI actions for this paragraph")}>
         <button
-          aria-label="AI actions"
+          aria-label={t("AI actions")}
           onClick={() => setOpen((v) => !v)}
           className={`flex h-7 w-7 items-center justify-center rounded-full text-ink-faint transition-colors hover:bg-accent/10 hover:text-accent ${
             open ? "bg-accent/10 text-accent" : ""
@@ -227,57 +237,64 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
           {isText && (
             <div className="space-y-1">
               <div className={group}>
-                <div className={groupLabel}>Rewrite</div>
+                <div className={groupLabel}>{t("Rewrite")}</div>
                 <button className={item} onClick={onExpand}>
-                  <ExpandIcon /> Expand
-                </button>
+                  <ExpandIcon />{t("Expand")}</button>
                 <button className={item} onClick={onDetail}>
-                  <DetailIcon /> Add detail
-                </button>
+                  <DetailIcon />{t("Add detail")}</button>
                 <button className={item} onClick={onConcentrate}>
-                  <ConcentrateIcon /> Concentrate
-                </button>
+                  <ConcentrateIcon />{t("Concentrate")}</button>
                 <button className={item} onClick={onFocus}>
-                  <FocusIcon /> Focus
-                </button>
+                  <FocusIcon />{t("Focus")}</button>
                 <button className={item} onClick={onHarmonize}>
-                  <ConcentrateIcon /> Revise with context
-                </button>
+                  <ConcentrateIcon />{t("Revise with context")}</button>
               </div>
               <div className={group}>
-                <div className={groupLabel}>Language</div>
+                <div className={groupLabel}>{t("Language")}</div>
                 <button className={item} onClick={onTranslate}>
-                  <LanguagesIcon /> Translate…
-                </button>
+                  <LanguagesIcon />{t("Translate…")}</button>
                 <button className={item} onClick={onProofread}>
-                  <WandIcon /> Proofread…
-                </button>
+                  <WandIcon />{t("Proofread…")}</button>
+              </div>
+              {/* Every action above (Rewrite + Language) replaces the paragraph's
+                  text via the same path, which always shows a "What changed"
+                  word-diff with one-click Revert right after — so trying one is
+                  low-risk. This caption names that once, rather than repeating a
+                  tooltip on every button (ui.md #1/#6: a visible label, quiet
+                  rather than decoration on each item). */}
+              <div className="flex items-center gap-1 px-2 pb-1 text-[10px] text-ink-faint">
+                <HistoryIcon className="h-3 w-3 shrink-0" />
+                {t("Safe to try — shows a reviewable diff (Revert) after")}
               </div>
               <div className={group}>
-                <div className={groupLabel}>Summarize</div>
+                <div className={groupLabel}>{t("Summarize")}</div>
                 <button className={item} onClick={onSummarize}>
-                  <SummaryIcon /> Summarize
-                </button>
-                <Tooltip label="Rewrites this paragraph in place as bullet points — replaces its text (⌘/Ctrl+Z to undo).">
+                  <SummaryIcon />{t("Summarize")}</button>
+              </div>
+              {/* Bulletize gets its own group, visually separated from the
+                  reviewable actions above: it replaces this paragraph with
+                  several new ones immediately — no word-diff/Revert affordance
+                  (those only apply to one chunk's text edited in place, not a
+                  restructuring into N new chunks). The caption makes that
+                  distinction visible at a glance, not just on hover. */}
+              <div className={warnGroup}>
+                <div className={groupLabel}>{t("Restructures immediately")}</div>
+                <Tooltip label="Rewrites this paragraph in place as bullet points — replaces its text immediately, with no reviewable diff (⌘/Ctrl+Z to undo).">
                   <button className={item} onClick={onBulletize} disabled={!!globalBusy}>
-                    <BulletListIcon /> Bulletize
-                  </button>
+                    <BulletListIcon />{t("Bulletize")}</button>
                 </Tooltip>
               </div>
               <div className={group}>
-                <div className={groupLabel}>Generate</div>
+                <div className={groupLabel}>{t("Generate")}</div>
                 <button className={item} onClick={onDiagram}>
-                  <FlowIcon /> Generate diagram…
-                </button>
+                  <FlowIcon />{t("Generate diagram…")}</button>
                 <button className={item} onClick={onPresentation}>
-                  <ImageIcon /> Presentation figure
-                </button>
+                  <ImageIcon />{t("Presentation figure")}</button>
               </div>
               <div className={group}>
-                <div className={groupLabel}>Custom</div>
+                <div className={groupLabel}>{t("Custom")}</div>
                 <button className={item} onClick={onCustom}>
-                  <SparklesIcon /> Custom instruction…
-                </button>
+                  <SparklesIcon />{t("Custom instruction…")}</button>
               </div>
               {footer}
             </div>
@@ -285,32 +302,28 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
           {isHeading && (
             <div className="space-y-1">
               <div className={group}>
-                <div className={groupLabel}>Language</div>
+                <div className={groupLabel}>{t("Language")}</div>
                 <button className={item} onClick={onTranslate}>
-                  <LanguagesIcon /> Translate…
-                </button>
+                  <LanguagesIcon />{t("Translate…")}</button>
                 <button className={item} onClick={onProofread}>
-                  <WandIcon /> Proofread / rewrite…
-                </button>
+                  <WandIcon />{t("Proofread / rewrite…")}</button>
               </div>
               <div className={group}>
-                <div className={groupLabel}>Generate</div>
+                <div className={groupLabel}>{t("Generate")}</div>
                 <button className={item} onClick={onPresentation}>
-                  <ImageIcon /> Presentation figure
-                </button>
+                  <ImageIcon />{t("Presentation figure")}</button>
               </div>
               <div className={group}>
-                <div className={groupLabel}>Custom</div>
+                <div className={groupLabel}>{t("Custom")}</div>
                 <button className={item} onClick={onCustom}>
-                  <SparklesIcon /> Custom instruction…
-                </button>
+                  <SparklesIcon />{t("Custom instruction…")}</button>
               </div>
               {footer}
             </div>
           )}
           {!isText && !isHeading && (
             <div className="px-2.5 py-1.5 text-sm text-ink-faint">
-              Edit the Mermaid code below to update this diagram.
+              {t("Edit the Mermaid code below to update this diagram.")}
             </div>
           )}
         </div>

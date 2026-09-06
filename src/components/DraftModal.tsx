@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import { draftDocument } from "../fileActions";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import { CloseIcon, DraftIcon, ImportIcon, NetworkIcon, SpinnerIcon } from "./icons";
 
@@ -30,6 +31,7 @@ interface RefSource {
 }
 
 export default function DraftModal() {
+  const t = useT();
   const open_ = useStore((s) => s.draftOpen);
   const close = useStore((s) => s.closeDraft);
   const globalBusy = useStore((s) => s.globalBusy);
@@ -118,7 +120,7 @@ export default function DraftModal() {
 
   const submit = () => {
     if (!theme.trim()) {
-      notify("Enter a theme to draft about.", "info");
+      notify(t("Enter a theme to draft about."), "info");
       return;
     }
     const words = LENGTHS[lengthIdx]?.value ?? undefined;
@@ -137,9 +139,8 @@ export default function DraftModal() {
       >
         <div className="flex shrink-0 items-center justify-between border-b border-gray-100 px-6 pb-3 pt-5">
           <h2 className="flex items-center gap-2 text-lg font-semibold text-ink">
-            <DraftIcon /> Draft a document by AI
-          </h2>
-          <button onClick={close} className="text-ink-faint hover:text-ink" aria-label="Close">
+            <DraftIcon />{t("Draft a document by AI")}</h2>
+          <button onClick={close} className="text-ink-faint hover:text-ink" aria-label={t("Close")}>
             <CloseIcon />
           </button>
         </div>
@@ -147,7 +148,7 @@ export default function DraftModal() {
         <div className="flex-1 space-y-4 overflow-y-auto px-6 py-4">
           <div>
             <label className="mb-1 block text-sm font-medium text-ink-soft">
-              Theme / topic
+              {t("Theme / topic")}
             </label>
             <textarea
               value={theme}
@@ -161,7 +162,7 @@ export default function DraftModal() {
 
           <div>
             <label className="mb-1 block text-sm font-medium text-ink-soft">
-              Approximate length
+              {t("Approximate length")}
             </label>
             <select
               value={lengthIdx}
@@ -170,20 +171,19 @@ export default function DraftModal() {
             >
               {LENGTHS.map((l, i) => (
                 <option key={l.label} value={i}>
-                  {l.label}
+                  {t(l.label)}
                 </option>
               ))}
             </select>
           </div>
 
           <div>
-            <label className="mb-1 block text-sm font-medium text-ink-soft">
-              Reference material <span className="text-ink-faint">(optional)</span>
+            <label className="mb-1 block text-sm font-medium text-ink-soft">{t("Reference material")}<span className="text-ink-faint">(optional)</span>
             </label>
             <textarea
               value={reference}
               onChange={(e) => setReference(e.target.value)}
-              placeholder="Paste notes or text here, and/or attach a file / fetch a URL below."
+              placeholder={t("Paste notes or text here, and/or attach a file / fetch a URL below.")}
               rows={4}
               className={`${field} resize-y`}
             />
@@ -216,7 +216,7 @@ export default function DraftModal() {
             )}
             {combinedReference.length > REFERENCE_CHAR_LIMIT && (
               <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700">
-                Only about the first 12,000 characters will be used by the AI.
+                {t("Only about the first 12,000 characters will be used by the AI.")}
               </p>
             )}
             <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -227,7 +227,7 @@ export default function DraftModal() {
                 className="flex items-center gap-1.5 rounded-md border border-gray-300 px-2.5 py-1.5 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-50"
               >
                 {working === "file" ? <SpinnerIcon /> : <ImportIcon className="h-4 w-4" />}
-                Attach .txt / .md / .rtf / .pdf
+                {t("Attach .txt / .md / .rtf / .pdf")}
               </button>
             </div>
             <div className="mt-2 flex gap-2">
@@ -250,12 +250,12 @@ export default function DraftModal() {
                 className="flex shrink-0 items-center gap-1.5 rounded-md border border-gray-300 px-3 py-2 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-50"
               >
                 {working === "url" ? <SpinnerIcon /> : <NetworkIcon className="h-4 w-4" />}
-                Fetch
+                {t("Fetch")}
               </button>
             </div>
             <p className="mt-1 text-xs text-ink-faint">
               The draft is grounded in this material (it won't copy it verbatim).
-              PDF text extraction is best-effort.
+              {t("PDF text extraction is best-effort.")}
             </p>
           </div>
         </div>
@@ -265,15 +265,14 @@ export default function DraftModal() {
             onClick={close}
             className="rounded-md px-4 py-2 text-sm text-ink-soft hover:bg-gray-100"
           >
-            Cancel
+            {t("Cancel")}
           </button>
           <button
             onClick={submit}
             disabled={!!globalBusy || !theme.trim()}
             className="flex items-center gap-1.5 rounded-md bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-soft disabled:opacity-50"
           >
-            <DraftIcon className="h-4 w-4" /> Draft
-          </button>
+            <DraftIcon className="h-4 w-4" />{t("Draft")}</button>
         </div>
       </div>
     </div>

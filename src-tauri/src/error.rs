@@ -26,6 +26,16 @@ pub enum AppError {
     #[error("Unsupported file format: '{0}'")]
     UnsupportedFormat(String),
 
+    #[error("Can't insert '{0}': unsupported image type. Use PNG, JPEG, GIF, WEBP, or BMP.")]
+    UnsupportedImage(String),
+
+    #[error("Can't insert '{name}': the file is {size_mb:.1} MB, over the {limit_mb} MB limit.")]
+    ImageTooLarge {
+        name: String,
+        size_mb: f64,
+        limit_mb: u64,
+    },
+
     #[error("{0}")]
     Other(String),
 }

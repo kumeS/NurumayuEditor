@@ -13,6 +13,7 @@
 
 import { useMemo } from "react";
 import { documentDiff, wordDiff, type ChangedChunk } from "../diff";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import type { Chunk } from "../types";
 import { CloseIcon, HistoryIcon } from "./icons";
@@ -50,6 +51,7 @@ interface DiffPanelProps {
 }
 
 export default function DiffPanel({ onClose }: DiffPanelProps) {
+  const t = useT();
   const doc = useStore((s) => s.doc);
   const savedDoc = useStore((s) => s.savedDoc);
 
@@ -62,13 +64,13 @@ export default function DiffPanel({ onClose }: DiffPanelProps) {
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <HistoryIcon className="h-4 w-4" />
-          Changes since last save
+          {t("Changes since last save")}
         </div>
         <button
           onClick={onClose}
           className="text-ink-faint hover:text-ink"
-          aria-label="Close changes panel"
-          title="Close"
+          aria-label={t("Close changes panel")}
+          title={t("Close")}
         >
           <CloseIcon className="h-4 w-4" />
         </button>
@@ -76,7 +78,7 @@ export default function DiffPanel({ onClose }: DiffPanelProps) {
 
       {isEmpty ? (
         <p className="px-1 py-4 text-center text-xs text-ink-faint">
-          No changes since last save.
+          {t("No changes since last save.")}
         </p>
       ) : (
         <div className="max-h-80 space-y-3 overflow-y-auto pr-1">

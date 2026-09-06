@@ -3,7 +3,7 @@
 
 import { useEffect } from "react";
 import { confirmDiscard } from "./confirm";
-import { saveNative, openNative } from "./fileActions";
+import { openFolder, openNative, saveNative } from "./fileActions";
 import { useStore } from "./store";
 
 export function useShortcuts() {
@@ -13,9 +13,19 @@ export function useShortcuts() {
       if (!mod) return;
       const key = e.key.toLowerCase();
 
+      // CodeMirror provides its own character-level undo/redo while the
+      // Markdown source has focus. Let its keymap handle these events; the
+      // update listener keeps the shared document/store in sync afterward.
+      const inCodeMirror =
+        e.target instanceof Element && !!e.target.closest(".cm-editor");
+      if (inCodeMirror && (key === "z" || key === "y")) return;
+
       if (key === "s") {
         e.preventDefault();
         void saveNative();
+      } else if (key === "o" && e.shiftKey) {
+        e.preventDefault();
+        void openFolder();
       } else if (key === "o") {
         e.preventDefault();
         void openNative();

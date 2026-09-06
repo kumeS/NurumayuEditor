@@ -92,7 +92,7 @@ async fn send_with_retry(
             .header("Authorization", format!("Bearer {api_key}"))
             // OpenRouter attribution headers (optional but recommended).
             .header("HTTP-Referer", "https://github.com/kumeS/NurumayuFacet")
-            .header("X-Title", "NurumayuFacet")
+            .header("X-Title", "NurumayuEditor")
             .json(payload)
             .send()
             .await;
@@ -336,6 +336,26 @@ fn finalize_stream(full: String) -> AppResult<String> {
 
 // ----- request / result types --------------------------------------------
 
+/// One personal-library grounding snippet attached to an `AiRequest`. Mirrors
+/// `commands::RagSearchHit` / TS `RagSearchHit` field-for-field (source path +
+/// matched text + cosine distance), but is defined locally rather than reusing
+/// `rag::SearchHit` directly: `rag::SearchHit` is a pure OUTPUT type (never
+/// deserialized — `rag.rs` only ever produces it from a search), and `AiRequest`
+/// is `ai.rs`'s own request contract, so this keeps that module's derives
+/// minimal while staying a trivial 1:1 mirror here.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RagSnippetRef {
+    pub source_path: String,
+    pub snippet: String,
+    /// Cosine distance from the query (kept for a complete mirror of
+    /// `RagSearchHit`/`rag::SearchHit`, and so a future prompt/UI ordering-by-
+    /// relevance pass has it on hand); the prompt itself doesn't need it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub distance: f32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiRequest {
@@ -379,6 +399,14 @@ pub struct AiRequest {
     /// (metadata.linkedChunks) — the supporting/related material.
     #[serde(default)]
     pub linked_content: Option<String>,
+    /// Personal RAG (開発.txt Stage 3, item 3-1): top personal-library matches
+    /// for this chunk, assembled by `aiActions.ts::gatherRagSnippets` — empty
+    /// whenever the setting is off or nothing is indexed. Read by
+    /// `context_block` below and folded into the prompt as a labeled
+    /// "[From your personal library]" section; which sources were actually
+    /// used is then surfaced to the user near the result (aiActions.ts).
+    #[serde(default)]
+    pub rag_snippets: Vec<RagSnippetRef>,
 }
 
 /// Trailing constraints appended to a writing action's system prompt: pin the
@@ -421,6 +449,22 @@ fn context_block(req: &AiRequest) -> String {
     push(&mut ctx, "[Preceding paragraph]", &req.context_before);
     push(&mut ctx, "[Following paragraph]", &req.context_after);
     push(&mut ctx, "[Related/linked material]", &req.linked_content);
+    // Personal RAG (開発.txt Stage 3, item 3-1): ground the model against the
+    // user's own indexed papers/notes, one entry per matched snippet labeled
+    // with its source path so the model (and, downstream, the user) can tell
+    // where each piece of grounding came from. Omitted entirely when no
+    // snippets were attached (disabled setting, empty library, or no match).
+    if !req.rag_snippets.is_empty() {
+        ctx.push_str("[From your personal library]\n");
+        for hit in &req.rag_snippets {
+            let text = hit.snippet.trim();
+            if text.is_empty() {
+                continue;
+            }
+            ctx.push_str(&format!("— {}: {}\n", hit.source_path, text));
+        }
+        ctx.push_str("\n\n");
+    }
     ctx
 }
 
@@ -960,6 +1004,68 @@ mod tests {
     /// JSON `Value` equality, which is what these tests actually care about.
     fn temperature_of(payload: &serde_json::Value) -> f32 {
         payload["temperature"].as_f64().expect("temperature is a number") as f32
+    }
+
+    /// A minimal `AiRequest` with every optional field empty/default, for
+    /// `context_block` tests that only care about one field at a time.
+    fn empty_ai_request() -> AiRequest {
+        AiRequest {
+            action: "custom".to_string(),
+            text: "target text".to_string(),
+            context_before: None,
+            context_after: None,
+            target_language: None,
+            style: None,
+            instruction: None,
+            output_language: None,
+            tone: None,
+            section_heading: None,
+            document_map: None,
+            linked_content: None,
+            rag_snippets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn context_block_includes_rag_snippets_when_present() {
+        let mut req = empty_ai_request();
+        req.rag_snippets = vec![
+            RagSnippetRef {
+                source_path: "/papers/photosynthesis.md".to_string(),
+                snippet: "Chlorophyll absorbs red and blue light.".to_string(),
+                distance: 0.12,
+            },
+            RagSnippetRef {
+                source_path: "my-notes.aix".to_string(),
+                snippet: "Earlier draft observation about pigments.".to_string(),
+                distance: 0.34,
+            },
+        ];
+        let ctx = context_block(&req);
+        assert!(
+            ctx.contains("[From your personal library]"),
+            "expected the personal-library section header: {ctx}"
+        );
+        assert!(ctx.contains("/papers/photosynthesis.md"), "expected the first source path: {ctx}");
+        assert!(
+            ctx.contains("Chlorophyll absorbs red and blue light."),
+            "expected the first snippet text: {ctx}"
+        );
+        assert!(ctx.contains("my-notes.aix"), "expected the second source path: {ctx}");
+        assert!(
+            ctx.contains("Earlier draft observation about pigments."),
+            "expected the second snippet text: {ctx}"
+        );
+    }
+
+    #[test]
+    fn context_block_omits_rag_section_when_empty() {
+        let req = empty_ai_request();
+        let ctx = context_block(&req);
+        assert!(
+            !ctx.contains("[From your personal library]"),
+            "an empty rag_snippets list must not add the section at all: {ctx}"
+        );
     }
 
     #[test]

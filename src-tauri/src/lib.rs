@@ -1,4 +1,4 @@
-//! NurumayuFacet — Tauri backend entry point.
+//! NurumayuEditor — Tauri backend entry point.
 
 mod ai;
 pub mod cli;
@@ -38,7 +38,15 @@ pub fn run() {
         })
         .setup(|app| {
             // Native menu mirroring the toolbar; custom items emit a "menu" event.
-            let menu = menu::build(app)?;
+            // Built with the saved "Default language" so the menu bar matches
+            // the in-app chrome from the first frame (Settings rebuilds it via
+            // `set_menu_language` when the user changes languages).
+            let language = app
+                .path()
+                .app_config_dir()
+                .map(|dir| settings::Settings::load(&dir).default_target_language)
+                .unwrap_or_default();
+            let menu = menu::build(app, &language)?;
             app.set_menu(menu)?;
             app.on_menu_event(|app, event| {
                 let _ = app.emit("menu", event.id().0.clone());
@@ -51,6 +59,8 @@ pub fn run() {
             commands::export_pptx,
             commands::save_document_json,
             commands::open_document_json,
+            commands::list_directory,
+            commands::set_menu_language,
             commands::get_settings,
             commands::save_settings,
             commands::set_api_key,
@@ -62,6 +72,7 @@ pub fn run() {
             commands::ai_ghost_complete_stream,
             commands::ai_draft_stream,
             commands::ai_generate_image,
+            commands::read_local_image,
             commands::ai_generate_diagram,
             commands::ai_analyze_document,
             commands::read_reference_file,
@@ -70,6 +81,7 @@ pub fn run() {
             commands::rag_remove_source,
             commands::rag_list_sources,
             commands::rag_search,
+            commands::rag_sync_confirmed_chunks,
             commands::citations_import_bibtex,
             commands::citations_list,
             commands::citations_lookup_doi,

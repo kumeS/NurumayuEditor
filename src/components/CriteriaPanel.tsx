@@ -19,6 +19,7 @@
 import { useState } from "react";
 import { create } from "zustand";
 import { checkAgainstCriteria, type CriteriaCheckResult } from "../aiActions";
+import { useT } from "../i18n";
 import { useStore } from "../store";
 import { CheckSquareIcon, CloseIcon, SquareIcon } from "./icons";
 
@@ -48,6 +49,7 @@ function chunkPreview(content: string, max = 60): string {
 }
 
 export default function CriteriaPanel() {
+  const t = useT();
   const open = useCriteriaPanelStore((s) => s.open);
   const setOpen = useCriteriaPanelStore((s) => s.setOpen);
   const chunks = useStore((s) => s.doc.chunks);
@@ -96,13 +98,13 @@ export default function CriteriaPanel() {
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <CheckSquareIcon className="h-4 w-4" />
-          Review criteria coverage
+          {t("Review criteria coverage")}
         </div>
         <button
           onClick={() => setOpen(false)}
           className="text-ink-faint hover:text-ink"
-          aria-label="Close review criteria panel"
-          title="Close"
+          aria-label={t("Close review criteria panel")}
+          title={t("Close")}
         >
           <CloseIcon className="h-4 w-4" />
         </button>
@@ -133,20 +135,20 @@ export default function CriteriaPanel() {
           disabled={criteria.length === 0 || checking || !!globalBusy}
           className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-soft disabled:opacity-50"
         >
-          {checking ? "Checking…" : "Check against criteria"}
+          {checking ? t("Checking…") : t("Check against criteria")}
         </button>
       </div>
 
       {/* Empty state: no criteria entered yet AND no result to show. */}
       {criteria.length === 0 && results === null && !error && (
         <p className="mt-3 rounded-md bg-gray-50/60 px-2 py-3 text-center text-xs text-ink-faint">
-          Add one or more criteria above, then run the check.
+          {t("Add one or more criteria above, then run the check.")}
         </p>
       )}
 
       {/* Loading state. */}
       {checking && (
-        <p className="mt-3 text-center text-xs text-ink-faint">Checking against the document…</p>
+        <p className="mt-3 text-center text-xs text-ink-faint">{t("Checking against the document…")}</p>
       )}
 
       {/* Error state — persistent, not just the toast fileActions/aiActions
@@ -186,7 +188,7 @@ export default function CriteriaPanel() {
                         key={id}
                         onClick={() => flashChunk(id)}
                         className="rounded bg-white px-1.5 py-0.5 text-[10px] text-emerald-700 underline decoration-dotted hover:bg-emerald-100"
-                        title="Jump to this paragraph"
+                        title={t("Jump to this paragraph")}
                       >
                         {c ? chunkPreview(c.content, 30) : id}
                       </button>
@@ -195,7 +197,7 @@ export default function CriteriaPanel() {
                 </div>
               ) : (
                 <p className="mt-1 pl-5 text-[11px] text-amber-700">
-                  No supporting paragraph found.
+                  {t("No supporting paragraph found.")}
                 </p>
               )}
             </li>

@@ -6,6 +6,7 @@
 // paragraph — not the whole document.
 
 import { create } from "zustand";
+import { documentToMarkdown, markdownToDocument } from "./markdown";
 import { groupSlides } from "./slides";
 import type {
   AnalysisResult,
@@ -362,6 +363,17 @@ interface AppState {
   // drives the NetworkPanel "out of date" badge.
   analysisStale: boolean;
   networkOpen: boolean;
+  // Folder tree sidebar (left dock, general-purpose file explorer — not
+  // per-tab, not per-mode). Defaults OPEN (unlike networkOpen/reviewPanelOpen)
+  // since it's meant to be a standard, always-available feature rather than
+  // something the user opts into per session. `folderRoot` is the last chosen
+  // directory; neither field persists across launches (same as networkOpen).
+  folderTreeOpen: boolean;
+  folderRoot: string | null;
+  // Markdown preview zoom (1 = 100%). A reading-comfort control, so it is
+  // app-level rather than per-tab, and — like the panel flags — deliberately
+  // not persisted across launches.
+  markdownZoom: number;
   // Review comments panel (right dock, like networkOpen — not per-tab). The
   // target chunk is the one the panel's "add comment" composer points at (set
   // when the panel is opened from a chunk's gutter comment button).
@@ -410,6 +422,7 @@ interface AppActions {
   hydrateSession: (tabs: PersistedTab[], activeTabId: string) => void;
   setTitle: (title: string) => void;
   setMode: (mode: DocMode) => void;
+  setMarkdownSource: (source: string) => void;
 
   updateChunkContent: (id: string, content: string) => void;
   replaceChunkContent: (id: string, content: string) => void; // undoable (AI results)
@@ -423,6 +436,12 @@ interface AppActions {
   addChunkAfter: (id: string | null, type?: ChunkType) => string;
   insertDiagramAfter: (id: string | null, code: string) => string;
   insertImageAfter: (id: string | null, url: string, prompt: string) => string;
+  // Insert a user-supplied local image (file picker / drag-drop / paste) as an
+  // image chunk. Unlike `insertImageAfter` (AI-generated), this never sets
+  // `imagePrompt` — a locally inserted image has no generation prompt to
+  // "regenerate" from — and marks `imageSource: "local"` so the UI can badge
+  // it distinctly from an AI-generated image.
+  insertLocalImageAfter: (id: string | null, dataUrl: string, fileName: string) => string;
   splitChunk: (id: string, caret: number) => string | null;
   deleteChunk: (id: string) => void;
   mergeWithPrevious: (id: string) => string | null;
@@ -436,6 +455,10 @@ interface AppActions {
   duplicateChunksAfter: (ids: string[]) => string[];
   setChunkLayout: (id: string, layout: SlideLayout | null) => void;
   setChunkSubtitle: (id: string, subtitle: boolean) => void;
+  // Personal RAG (開発.txt Stage 3, item 3-1) auto-accumulation (Q11/Q16): mark/
+  // unmark a chunk's content as vetted enough to feed into the user's personal
+  // library — see fileActions.ts's save flow for what a confirmed chunk does.
+  setChunkConfirmed: (id: string, confirmed: boolean) => void;
   setSlideBody: (leadId: string, body: string[] | null) => void;
   setChunkNotes: (id: string, notes: string) => void;
   replaceChunksWithTexts: (ids: string[], texts: string[]) => void;
@@ -470,6 +493,15 @@ interface AppActions {
   shiftSpeechQueue: () => string | null;
 
   setSettings: (settings: Settings) => void;
+  // Blindspot QA v1 (project.md Q13): on the very first launch (settings say
+  // the example hasn't been shown yet, AND the active tab is still the
+  // pristine blank doc — a real user hasn't typed a title or made a tab dirty
+  // in the meantime), replace the blank first document with the worked
+  // example. Returns true when it fired (the caller — App.tsx's settings-load
+  // effect — is responsible for persisting `hasSeenWelcomeExample: true` via
+  // api.saveSettings so this is a one-time effect); false when either guard
+  // failed, in which case the caller must leave settings untouched.
+  loadWelcomeExampleIfFirstRun: (settings: Settings) => boolean;
   setHasApiKey: (has: boolean) => void;
   openSettings: () => void;
   closeSettings: () => void;
@@ -483,6 +515,9 @@ interface AppActions {
   applyAnalysis: (result: AnalysisResult) => void;
   toggleNetwork: (open?: boolean) => void;
   toggleReviewPanel: (open?: boolean) => void;
+  toggleFolderTree: (open?: boolean) => void;
+  setFolderRoot: (path: string | null) => void;
+  setMarkdownZoom: (zoom: number) => void;
   setReviewTarget: (id: string | null) => void;
   toggleDiffPanel: (open?: boolean) => void;
   openPresentation: () => void;
@@ -533,6 +568,100 @@ function makeInitialDoc(mode: DocMode = "editor"): Document {
     // A slide deck starts with one slide (a heading = the first slide's title);
     // an editor doc starts with one empty paragraph.
     chunks: [emptyChunk(0, mode === "slide" ? "heading" : "text")],
+    markdownSource: mode === "markdown" ? "" : undefined,
+  };
+}
+
+// A tiny inline chart, encoded as an SVG data URL — no bundled asset file, no
+// network fetch, just a few hundred bytes of markup. Stands in for "a plot you
+// made this week" in the welcome example below (Q13's own-figure feature).
+const WELCOME_EXAMPLE_PLOT_DATA_URL =
+  "data:image/svg+xml," +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200" viewBox="0 0 320 200">' +
+      '<rect width="320" height="200" fill="#ffffff"/>' +
+      '<rect x="0.5" y="0.5" width="319" height="199" fill="none" stroke="#d0d0d0"/>' +
+      '<line x1="40" y1="20" x2="40" y2="170" stroke="#888" stroke-width="1"/>' +
+      '<line x1="40" y1="170" x2="300" y2="170" stroke="#888" stroke-width="1"/>' +
+      '<polyline points="40,150 80,120 120,130 160,90 200,95 240,60 280,50" ' +
+      'fill="none" stroke="#2563eb" stroke-width="2.5"/>' +
+      '<circle cx="40" cy="150" r="3" fill="#2563eb"/>' +
+      '<circle cx="80" cy="120" r="3" fill="#2563eb"/>' +
+      '<circle cx="120" cy="130" r="3" fill="#2563eb"/>' +
+      '<circle cx="160" cy="90" r="3" fill="#2563eb"/>' +
+      '<circle cx="200" cy="95" r="3" fill="#2563eb"/>' +
+      '<circle cx="240" cy="60" r="3" fill="#2563eb"/>' +
+      '<circle cx="280" cy="50" r="3" fill="#2563eb"/>' +
+      '<text x="44" y="34" font-family="sans-serif" font-size="12" fill="#333">' +
+      "baseline noise (example)</text></svg>"
+  );
+
+/**
+ * Blindspot QA v1 (project.md Q13): the one-time first-run worked example,
+ * shown instead of a blank document so a brand-new user sees the weekly loop
+ * (progress note → slides → own figure) before hitting the "add your API key"
+ * wall. Pure data construction — no I/O — so `loadWelcomeExampleIfFirstRun`
+ * below only has to decide WHEN to call this, and every branch stays testable
+ * without mocking Tauri.
+ *
+ * Chunk shape:
+ *   0. heading — names what this doc is and doubles as the slide title.
+ *   1-3. text — a short progress-note voice (generic, not domain-specific).
+ *   4. image — a small bundled placeholder chart, `imageSource: "local"`
+ *      (mirrors the shape `insertLocalImageAfter` produces), captioned as
+ *      "this week's plot" to demonstrate the own-figures feature.
+ * The heading explicitly says this doc IS the slides too, pointing at the
+ * Editor/Slides toggle.
+ */
+export function makeWelcomeExampleDoc(): Document {
+  const heading: Chunk = {
+    id: localId(),
+    order: 0,
+    content: "Week of — lab progress note",
+    metadata: { chunkType: "heading", level: 1, linkedChunks: [] },
+  };
+  const intro: Chunk = {
+    id: localId(),
+    order: 1,
+    content:
+      "This is both your document and your slides — flip to Slides (top toolbar) " +
+      "to see this exact content presented as a deck, no separate file to keep in sync.",
+    metadata: { chunkType: "text", linkedChunks: [] },
+  };
+  const progress: Chunk = {
+    id: localId(),
+    order: 2,
+    content:
+      "This week I re-ran the calibration with the new buffer and got a cleaner " +
+      "baseline — noise dropped enough that the next dataset should be usable " +
+      "without extra smoothing.",
+    metadata: { chunkType: "text", linkedChunks: [] },
+  };
+  const nextSteps: Chunk = {
+    id: localId(),
+    order: 3,
+    content:
+      "Next week: repeat the run twice more to check it wasn't a one-off, then " +
+      "start drafting the method section while the details are still fresh.",
+    metadata: { chunkType: "text", linkedChunks: [] },
+  };
+  const plot: Chunk = {
+    id: localId(),
+    order: 4,
+    content: WELCOME_EXAMPLE_PLOT_DATA_URL,
+    metadata: {
+      chunkType: "image",
+      summary: "this week's plot",
+      imageSource: "local",
+      linkedChunks: [],
+      contentHistory: [],
+    },
+  };
+  return {
+    id: localId(),
+    title: "Weekly progress note (example)",
+    mode: "editor",
+    chunks: [heading, intro, progress, nextSteps, plot],
   };
 }
 
@@ -577,6 +706,9 @@ export const useStore = create<AppState & AppActions>((set, get) => {
 
   const mapChunks = (doc: Document, fn: (chunks: Chunk[]) => Chunk[]): Document => ({
     ...doc,
+    // A chunk-side edit supersedes any previously captured raw Markdown. The
+    // next Markdown view regenerates from the now-current chunk projection.
+    markdownSource: undefined,
     chunks: fn(doc.chunks),
   });
 
@@ -608,6 +740,9 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     analysis: null,
     analysisStale: false,
     networkOpen: false,
+    folderTreeOpen: true,
+    folderRoot: null,
+    markdownZoom: 1,
     reviewPanelOpen: false,
     reviewTargetChunkId: null,
     diffPanelOpen: false,
@@ -781,7 +916,10 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       }),
 
     setTitle: (title) =>
-      set((s) => ({ doc: { ...s.doc, title }, dirty: true })),
+      set((s) => ({
+        doc: { ...s.doc, title, markdownSource: undefined },
+        dirty: true,
+      })),
 
     // Switch the current document between "editor" (prose) and "slide" (deck)
     // views. Both render the SAME chunk model — a slide is just the chunks under
@@ -789,7 +927,17 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     setMode: (mode) => {
       const prevMode = get().doc.mode ?? "editor";
       if (prevMode === mode) return;
-      set((s) => ({ doc: { ...s.doc, mode }, dirty: true }));
+      set((s) => ({
+        doc: {
+          ...s.doc,
+          mode,
+          markdownSource:
+            mode === "markdown"
+              ? documentToMarkdown(s.doc)
+              : s.doc.markdownSource,
+        },
+        dirty: true,
+      }));
       // Slide→Editor didn't preserve your place (SlideEditor already derives
       // the selected slide from focusedChunkId on the way in, so Editor→Slide
       // was fine). flashChunk scrolls to and briefly highlights it, closing
@@ -798,6 +946,29 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         get().flashChunk(get().focusedChunkId as string);
       }
     },
+
+    // CodeMirror owns character-level history while focused; the app-level
+    // history coalesces one continuous Markdown typing session into one step,
+    // matching the existing per-paragraph editor behavior.
+    setMarkdownSource: (source) =>
+      set((state) => {
+        if (documentToMarkdown(state.doc) === source) return state;
+        const marker = "__markdown__";
+        const startNewUndoStep =
+          state.past.length === 0 || state.lastEditChunkId !== marker;
+        return {
+          doc: markdownToDocument(state.doc, source),
+          past: startNewUndoStep
+            ? [...state.past, state.doc].slice(-MAX_HISTORY)
+            : state.past,
+          future: [],
+          dirty: true,
+          lastEditChunkId: marker,
+          lastAiEditChunkId: null,
+          analysis: null,
+          analysisStale: true,
+        };
+      }),
 
     // Live typing: coalesce into one undo step per continuous edit session on a
     // chunk. Replaces only the edited chunk object (others keep identity).
@@ -1016,6 +1187,35 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           // Keep the full prompt so the image can be regenerated, and start an
           // empty version history (alternatives accumulate here).
           imagePrompt: full || undefined,
+          imageSource: "ai",
+          linkedChunks: [],
+          contentHistory: [],
+        },
+      };
+      commit((doc) =>
+        mapChunks(doc, (chunks) => {
+          const found = id ? chunks.findIndex((c) => c.id === id) : -1;
+          const idx = found >= 0 ? found : chunks.length - 1;
+          const next = [...chunks];
+          next.splice(idx + 1, 0, newChunk);
+          return reindex(next);
+        })
+      );
+      set({ focusedChunkId: newChunk.id });
+      return newChunk.id;
+    },
+
+    insertLocalImageAfter: (id, dataUrl, fileName) => {
+      const newChunk: Chunk = {
+        id: localId(),
+        order: 0,
+        content: dataUrl,
+        metadata: {
+          chunkType: "image",
+          // The file name is a reasonable caption default; no imagePrompt —
+          // there is no generation prompt to "regenerate" from.
+          summary: fileName.trim() || undefined,
+          imageSource: "local",
           linkedChunks: [],
           contentHistory: [],
         },
@@ -1368,6 +1568,20 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         { marksStale: false }
       ),
 
+    // Personal RAG (開発.txt Stage 3, item 3-1) auto-accumulation (Q11/Q16):
+    // presentation/workflow metadata like `subtitle` above, not a content
+    // edit, so it doesn't invalidate the relationship graph.
+    setChunkConfirmed: (id, confirmed) =>
+      commit(
+        (doc) =>
+          mapChunks(doc, (chunks) =>
+            chunks.map((c) =>
+              c.id === id ? { ...c, metadata: { ...c.metadata, confirmed } } : c
+            )
+          ),
+        { marksStale: false }
+      ),
+
     // Detach/re-link a slide (Req 2): store custom `slideBody` lines on the
     // slide's lead chunk (detach), or pass null to clear it (re-link to prose).
     setSlideBody: (leadId, body) =>
@@ -1564,6 +1778,29 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     },
 
     setSettings: (settings) => set({ settings }),
+    // See the AppActions doc comment above for the contract. Guarded the same
+    // way fileActions.ts's `activeIsPristine` guards "reuse this tab or open a
+    // new one" — a blank, untitled, not-yet-dirty single-paragraph editor tab
+    // with no backing file — so this can never clobber a restored session or
+    // anything the user already started typing before settings finished
+    // loading.
+    loadWelcomeExampleIfFirstRun: (settings) => {
+      if (settings.hasSeenWelcomeExample) return false;
+      const s = get();
+      const c = s.doc.chunks;
+      const pristine =
+        (s.doc.mode ?? "editor") === "editor" &&
+        !s.dirty &&
+        !s.filePath &&
+        c.length === 1 &&
+        !c[0].content.trim();
+      if (!pristine) return false;
+      // Loaded as dirty: it's a fabricated example with no backing file, same
+      // as an AI draft (B2) — otherwise the quit guard would let it vanish
+      // silently, and there'd be nothing marking it as "not yet saved".
+      get().loadDocument(makeWelcomeExampleDoc(), null, { dirty: true });
+      return true;
+    },
     setHasApiKey: (has) => set({ hasApiKey: has }),
     openSettings: () => set({ settingsOpen: true }),
     closeSettings: () => set({ settingsOpen: false }),
@@ -1647,6 +1884,19 @@ export const useStore = create<AppState & AppActions>((set, get) => {
 
     toggleNetwork: (open) =>
       set((s) => ({ networkOpen: open ?? !s.networkOpen })),
+
+    toggleFolderTree: (open) =>
+      set((s) => ({ folderTreeOpen: open ?? !s.folderTreeOpen })),
+
+    setFolderRoot: (path) => set({ folderRoot: path }),
+
+    // Clamped to a range that stays readable at both ends, and rounded to whole
+    // percent so the on-screen readout can't show floating-point noise.
+    setMarkdownZoom: (zoom) =>
+      set(() => {
+        if (!Number.isFinite(zoom)) return {};
+        return { markdownZoom: Math.round(Math.min(2.5, Math.max(0.6, zoom)) * 100) / 100 };
+      }),
 
     toggleReviewPanel: (open) =>
       set((s) => {
