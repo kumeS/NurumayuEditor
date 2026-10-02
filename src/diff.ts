@@ -123,3 +123,72 @@ export function documentDiff(
 
   return { added, removed, changed: changedList };
 }
+
+/**
+ * What kind of change separates the current document from the saved baseline
+ * (BUG-015b): the health-bar label and DiffPanel use this so a dirty document
+ * never reads "No changes since last save".
+ *
+ * - `paragraphs`: added + removed + changed chunks (documentDiff, content only).
+ * - `titleChanged`: the title differs (trimmed); with no baseline, a non-empty
+ *   title counts.
+ * - `otherChanged`: the stored analysis, the order of the paragraphs both
+ *   versions share, or any chunk's metadata (comments, links, summaries,
+ *   confirmed, layout…) differs.
+ *
+ * Not compared, because changing them never marks the document dirty: `mode`
+ * and `markdownSource` (a mode switch and its baseline rewrite are view-only),
+ * `metadata.contentHistory` and the export-only `metadata.renderedImage`.
+ * Unchanged chunks keep their object identity through store edits, so the
+ * reference check makes the common case cheap; still memoize the caller.
+ */
+export interface ChangeSummary {
+  paragraphs: number;
+  titleChanged: boolean;
+  otherChanged: boolean;
+}
+
+const IGNORED_METADATA_KEYS = new Set(["contentHistory", "renderedImage"]);
+
+/** Structural equality, independent of key order; `undefined` keys are absent. */
+function sameValue(a: unknown, b: unknown, ignore?: Set<string>): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => sameValue(v, b[i]));
+  }
+  const ra = a as Record<string, unknown>;
+  const rb = b as Record<string, unknown>;
+  const keys = (r: Record<string, unknown>) =>
+    Object.keys(r).filter((k) => r[k] !== undefined && !ignore?.has(k));
+  const ka = keys(ra);
+  const kb = keys(rb);
+  return ka.length === kb.length && ka.every((k) => Object.prototype.hasOwnProperty.call(rb, k) && sameValue(ra[k], rb[k]));
+}
+
+export function changeSummary(saved: Document | null, current: Document): ChangeSummary {
+  if (saved === current) return { paragraphs: 0, titleChanged: false, otherChanged: false };
+  const d = documentDiff(saved, current);
+  const paragraphs = d.added.length + d.removed.length + d.changed.length;
+  const titleChanged = (saved?.title ?? "").trim() !== current.title.trim();
+  if (!saved) {
+    return { paragraphs, titleChanged, otherChanged: current.analysis !== undefined };
+  }
+
+  let otherChanged = !sameValue(saved.analysis, current.analysis);
+  if (!otherChanged && saved.chunks !== current.chunks) {
+    const savedById = new Map(saved.chunks.map((c) => [c.id, c]));
+    const currentIds = new Set(current.chunks.map((c) => c.id));
+    const sharedSaved = saved.chunks.filter((c) => currentIds.has(c.id)).map((c) => c.id);
+    const sharedCurrent = current.chunks.filter((c) => savedById.has(c.id)).map((c) => c.id);
+    otherChanged = sharedSaved.some((id, i) => id !== sharedCurrent[i]);
+    for (const chunk of current.chunks) {
+      if (otherChanged) break;
+      const before = savedById.get(chunk.id);
+      if (!before || before === chunk || before.metadata === chunk.metadata) continue;
+      otherChanged = !sameValue(before.metadata, chunk.metadata, IGNORED_METADATA_KEYS);
+    }
+  }
+  return { paragraphs, titleChanged, otherChanged };
+}

@@ -12,9 +12,17 @@
 //! cell subdivision of the layout's image region) is defined identically in
 //! `pptx.rs` (export) and `SlideEditor.tsx` (preview) — change one, change all.
 //!
-//! Sync contract (notes): a slide's `notes` field is derived from its heading
-//! chunk's `metadata.notes` (empty string when absent). This MUST mirror the
-//! TS `slideNotes` in `slides.ts` — change one, change both.
+//! Sync contract (notes): a slide's `notes` field is derived from its LEAD
+//! chunk's `metadata.notes` (empty string when absent): the heading chunk, or
+//! — for the heading-less leading slide — its first chunk, whose notes the
+//! synthetic doc-title heading carries. Notes on any other chunk are ignored.
+//! This MUST mirror the TS `slideNotes`/`slideLead` in `slides.ts` — change
+//! one, change both. The same lead rule hosts a detached slide's
+//! `slide_body` (TS `slideBullets`/`isSlideDetached`): the deck keeps it on
+//! the slide's heading only and clears it from every other chunk. Known
+//! limit: inserting a heading above a leading slide's lead chunk makes it a
+//! body chunk, and its notes and slideBody stop being read (same on both
+//! sides); notes are never written to `.md` (planned).
 
 use crate::models::{
     Chunk, Deck, Document, Slide, SLIDE_LAYOUT_SECTION, SLIDE_LAYOUT_TITLE_CONTENT,
@@ -43,8 +51,15 @@ pub fn document_to_deck(doc: &Document) -> Deck {
                 None => {
                     // Content before any heading → an opening slide whose title
                     // is the document title.
+                    // Its speaker notes and slideBody live on its lead
+                    // (first) chunk; the synthetic heading carries them so the
+                    // heading-based derivation below and pptx.rs apply
+                    // unchanged (BUG-007).
                     let mut s = Slide::new(order, SLIDE_LAYOUT_TITLE_CONTENT);
-                    s.chunks.push(Chunk::new_heading(0, 1, doc.title.clone()));
+                    let mut h = Chunk::new_heading(0, 1, doc.title.clone());
+                    h.metadata.notes = chunk.metadata.notes.clone();
+                    h.metadata.slide_body = chunk.metadata.slide_body.clone();
+                    s.chunks.push(h);
                     s.chunks.push(chunk.clone());
                     current = Some(s);
                     order += 1;
@@ -54,6 +69,17 @@ pub fn document_to_deck(doc: &Document) -> Deck {
     }
     if let Some(s) = current.take() {
         slides.push(s);
+    }
+
+    // `slideBody` is read from the slide's lead only (TS `slideLead`): the
+    // heading, which for a leading slide is the synthetic one carrying its
+    // first chunk's. Drop it from every other chunk. pptx.rs's
+    // `body_paragraphs` reads only the lead's (`slide_lead`), so this is
+    // defence in depth, not load-bearing.
+    for s in &mut slides {
+        for c in s.chunks.iter_mut().filter(|c| !c.is_heading()) {
+            c.metadata.slide_body = None;
+        }
     }
 
     // Empty document → a single section slide carrying just the title.
@@ -87,8 +113,9 @@ pub fn document_to_deck(doc: &Document) -> Deck {
             }
         });
 
-        // Speaker notes: the slide's heading chunk's `metadata.notes`, or an
-        // empty string when absent. Sync contract with the TS `slideNotes` —
+        // Speaker notes: the slide's heading chunk's `metadata.notes` (for a
+        // leading slide, the synthetic heading carries its lead chunk's), or
+        // an empty string when absent. Sync contract with the TS `slideNotes` —
         // see the module doc comment.
         s.notes = s
             .chunks
@@ -208,6 +235,104 @@ mod tests {
         doc.chunks.push(Chunk::new_text(1, "bullet"));
         let deck = document_to_deck(&doc);
         assert_eq!(deck.slides[0].notes, "Remember to mention X");
+    }
+
+    #[test]
+    fn leading_slide_notes_come_from_its_first_chunk() {
+        // BUG-007: a heading-less leading slide hosts its notes on its lead
+        // (first) chunk, like layout/slideBody — mirrors the TS `slideNotes`.
+        let mut doc = Document::new("D");
+        let mut t = Chunk::new_text(0, "lonely");
+        t.metadata.notes = Some("N".into());
+        doc.chunks.push(t);
+        doc.chunks.push(Chunk::new_text(1, "more"));
+        doc.chunks.push(Chunk::new_heading(2, 1, "Next"));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].notes, "N");
+        assert_eq!(deck.slides[1].notes, "");
+    }
+
+    #[test]
+    fn notes_on_a_body_chunk_of_a_heading_slide_are_ignored() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "T"));
+        let mut b = Chunk::new_text(1, "body");
+        b.metadata.notes = Some("stale".into());
+        doc.chunks.push(b);
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].notes, "");
+    }
+
+    // ----- slideBody host (mirrors TS `slideLead` / `slideBullets` /
+    // `isSlideDetached` in slides.ts and the "detach / slideBody (Req 2)"
+    // cases in slides.test.ts). After `document_to_deck`, a slide's only
+    // `slide_body` is on its heading — the lead pptx.rs's `slide_lead` reads.
+
+    /// Which chunks of a slide carry a `slide_body`, as (index, lines).
+    fn slide_body_hosts(s: &Slide) -> Vec<(usize, Vec<String>)> {
+        s.chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.metadata.slide_body.clone().map(|b| (i, b)))
+            .collect()
+    }
+
+    #[test]
+    fn slide_body_on_the_heading_is_kept() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Title");
+        h.metadata.slide_body = Some(vec!["Sum A".into(), "Sum B".into()]);
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "original prose"));
+        let deck = document_to_deck(&doc);
+        assert_eq!(
+            slide_body_hosts(&deck.slides[0]),
+            vec![(0, vec!["Sum A".to_string(), "Sum B".to_string()])]
+        );
+    }
+
+    #[test]
+    fn no_slide_body_means_no_host() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "T"));
+        doc.chunks.push(Chunk::new_text(1, "prose"));
+        let deck = document_to_deck(&doc);
+        assert!(slide_body_hosts(&deck.slides[0]).is_empty());
+    }
+
+    #[test]
+    fn leading_slide_takes_its_slide_body_from_its_first_chunk() {
+        let mut doc = Document::new("D");
+        let mut t = Chunk::new_text(0, "lead");
+        t.metadata.slide_body = Some(vec!["S1".into()]);
+        doc.chunks.push(t);
+        doc.chunks.push(Chunk::new_text(1, "more"));
+        let deck = document_to_deck(&doc);
+        // Carried by the synthetic heading (index 0), like the lead's notes.
+        assert_eq!(slide_body_hosts(&deck.slides[0]), vec![(0, vec!["S1".to_string()])]);
+    }
+
+    #[test]
+    fn slide_body_on_a_body_chunk_of_a_heading_slide_is_ignored() {
+        // TS `slideLead` is the heading, so this slide is NOT detached there.
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "T"));
+        let mut b = Chunk::new_text(1, "body");
+        b.metadata.slide_body = Some(vec!["stale".into()]);
+        doc.chunks.push(b);
+        let deck = document_to_deck(&doc);
+        assert!(slide_body_hosts(&deck.slides[0]).is_empty(), "{:?}", slide_body_hosts(&deck.slides[0]));
+    }
+
+    #[test]
+    fn slide_body_on_a_later_chunk_of_a_leading_slide_is_ignored() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_text(0, "lead"));
+        let mut later = Chunk::new_text(1, "later");
+        later.metadata.slide_body = Some(vec!["stale".into()]);
+        doc.chunks.push(later);
+        let deck = document_to_deck(&doc);
+        assert!(slide_body_hosts(&deck.slides[0]).is_empty(), "{:?}", slide_body_hosts(&deck.slides[0]));
     }
 
     #[test]

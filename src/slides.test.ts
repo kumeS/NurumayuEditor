@@ -12,10 +12,12 @@ import {
   slideMoveBounds,
   slideNotes,
   slideOverflows,
+  slideParagraphs,
   slideSubtitle,
   slideTitle,
   splitImageRegion,
 } from "./slides";
+import { markdownToDocument } from "./markdown";
 import type { Chunk, ChunkType, SlideLayout } from "./types";
 
 function chunk(id: string, type: ChunkType, content = ""): Chunk {
@@ -265,7 +267,7 @@ describe("detach / slideBody (Req 2)", () => {
   });
 });
 
-describe("slideNotes (contract test — mirrors deck.rs's heading_notes_populate_the_slides_notes_field / heading_without_notes_yields_empty_slide_notes)", () => {
+describe("slideNotes (contract test — mirrors deck.rs's heading_notes_populate_the_slides_notes_field / heading_without_notes_yields_empty_slide_notes / leading_slide_notes_come_from_its_first_chunk)", () => {
   it("a heading chunk with notes produces that notes value", () => {
     const h = chunk("h", "heading", "Intro");
     h.metadata.notes = "Remember to mention X";
@@ -278,8 +280,26 @@ describe("slideNotes (contract test — mirrors deck.rs's heading_notes_populate
     expect(slideNotes(slide)).toBe("");
   });
 
-  it("a heading-less (leading) slide has no heading to carry notes, so it's always empty", () => {
+  // BUG-007 flip: the old test asserted a heading-less leading slide's notes
+  // were ALWAYS "" — that encoded the bug (slide 1 of every doc whose title
+  // is the document title could never hold notes). Notes now live on the
+  // slide's lead chunk, the same host as layout and slideBody.
+  it("a heading-less leading slide takes notes from its lead chunk", () => {
+    const a = chunk("a", "text", "lonely");
+    a.metadata.notes = "N";
+    const [slide] = groupSlides([a, chunk("b", "text", "more")]);
+    expect(slideNotes(slide)).toBe("N");
+  });
+
+  it("a heading-less leading slide without notes still yields an empty string", () => {
     const [slide] = groupSlides([chunk("a", "text", "lonely")]);
+    expect(slideNotes(slide)).toBe("");
+  });
+
+  it("notes on a body chunk of a heading slide are not the slide's notes", () => {
+    const b = chunk("b", "text", "body");
+    b.metadata.notes = "stale";
+    const [slide] = groupSlides([chunk("h", "heading", "T"), b]);
     expect(slideNotes(slide)).toBe("");
   });
 });
@@ -301,5 +321,80 @@ describe("slideMoveBounds (B2 — stay inside the slide)", () => {
     expect(slideMoveBounds(items, 0)).toEqual({ canUp: false, canDown: true });
     expect(slideMoveBounds(items, 1)).toEqual({ canUp: true, canDown: true });
     expect(slideMoveBounds(items, 2)).toEqual({ canUp: true, canDown: false });
+  });
+});
+
+// Handoff from w2-md (MODE-frontmatter): YAML frontmatter is a title prefix in
+// markdown.ts, so it never reaches the slide pipeline — not as a bullet, a
+// slide title, or any other chunk the deck renders.
+describe("frontmatter never reaches a slide", () => {
+  it("frontmatter never becomes a slide bullet or title", () => {
+    const d = markdownToDocument(
+      { id: "d", title: "stem", mode: "markdown", chunks: [] },
+      "---\ntitle: T\ntags: [a]\n---\n\n# 本題\n\n本文\n"
+    );
+    const slides = groupSlides(d.chunks);
+    const rendered = [
+      ...slides.flatMap(slideBullets),
+      ...slides.map((s) => slideTitle(s, d.title)),
+      ...d.chunks.map((c) => c.content),
+    ];
+    expect(rendered.filter((t) => /title: T|tags: \[a\]/.test(t))).toEqual([]);
+    expect(slides.flatMap(slideBullets)).toEqual(["本文"]);
+  });
+});
+
+// BUG-020: slide bodies are converted Markdown, not raw strings under a bullet.
+describe("slideParagraphs (BUG-020 — Markdown becomes runs and paragraphs)", () => {
+  const runsText = (p: { runs: { text: string }[] }) => p.runs.map((r) => r.text).join("");
+
+  it("list items are separate bullets without the dash", () => {
+    const [s] = groupSlides([chunk("h", "heading", "第2節"), chunk("a", "text", "- 項目A\n- 項目B")]);
+    expect(slideParagraphs(s).map(runsText)).toEqual(["項目A", "項目B"]);
+    expect(slideParagraphs(s).map((p) => p.kind)).toEqual(["bullet", "bullet"]);
+  });
+
+  it("bold run is structured, markers removed", () => {
+    const [s] = groupSlides([chunk("h", "heading", "T"), chunk("a", "text", "最初の段落。**太字**と")]);
+    expect(slideParagraphs(s)[0].runs).toEqual([
+      { text: "最初の段落。" },
+      { text: "太字", bold: true },
+      { text: "と" },
+    ]);
+  });
+
+  it("fenced code becomes code paragraphs without fences", () => {
+    const [s] = groupSlides([chunk("h", "heading", "T"), chunk("a", "text", "```text\nコード行\n```")]);
+    expect(slideParagraphs(s)).toEqual([{ kind: "code", level: 0, runs: [{ text: "コード行" }] }]);
+  });
+
+  it("detached slideBody lines are converted too (blank lines dropped)", () => {
+    const h = chunk("h", "heading", "T");
+    h.metadata.slideBody = ["- **要点**", "  ", "二つ目"];
+    const [s] = groupSlides([h, chunk("b", "text", "prose")]);
+    expect(slideParagraphs(s)).toEqual([
+      { kind: "bullet", level: 0, runs: [{ text: "要点", bold: true }] },
+      { kind: "bullet", level: 0, runs: [{ text: "二つ目" }] },
+    ]);
+  });
+
+  it("an explicit subtitle chunk is never a paragraph", () => {
+    const sub = chunk("s", "text", "**sub**");
+    sub.metadata.subtitle = true;
+    const [s] = groupSlides([chunk("h", "heading", "T"), sub, chunk("b", "text", "body")]);
+    expect(slideParagraphs(s).map(runsText)).toEqual(["body"]);
+  });
+
+  it("overflow counts visible text: a long link URL never overflows the slide", () => {
+    const url = `https://example.com/${"x".repeat(120 * 20)}`;
+    const [s] = groupSlides([chunk("h", "heading", "T"), chunk("a", "text", `[リンク](${url})`)]);
+    expect(slideOverflows(s)).toBe(false); // pptx.rs: link_url_never_counts_toward_overflow
+  });
+
+  it("overflow counts each list item as its own line", () => {
+    // One chunk, 15 short items → 15 lines > 14 (the raw chunk was 1 line by length).
+    const items = Array.from({ length: 15 }, (_, i) => `- item ${i}`).join("\n");
+    const [s] = groupSlides([chunk("h", "heading", "T"), chunk("a", "text", items)]);
+    expect(slideOverflows(s)).toBe(true);
   });
 });

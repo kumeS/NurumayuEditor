@@ -1,0 +1,317 @@
+{
+  "_comment": "Golden contract for Markdown IMPORT (invariant 3, CLAUDE.md lockstep rule): TS markdownToDocument (src/markdown.ts parseMarkdownBlocks, GUI) and Rust markdown_text_to_document (src-tauri/src/fileio.rs, CLI/MCP import) must produce exactly `title` and the (type, level, content) chunk sequence for each `md`, given `fallbackTitle` as the previous/file-stem title. Read by src/markdownImportParity.test.ts and fileio.rs tests::md_import_golden_parity. Deliberately EXCLUDED because the parsers differ by design or the behavior is planned: YAML frontmatter (GUI-only; Rust keeps it as text), image lines (TS makes image chunks; Rust keeps them as text), an indented first-line H1 (Rust trims it into the title; TS treats it as a body heading), empty ATX headings such as '## ' or '## #' (planned), lone-CR line endings (TS splits on \\r; Rust str::lines does not), and indented fences.",
+  "fallbackTitle": "Fallback Title",
+  "cases": [
+    {
+      "name": "h1 title (after leading blank lines) and body headings",
+      "md": "\n\n# My Paper\n\nIntro text.\n\n## Methods\n\nWe did things.",
+      "title": "My Paper",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "Intro text."
+        },
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "Methods"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "We did things."
+        }
+      ]
+    },
+    {
+      "name": "C# keeps its hash in the H1 title and in a body heading",
+      "md": "# Learn C#\n\n## Using C#\n\nBody.",
+      "title": "Learn C#",
+      "chunks": [
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "Using C#"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "Body."
+        }
+      ]
+    },
+    {
+      "name": "closing # runs after whitespace are stripped (title and h2-h4)",
+      "md": "# Title ##\n\n## Section ##\n\n### Deep ###   \n\n#### Deeper #\n\nText",
+      "title": "Title",
+      "chunks": [
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "Section"
+        },
+        {
+          "type": "heading",
+          "level": 3,
+          "content": "Deep"
+        },
+        {
+          "type": "heading",
+          "level": 3,
+          "content": "Deeper"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "Text"
+        }
+      ]
+    },
+    {
+      "name": "a # run without preceding whitespace, or mid-line, is content",
+      "md": "## Issue#42\n\n## C##\n\n## Tag #hash text",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "Issue#42"
+        },
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "C##"
+        },
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "Tag #hash text"
+        }
+      ]
+    },
+    {
+      "name": "tab after # opens the H1 title",
+      "md": "#\tTabbed Title\n\nBody.",
+      "title": "Tabbed Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "Body."
+        }
+      ]
+    },
+    {
+      "name": "no H1 keeps the fallback title",
+      "md": "## Only Section\n\nBody.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "Only Section"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "Body."
+        }
+      ]
+    },
+    {
+      "name": "H1-only source yields one empty text chunk",
+      "md": "# Only Title\n",
+      "title": "Only Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": ""
+        }
+      ]
+    },
+    {
+      "name": "empty source yields one empty text chunk",
+      "md": "",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": ""
+        }
+      ]
+    },
+    {
+      "name": "tilde fence is a code block that keeps its marker",
+      "md": "Intro\n\n~~~js\nconst a = 1;\n~~~\n\nAfter.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "Intro"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "~~~js\nconst a = 1;\n~~~"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "After."
+        }
+      ]
+    },
+    {
+      "name": "tilde mermaid fence is a diagram",
+      "md": "~~~mermaid\ngraph TD; A-->B;\n~~~",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "diagram",
+          "level": null,
+          "content": "graph TD; A-->B;"
+        }
+      ]
+    },
+    {
+      "name": "backtick fence is not closed by a tilde run",
+      "md": "```\ncode\n~~~\nmore\n```\n\nAfter.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "```\ncode\n~~~\nmore\n```"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "After."
+        }
+      ]
+    },
+    {
+      "name": "tilde fence is not closed by a backtick run",
+      "md": "~~~\na\n```\nb\n~~~\n\nAfter.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "~~~\na\n```\nb\n~~~"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "After."
+        }
+      ]
+    },
+    {
+      "name": "a 4-backtick opener is not closed by a shorter run and keeps its 4-run marker",
+      "md": "````md\n```\ninner\n```\n````\n\nAfter.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "````md\n```\ninner\n```\n````"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "After."
+        }
+      ]
+    },
+    {
+      "name": "a longer closing run closes the fence",
+      "md": "~~~\nx\n~~~~~\n\nAfter.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "~~~\nx\n~~~"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "After."
+        }
+      ]
+    },
+    {
+      "name": "an inner fence line with an info string does not close the block",
+      "md": "```markdown\nshow a ```text sample\n```\n\nAfter.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "```markdown\nshow a ```text sample\n```"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "After."
+        }
+      ]
+    },
+    {
+      "name": "an unclosed tilde fence runs to EOF and gains its closing marker",
+      "md": "Intro\n\n~~~py\nprint(1)\n\nstill code",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "Intro"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "~~~py\nprint(1)\n\nstill code\n~~~"
+        }
+      ]
+    },
+    {
+      "name": "a backtick info string containing a backtick is not a fence",
+      "md": "```js`x\nnot code\n\nAfter.",
+      "title": "Fallback Title",
+      "chunks": [
+        {
+          "type": "text",
+          "level": null,
+          "content": "```js`x\nnot code"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "After."
+        }
+      ]
+    },
+    {
+      "name": "CRLF line endings",
+      "md": "# T\r\n\r\n## H ##\r\n\r\nPara one\r\nline two\r\n",
+      "title": "T",
+      "chunks": [
+        {
+          "type": "heading",
+          "level": 2,
+          "content": "H"
+        },
+        {
+          "type": "text",
+          "level": null,
+          "content": "Para one\nline two"
+        }
+      ]
+    }
+  ]
+}

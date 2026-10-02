@@ -14,11 +14,11 @@
 
 <br/>
 
-[![Version](https://img.shields.io/badge/🚀_v1.3.0-Release-0078D4?style=for-the-badge&logoColor=white)](https://github.com/kumeS/NurumayuFacet/releases)
+[![Version](https://img.shields.io/badge/🚀_v1.4.0-Release-0078D4?style=for-the-badge&logoColor=white)](https://github.com/kumeS/NurumayuEditor/releases)
 &nbsp;
 [![License](https://img.shields.io/badge/📜_Artistic--2.0-License-2EA44F?style=for-the-badge)](LICENSE)
 &nbsp;
-[![Platform](https://img.shields.io/badge/🍎_macOS-Supported-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/kumeS/NurumayuFacet/releases)
+[![Platform](https://img.shields.io/badge/🍎_macOS-Supported-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/kumeS/NurumayuEditor/releases)
 
 [![Tauri](https://img.shields.io/badge/⚡_Tauri-v2-FFC131?style=for-the-badge&logo=tauri&logoColor=white)](https://v2.tauri.app)
 &nbsp;
@@ -80,10 +80,10 @@
 ### 1. The writing canvas
 
 <div align="center">
-  <img src="docs/01.png" alt="NurumayuEditor main window — a clean, distraction-free writing canvas with a minimal toolbar" width="560" />
+  <img src="img/01.png" alt="NurumayuEditor main window — a clean, distraction-free writing canvas with a minimal toolbar" width="560" />
 </div>
 
-> **A distraction-free writing canvas.** Use the paragraph editor for focused writing, the Markdown workspace for exact source plus live GFM preview, and Slides for presenting the same content. The toolbar keeps the essentials one click away (**Open / Save**, **Import / Export**, **Undo / Redo**, **Draft by AI**, **Review**, **Editor / Markdown / Slides**, **Help**).
+> **A distraction-free writing canvas.** Use the paragraph editor for focused writing, the Markdown workspace for exact source plus live GFM preview, and Slides for presenting the same content. A **files sidebar** docks on the left for browsing a project folder, and the toolbar keeps the essentials one click away (**Open** ▸ *File… / Folder…*, **Save**, **Files**, **Import / Export**, **Undo / Redo**, **Draft by AI**, **Review**, **Read**, **Editor / Markdown / Slides**, **Help**).
 
 **Quick start**
 
@@ -97,7 +97,7 @@
 ### 2. Draft → refine → review (the core workflow)
 
 <div align="center">
-  <img src="docs/demo.gif" alt="End-to-end demo: drafting a document with AI from a theme, then refining a paragraph and reviewing the inline diff" width="600" />
+  <img src="img/demo.gif" alt="End-to-end demo: drafting a document with AI from a theme, then refining a paragraph and reviewing the inline diff" width="600" />
 </div>
 
 > **From a one-line theme to a polished draft — then sharpen it paragraph by paragraph.** The clip walks through the whole loop: generate a structured first draft, then use the per-chunk **✨** menu to revise, with every AI edit shown as a reviewable diff you can keep or undo.
@@ -116,7 +116,7 @@
 ### 3. Built-in guide (multilingual)
 
 <div align="center">
-  <img src="docs/02.png" alt="The in-app Help guide explaining the recommended writing workflow and API-key setup" width="330" />
+  <img src="img/02.png" alt="The in-app Help guide explaining the recommended writing workflow and API-key setup" width="330" />
 </div>
 
 > **Help is always one click away.** The **Help** button (toolbar or native Help menu) opens a step-by-step guide to the recommended workflow, plus a one-time **API-key setup** walkthrough. The guide is available in **five languages — English, 日本語, 中文, Español, Français** — chosen from the selector beside the title, and it follows your **Default language** in Settings automatically.
@@ -133,8 +133,9 @@
 
 | Area | What it does |
 | --- | --- |
-| **Markdown edit + preview** | Open `.md`/`.markdown` files directly, edit their exact source in CodeMirror, and switch between **Edit**, **Preview**, or side-by-side **Split**. GFM tables, task lists, links, code blocks, images, and Mermaid fences render in the preview. `⌘/Ctrl+S` writes back to the opened Markdown file without reformatting its source. |
+| **Markdown edit + preview** | Open `.md`/`.markdown` files directly, edit their exact source in CodeMirror, and switch between **Edit**, side-by-side **Split**, or **Preview** — which is what a Markdown document opens in. GFM tables, task lists, links, code blocks, images, and Mermaid fences render in the preview, and you can click rendered text to edit it in place. The preview has its own **zoom (60–250%)** — `⌘/Ctrl +`, `−`, `0`, or the toolbar `− 100% ＋` — which scales the whole page (measure, margins, tables, images), not just the type. `⌘/Ctrl+S` writes back to the opened Markdown file without reformatting its source. |
 | **Document ⟷ Slides** | One document, two faces. The same chunks render as an editable **document** and as a **slide deck** — flip with the toolbar toggle; switching preserves your place and loses nothing. Slides are a projection of the writing, not a separate file. |
+| **Files sidebar** | A left-docked **folder tree** for working out of a project folder: **Open ▸ Folder…** (`⌘/Ctrl+Shift+O`) picks a root, subfolders expand lazily, and clicking a `.aix`/`.md`/`.markdown` file opens it in a tab (other file types are listed but greyed out). Show/hide it from the section's own **Hide** button, the toolbar **Files** button, or the command palette. Directory listing stays in Rust, jailed to the chosen root. |
 | **Multiple tabs** | Open and edit several documents at once. New tab via the tab-bar **＋** or `⌘/Ctrl+T`; each tab keeps its own document, file path, undo/redo history and analysis. |
 | **Chunk editing** | Document = an ordered list of chunks. Split (`⌘/Ctrl+Shift+Enter`), merge (Backspace at start, or select 2+ adjacent paragraphs → **Merge**), reorder (↑/↓), add/delete, and move between chunks with the Up/Down arrows. |
 | **Chunk types** | **Text**, **Heading** (`#`/`##`/`###`, levels 1–3), **Diagram** (Mermaid), and **Image**. Type `# `/`## `/`### ` at the start of a paragraph to turn it into a heading. |
@@ -146,10 +147,18 @@
 | **Your own figures** | Insert your own images — file picker (command palette → *Insert image from file…*), drag-and-drop onto the editor, or paste from the clipboard. They land as ordinary **image chunks**, reorderable alongside AI-generated ones, with no round-trip through a model. |
 | **Personal library (RAG)** | An on-device, growing corpus of your own confirmed notes and papers. Mark a chunk **confirmed** to make it eligible; embeddings and search run **entirely locally** (no network call beyond a one-time model download). AI actions ground their answer in the top matches from your library, and the sources used are surfaced back to you — open it from the command palette (*Open personal library (RAG)*). |
 | **Relationship graph** _(optional)_ | **Analyze** builds a two-level network — **paragraph** nodes plus per-**sentence** nodes — with typed relations (cause, evidence, elaboration, contrast, …), drawn with **Cytoscape** (sentences nested under their paragraph). Click a node to jump to its paragraph; click an edge to flash both endpoints. Relations are color-coded with a legend, and the panel shows when the analysis ran. The graph is saved inside the `.aix` file. An occasional-use tool, not part of the core weekly loop — reachable from the command palette or the toolbar's quiet secondary cluster. |
-| **Open / Import / Export** | Open and save `.md`/`.markdown` directly, or use the native `.aix` format to preserve chunks, metadata, comments, and analysis. Import `.txt`/`.md`/`.rtf`; export `.txt`, `.md`, `.rtf`, `.pdf`, and `.pptx`. All disk I/O and atomic writes stay in Rust. |
-| **Native menu** | The macOS/Windows menu bar (File / Edit / AI / Window) mirrors the in-app toolbar; its custom items drive the same actions. |
+| **Open / Import / Export** | Open and save `.md`/`.markdown` directly, or use the native `.aix` format to preserve chunks, metadata, comments, and analysis. **Save As offers both formats for any document** — choosing `.md` for an Editor/Slide document converts it and reports, on the health bar, that view mode and slide-only details won't round-trip. Import `.txt`/`.md`/`.rtf`; export `.txt`, `.md`, `.rtf`, `.pdf`, and `.pptx`. All disk I/O and atomic writes stay in Rust. |
+| **Native menu** | The macOS/Windows menu bar (File / Edit / AI / Window) mirrors the in-app toolbar; its custom items drive the same actions, and its labels follow the interface language (rebuilt when you change it, so the menu bar never disagrees with the app). |
+| **Interface language** | Setting **Default language** to 日本語 renders the whole app in Japanese — toolbar, panels, dialogs, command palette, toasts and the native menu bar — and back to English for any other choice. Untranslated strings fall back to English rather than disappearing, and two test guards fail the build if a new UI string is added without a translation. |
 | **Security** | The API key is stored in the **OS keychain** (macOS Keychain / Windows Credential Manager / Linux Secret Service) — never written to disk in plaintext, never sent to the frontend. All network calls happen in Rust. |
 | **Resilience** | Free models are rate-limited; API calls retry on HTTP 429 / transient 5xx with exponential backoff, and surface actionable errors. |
+| **Citations** | Bring your own references: import a `.bib` file, or look up a **DOI / arXiv id** to fetch metadata. Insert in-text citations and build a references list in **APA / IEEE / BibTeX-key** style. The library is a JSON sidecar next to the `.aix` file (so a document must be saved first). Not a literature-search engine. |
+| **Review criteria** _(optional)_ | Check a draft against your own list of criteria (e.g. a call for proposals) and see which are covered, partially covered, or missing — each with the paragraph it rests on. Needs a fresh **Analyze** run. |
+| **Presentation mode** | A fullscreen overlay for the deck: arrow/space navigation, speaker notes toggle (`N`), `Esc` to exit. It renders the same `SlideStage` as the thumbnails and the PPTX export, so what you present is what you exported. |
+| **Changes since last save** | The health bar shows how many paragraphs were added, removed or changed since the last save; click it for a per-paragraph diff. |
+| **Ghost text** _(on whenever AI is configured)_ | A faint inline continuation while you type (Tab to accept, Esc to dismiss). After you type and pause with the caret at the end of a paragraph, that paragraph's text and the nearest preceding heading are sent to the configured endpoint. Turn on **Limit ghost-text completion to a local model** in Settings to keep it on-device (nothing is sent to a remote model). |
+| **Agent access (MCP)** | A minimal MCP server exposes documents to an external AI agent (e.g. Claude Desktop / Claude Code). Read and export are always available; **writing** a labeled reference chunk back into a document is off by default and enabled with one Settings toggle. |
+| **Length warnings** | Set a per-paragraph character limit and the health bar flags every paragraph over it, with a jump list. CJK counts as one character each — useful for grant forms and abstracts. |
 | **Review comments** | Per-paragraph comments in a right-docked panel (add/edit/resolve/delete, persisted in `.aix`). **AI review** writes targeted comments; **Map logic** _(optional)_ uses the relationship graph to surface the model's opinion on possibly-unsupported claims and contradictions — not a verified audit. |
 | **Read aloud** | Read one paragraph, a selection, or the whole document from the cursor (toolbar **Read/Stop**); the voice follows your default output language. macOS `say`-based. |
 | **Command palette** | `⌘/Ctrl+K` — search and run every major action (export, analyze, review, read aloud, tabs, settings…). |
@@ -162,17 +171,29 @@
 
 Open with the gear icon or `⌘/Ctrl+,`:
 
-- **OpenRouter API key** — stored in the OS keychain.
-- **Endpoint URL** — any OpenAI-compatible chat-completions endpoint.
+- **Default language** — the output language for **every** AI action (translation
+  target plus the language every result is written in). It also sets the app's
+  **interface language**: pick 日本語 and the UI and native menu switch to
+  Japanese.
+- **OpenRouter API key** — stored in the OS keychain. The app only reads it when
+  an AI action actually needs it, so macOS doesn't ask for keychain access on
+  every launch.
+- **Endpoint URL** — any OpenAI-compatible chat-completions endpoint (including a
+  local Ollama bridge, in which case leave the key blank).
+- **Limit ghost-text completion to a local model** — off by default; when on, the
+  inline suggestion is skipped entirely unless the endpoint is local.
+- **Paragraph character-limit warning** — off by default; flags over-long
+  paragraphs in the health bar.
+- **Personal knowledge base (RAG)** — off by default; fully on-device.
+- **Allow AI agent to write into documents (MCP)** — off by default.
 - **Model (text)** — a managed list you can select from / add to / remove. Used
   for writing, proofreading, drafting and analysis.
 - **Model (image generation)** — a separate managed list for image models
   (e.g. Google "Nano Banana"). **Verify exact model ids on
   openrouter.ai/models** — image-model ids change frequently and the seeded ones
   are starting points.
-- **Default translation language** — picked from a dropdown (English, 日本語,
-  中文, 한국어, Español, Français, …).
-- **Temperature**.
+- **Editor font** — Serif / Sans / Mono, 12–28px.
+- **Writing tone** and **Temperature**.
 
 ## Keyboard shortcuts
 
@@ -183,7 +204,10 @@ Open with the gear icon or `⌘/Ctrl+,`:
 | `⌘/Ctrl + Shift + Enter` | Split paragraph at the caret |
 | `Backspace` (at start) | Merge with previous paragraph (empty heading → text) |
 | `⌘/Ctrl + T` | New tab |
+| `⌘/Ctrl + W` | Close tab |
 | `⌘/Ctrl + S` / `O` | Save / Open `.aix` or Markdown document |
+| `⌘/Ctrl + Shift + O` | Open a folder in the files sidebar |
+| `⌘/Ctrl + +` / `−` / `0` | Markdown preview: zoom in / out / reset |
 | `⌘/Ctrl + Z` / `Shift+Z` | Undo / Redo |
 | `⌘/Ctrl + ,` | Settings |
 | `⌘/Ctrl + K` | Command palette |
@@ -316,15 +340,24 @@ src/                     React frontend
                          busy state, tab-race guards, read-aloud)
   fileActions.ts         New/Open/Import/Export/Draft/PPTX (dialog → Rust I/O)
   slides.ts              Deck derivation (mirrors deck.rs) for the Slide view
+  markdown.ts            Document ⟷ Markdown projection (mirrors fileio.rs)
+  i18n.ts                UI language + the English→Japanese dictionary
+  folderTree.ts          Pure helpers for the files sidebar
+  diff.ts                Paragraph diff for "changes since last save"
+  charLimitWarnings.ts   Per-paragraph character-limit check (CJK-aware)
+  citationInsert.ts      In-text citation / references-list insertion
   mermaidRender.ts       Shared Mermaid loader + validate + offscreen SVG/PNG
   fonts.ts               Editor font stacks (Settings → Editor font)
   confirm.ts             Shared unsaved-changes dialog (quit / close tab)
   caret.ts               Visual-line caret detection (chunk Up/Down navigation)
   useShortcuts.ts        Global keyboard shortcuts (⌘K palette, ⌘W close tab…)
-  components/            TabBar, Toolbar, Editor, SlideEditor, ChunkView,
-                         ChunkAiMenu, MermaidChunk, NetworkPanel, ReviewPanel,
-                         CommandPalette, HealthBar, SettingsModal, PromptModal,
-                         SelectionBar, Toasts, ErrorBoundary, icons
+  components/            TabBar, Toolbar, FolderTree, Editor, MarkdownEditor,
+                         SlideEditor, PresentationMode, ChunkView, ChunkAiMenu,
+                         MermaidChunk, NetworkPanel, ReviewPanel, DiffPanel,
+                         CitationsPanel, CriteriaPanel, PersonalLibraryPanel,
+                         CommandPalette, HealthBar, SettingsModal, HelpModal,
+                         DraftModal, PromptModal, SelectionBar, Tooltip,
+                         Toasts, ErrorBoundary, icons
 src-tauri/src/           Rust backend
   lib.rs                 Tauri builder: commands, native menu, window lifecycle
   models.rs              Document / Chunk / ChunkMetadata / Analysis* (serde)
@@ -334,12 +367,18 @@ src-tauri/src/           Rust backend
   deck.rs + pptx.rs      Document → Deck → hand-written .pptx (OOXML,
                          multi-image grids, diagram snapshots)
   fileio.rs              txt/md/rtf import-export (RTF picture embedding),
-                         paragraph + heading chunking, atomic writes
-  pdf.rs                 Headless PDF export (system-font discovery, CJK-aware)
+                         paragraph + heading chunking, atomic writes,
+                         root-jailed directory listing for the files sidebar
+  rag.rs                 On-device personal library (fastembed + sqlite-vec)
+  citations.rs           BibTeX import, DOI/arXiv lookup, APA/IEEE formatting
+  mcp.rs                 Minimal MCP server (agent read / export / gated write)
+  pdf.rs                 PDF export for GUI + CLI (system-font discovery, CJK-aware, PdfReport)
   imageio.rs             Shared image decode/size/fetch (pptx + rtf)
   net.rs                 SSRF-guarded, size-capped remote fetch
-  settings.rs            Settings JSON + OS keychain (keyring), locale detection
-  menu.rs                Native application menu (emits events to the frontend)
+  settings.rs            Settings JSON + OS keychain (keyring, cached per
+                         process), locale detection
+  menu.rs                Native application menu, localized (emits events to
+                         the frontend)
   cli.rs                 Headless CLI (capabilities / info / show / export)
   error.rs               Unified AppError
 ```
@@ -355,14 +394,14 @@ snapshots, so existing chunk actions operate unchanged.
 ### Install (recommended) — Homebrew
 
 ```bash
-brew tap kumeS/tap https://github.com/kumeS/NurumayuFacet   # one-time: the formula lives in this repo
-brew install kumeS/tap/nurumayufacet
+brew tap kumeS/tap https://github.com/kumeS/NurumayuEditor   # one-time: the formula lives in this repo
+brew install kumeS/tap/nurumayueditor
 ```
 
 > The `brew tap … <url>` line is required because the formula ships inside the app's
 > own repo rather than a separate `homebrew-tap` repo. (If you later create a
 > `kumeS/homebrew-tap` repo containing the formula, `brew install
-> kumeS/tap/nurumayufacet` works on its own, with no `brew tap` step.)
+> kumeS/tap/nurumayueditor` works on its own, with no `brew tap` step.)
 
 This **builds NurumayuEditor from source on your Mac**, so there is no notarization
 / *"app is damaged"* Gatekeeper prompt, and the binary matches your own CPU (Apple
@@ -374,7 +413,7 @@ Launch it from Spotlight as **NurumayuEditor**, or:
 ```bash
 nurumayueditor                                           # CLI launcher
 # …or add it to /Applications:
-ln -sfn "$(brew --prefix)/opt/nurumayufacet/NurumayuEditor.app" /Applications/
+ln -sfn "$(brew --prefix)/opt/nurumayueditor/NurumayuEditor.app" /Applications/
 ```
 
 The same binary is a headless CLI for agents and scripts:
@@ -393,8 +432,8 @@ https://openrouter.ai/models. The key is stored in the macOS keychain, never on
 disk in plaintext.
 
 > **Prebuilt `.dmg` alternative.** A `.dmg` is also published on the
-> [Releases](https://github.com/kumeS/NurumayuFacet/releases) page (and via the
-> Homebrew **cask** [`Casks/nurumayufacet.rb`](Casks/nurumayufacet.rb)). That
+> [Releases](https://github.com/kumeS/NurumayuEditor/releases) page (and via the
+> Homebrew **cask** [`Casks/nurumayueditor.rb`](Casks/nurumayueditor.rb)). That
 > build is *not notarized*, so macOS quarantines it on download — after installing,
 > clear the flag once with
 > `xattr -dr com.apple.quarantine "/Applications/NurumayuEditor.app"`. The
@@ -427,9 +466,18 @@ npm run tauri build    # → .app / .dmg under src-tauri/target/release/bundle/
   promoting a leading `# Heading` back to the document title.
 - Diagram snapshots in RTF/PPTX are rendered by the app at export time — CLI
   exports can't render Mermaid headlessly and will say so in a warning.
-- CLI PDF export needs a Unicode TTF font on the system (it looks for Arial
-  Unicode and common Noto/DejaVu paths); the GUI's PDF export uses the OS
-  print dialog and is unaffected.
+- PDF export (GUI and CLI share one Rust renderer) writes a plain A4 text
+  layout and needs a Unicode TTF font on the system (it looks for Arial
+  Unicode and common Noto/DejaVu paths; none found → an error). Arial Unicode
+  (macOS/Windows) covers CJK; the DejaVu Sans fallback on Linux does not, so
+  CJK text prints as missing glyphs there. Images become `[Image: caption]` text placeholders, diagrams print
+  as their Mermaid source, and when the document is in Markdown or Slide mode
+  or is Markdown-backed (e.g. opened from a `.md` file), inline markup (`**`,
+  links, list markers) prints literally; each is counted in the export report
+  (health bar in the GUI, `warning:` lines in the CLI). In a plain Editor
+  document that is not Markdown-backed, `**` is text you typed and prints as
+  written, uncounted. Embedding images and
+  rendered diagrams is planned.
 - Canceling an in-flight AI action stops it from changing the document, but the
   HTTP request itself isn't aborted server-side (planned for v2.x).
 

@@ -24,7 +24,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { create } from "zustand";
 import { api } from "../api";
-import { useT } from "../i18n";
+import { tf, translateWith, useLang, useT } from "../i18n";
 import { useStore } from "../store";
 import type { RagSearchHit, RagSourceInfo } from "../types";
 import { CloseIcon, FolderIcon, PlusIcon, SpinnerIcon, TrashIcon } from "./icons";
@@ -59,6 +59,7 @@ function message(e: unknown): string {
 
 export default function PersonalLibraryPanel() {
   const t = useT();
+  const lang = useLang();
   const open_ = usePersonalLibraryPanelStore((s) => s.open);
   const setOpen = usePersonalLibraryPanelStore((s) => s.setOpen);
   const settings = useStore((s) => s.settings);
@@ -107,7 +108,7 @@ export default function PersonalLibraryPanel() {
         multiple: false,
         directory: false,
         filters: [
-          { name: "Reference", extensions: ["txt", "md", "markdown", "rtf", "pdf"] },
+          { name: t("Reference"), extensions: ["txt", "md", "markdown", "rtf", "pdf"] },
         ],
       });
       if (typeof selected !== "string") return;
@@ -117,11 +118,16 @@ export default function PersonalLibraryPanel() {
       if (count === 0) {
         useStore
           .getState()
-          .notify(`No extractable text found in ${fileName(selected)}.`, "info");
+          .notify(tf("No extractable text found in {file}.", { file: fileName(selected) }), "info");
       } else {
         useStore
           .getState()
-          .notify(`Added ${fileName(selected)} (${count} passage${count === 1 ? "" : "s"}).`, "success");
+          .notify(
+            count === 1
+              ? tf("Added {file} (1 passage).", { file: fileName(selected) })
+              : tf("Added {file} ({n} passages).", { file: fileName(selected), n: count }),
+            "success"
+          );
       }
       await refresh();
     } catch (e) {
@@ -136,7 +142,7 @@ export default function PersonalLibraryPanel() {
     setError(null);
     try {
       await api.ragRemoveSource(path);
-      useStore.getState().notify(`Removed ${fileName(path)} from the personal library.`, "success");
+      useStore.getState().notify(tf("Removed {file} from the personal library.", { file: fileName(path) }), "success");
       await refresh();
     } catch (e) {
       setError(message(e));
@@ -177,18 +183,16 @@ export default function PersonalLibraryPanel() {
       </div>
 
       <p className="mb-2 text-xs text-ink-faint">
-        Add your own past papers/notes so AI actions can optionally ground
-        writing in them — fully on-device (embedding, indexing, and search all
-        run locally; only a one-time embedding-model download touches the
-        network).
+        {t(
+          "Add your own past papers/notes so AI actions can optionally ground writing in them — fully on-device (embedding, indexing, and search all run locally; only a one-time embedding-model download touches the network)."
+        )}
       </p>
 
       {/* Off state: the setting itself is disabled — this is a distinct state
           from "enabled but empty", so the user knows exactly what to do. */}
       {!enabled && (
         <div className="rounded-md bg-amber-50/60 px-2 py-3 text-center text-xs text-amber-700">
-          Personal RAG is off. Turn on "Personal knowledge base" in Settings to
-          add files here.
+          {t("Personal RAG is off. Turn on “Personal knowledge base” in Settings to add files here.")}
         </div>
       )}
 
@@ -198,7 +202,9 @@ export default function PersonalLibraryPanel() {
             <span className="text-[11px] text-ink-faint">
               {sources === null
                 ? ""
-                : `${sources.length} source${sources.length === 1 ? "" : "s"} indexed`}
+                : sources.length === 1
+                  ? t("1 source indexed")
+                  : translateWith("{n} sources indexed", lang, { n: sources.length })}
             </span>
             <button
               onClick={() => void addSource()}
@@ -241,13 +247,15 @@ export default function PersonalLibraryPanel() {
                     {fileName(s.path)}
                   </span>
                   <span className="shrink-0 text-[10px] text-ink-faint">
-                    {s.passageCount} passage{s.passageCount === 1 ? "" : "s"}
+                    {s.passageCount === 1
+                      ? t("1 passage")
+                      : translateWith("{n} passages", lang, { n: s.passageCount })}
                   </span>
                   <button
                     onClick={() => void removeSource(s.path)}
                     disabled={removingPath === s.path}
                     className="shrink-0 text-ink-faint hover:text-red-600 disabled:opacity-50"
-                    aria-label={`Remove ${fileName(s.path)} from the personal library`}
+                    aria-label={translateWith("Remove {file} from the personal library", lang, { file: fileName(s.path) })}
                     title={t("Remove from library")}
                   >
                     {removingPath === s.path ? (
@@ -281,7 +289,7 @@ export default function PersonalLibraryPanel() {
                 disabled={!query.trim() || searching || (sources?.length ?? 0) === 0}
                 className="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-ink-soft hover:bg-gray-100 disabled:opacity-40"
               >
-                {searching ? "…" : "Search"}
+                {searching ? "…" : t("Search")}
               </button>
             </div>
 

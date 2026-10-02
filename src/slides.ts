@@ -8,8 +8,12 @@
 // an empty-string layout override counts as NO override (deck.rs filters it);
 // `slideImages`/`splitImageRegion` mirror the pptx.rs multi-image grid contract
 // (same visuals ordering, cell split and gap); and `slideOverflows` ports the
-// pptx.rs A7 overflow heuristic (same thresholds).
+// pptx.rs A7 overflow heuristic (same thresholds). Slide BODY text goes
+// through the Markdown converter in `slideText.ts` (twin of slidetext.rs,
+// golden-fixture locked) — `slideParagraphs` is what Preview/Present render
+// and what pptx.rs exports.
 
+import { chunkToParagraphs, paragraphLines, type SlidePara } from "./slideText";
 import type { Chunk, SlideLayout } from "./types";
 
 export interface SlideGroup {
@@ -110,21 +114,21 @@ export function slideTitle(s: SlideGroup, docTitle: string): string {
 
 /**
  * The lead chunk of a slide (heading, else first chunk) — where slide-level
- * overrides (layout, slideBody) live. Same host as `layoutHost`.
+ * overrides (layout, slideBody, speaker notes) live. Same host as `layoutHost`.
  */
 export function slideLead(s: SlideGroup): Chunk | undefined {
   return headingOf(s) ?? s.items[0];
 }
 
 /**
- * The slide's speaker notes: its heading chunk's `metadata.notes`, or an
- * empty string when absent. Sync contract: this MUST mirror deck.rs's
- * `document_to_deck` notes derivation exactly — change one, change both (see
- * the deck.rs module doc comment). A heading-less (leading) slide has no
- * heading chunk to carry notes, so it always returns "".
+ * The slide's speaker notes: its LEAD chunk's `metadata.notes` (the heading,
+ * or the first chunk of a heading-less leading slide), or "" when absent.
+ * Notes on any other chunk are ignored. Sync contract: this MUST mirror
+ * deck.rs's `document_to_deck` notes derivation exactly — change one, change
+ * both (see the deck.rs module doc comment, which also states the limits).
  */
 export function slideNotes(s: SlideGroup): string {
-  return headingOf(s)?.metadata.notes ?? "";
+  return slideLead(s)?.metadata.notes ?? "";
 }
 
 /**
@@ -142,11 +146,13 @@ export function slideSubtitle(s: SlideGroup): string | undefined {
 }
 
 /**
- * The slide's bullet lines. When the slide is "detached" (its lead chunk carries
- * a `slideBody`), those custom/summarised lines are used instead of the linked
- * editor paragraphs (Req 2). Otherwise every non-subtitle text chunk is a bullet
- * (deck.rs makes every non-heading paragraph a bullet; D2); an explicit subtitle
- * chunk (Req 3) is excluded since it renders in the subtitle box.
+ * The slide's RAW body strings (unconverted Markdown) — the AI summarize/
+ * bulletize input. Renderers use `slideParagraphs` instead. When the slide is
+ * "detached" (its lead chunk carries a `slideBody`), those custom/summarised
+ * lines are used instead of the linked editor paragraphs (Req 2). Otherwise
+ * every non-subtitle text chunk contributes (deck.rs makes every non-heading
+ * paragraph body text; D2); an explicit subtitle chunk (Req 3) is excluded
+ * since it renders in the subtitle box.
  */
 export function slideBullets(s: SlideGroup): string[] {
   const override = slideLead(s)?.metadata.slideBody;
@@ -155,6 +161,17 @@ export function slideBullets(s: SlideGroup): string[] {
     .filter((c) => c.metadata.chunkType === "text" && !c.metadata.subtitle)
     .map((c) => c.content.trim())
     .filter(Boolean);
+}
+
+/**
+ * The slide body as converted paragraphs (BUG-020): every `slideBullets`
+ * string run through `chunkToParagraphs`, so list items are separate bullets,
+ * fences become code lines and inline Markdown becomes runs. Mirrors pptx.rs
+ * `body_paragraphs` (same sources, same trim/blank filtering, same converter).
+ * The section layout's subtitle fallback is the first of these.
+ */
+export function slideParagraphs(s: SlideGroup): SlidePara[] {
+  return slideBullets(s).flatMap(chunkToParagraphs);
 }
 
 /** True if this slide is "detached" — showing custom slideBody, not the prose (Req 2). */
@@ -238,10 +255,12 @@ const PPTX_MARGIN = 685_800;
 const PPTX_SUBTITLE_H = 700_000;
 
 /**
- * Estimate whether a slide's bullets overflow its body box — the char-count
+ * Estimate whether a slide's body overflows its body box — the char-count
  * heuristic PORTED from pptx.rs (build_slide's A7 overflow check; same
  * chars-per-line and max-line thresholds, including the subtitle-box height
- * scaling). Keep the two in sync. Drives the rail's "may overflow" badge so the
+ * scaling). Lines are counted over the VISIBLE text of the converted
+ * paragraphs (`paragraphLines`, golden-locked with Rust), so Markdown markers
+ * and link URLs never count. Keep the two in sync. Drives the rail's "may overflow" badge so the
  * user can split the slide BEFORE exporting a clipped .pptx.
  */
 export function slideOverflows(s: SlideGroup): boolean {
@@ -260,11 +279,7 @@ export function slideOverflows(s: SlideGroup): boolean {
   const baseAvail = PPTX_SLIDE_H - PPTX_BODY_Y - PPTX_MARGIN;
   const avail = baseAvail - (slideSubtitle(s) ? PPTX_SUBTITLE_H : 0);
   const maxLines = Math.max(1, Math.floor((baseMaxLines * avail) / baseAvail));
-  const lines = slideBullets(s).reduce(
-    (sum, t) => sum + Math.max(1, Math.ceil([...t].length / cpl)),
-    0
-  );
-  return lines > maxLines;
+  return paragraphLines(slideParagraphs(s), cpl) > maxLines;
 }
 
 /**

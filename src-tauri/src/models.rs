@@ -96,8 +96,9 @@ pub struct ChunkMetadata {
     /// broken by document order) — see the multi-image grid in `pptx.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,
-    /// Speaker notes for the slide this chunk begins (only meaningful on a
-    /// heading chunk that starts a slide). Populated into `Slide::notes` by
+    /// Speaker notes for the slide this chunk leads. Only read from a slide's
+    /// lead chunk: its heading, or the first chunk of a heading-less leading
+    /// slide (mirrors the TS `slideNotes`). Populated into `Slide::notes` by
     /// `deck::document_to_deck` and emitted as a PPTX notesSlide part by
     /// `pptx.rs`. A present-but-empty-after-trim string is normalized to
     /// `None` (see `Document::normalize`) so the field never round-trips as
@@ -257,11 +258,14 @@ pub struct Document {
     /// Persisted relationship graph (spec §3.4) so it survives save/reopen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<AnalysisResult>,
-    /// Exact Markdown source captured while the Markdown workspace was
-    /// authoritative. May linger stale after `mode` changes away from
-    /// "markdown" (ordinary chunk edits don't clear it) — every consumer
-    /// (`document_to_md`/`documentToMarkdown`) MUST ignore this field unless
-    /// `mode == "markdown"`, deriving fresh text from `chunks` otherwise.
+    /// Canonical Markdown text of a Markdown-backed document (mirrors the TS
+    /// `Document.markdownSource` doc). In "markdown" mode it is current and
+    /// written verbatim. In "editor"/"slide" mode it is the frontend's merge
+    /// baseline: TS `documentToMarkdown` keeps the bytes of unedited blocks.
+    /// The GUI's .md saves send `mode: "markdown"` plus the TS-merged text, so
+    /// `document_to_md` writes it as-is. Rust has no merge: outside "markdown"
+    /// mode `document_to_md` ignores this field and regenerates from `chunks`
+    /// (the CLI/MCP path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub markdown_source: Option<String>,
 }
@@ -495,7 +499,7 @@ pub struct Slide {
     #[serde(default)]
     pub chunks: Vec<Chunk>,
     /// Speaker notes, derived by `deck::document_to_deck` from the slide's
-    /// heading chunk's `ChunkMetadata::notes` (empty string when absent).
+    /// lead chunk's `ChunkMetadata::notes` (empty string when absent).
     /// Emitted as a PPTX notesSlide part by `pptx.rs`.
     #[serde(default)]
     pub notes: String,

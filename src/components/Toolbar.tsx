@@ -1,8 +1,8 @@
 // Global toolbar: file operations, export menu, undo/redo, document analysis,
 // and settings. Kept visually quiet to honour the "Clarity & Simplicity" goal.
 
-import { useEffect, useRef, useState } from "react";
-import { analyzeDocument, speakChunks, stopSpeaking } from "../aiActions";
+import { type RefObject, useEffect, useRef, useState } from "react";
+import { analyzeDocument, hasAnalyzableContent, speakChunks, stopSpeaking } from "../aiActions";
 import {
   exportDocument,
   exportPdf,
@@ -11,9 +11,12 @@ import {
   openFolder,
   openNative,
   saveNative,
+  saveNativeAs,
 } from "../fileActions";
 import { useT } from "../i18n";
+import { isImeKeyEvent } from "../modalBehavior";
 import { useStore } from "../store";
+import { settingsButtonLabel } from "../toolbarLabels";
 import type { ExportFormat } from "../types";
 import {
   CommentIcon,
@@ -37,22 +40,56 @@ function ToolButton({
   title,
   children,
   disabled,
+  expanded,
 }: {
   onClick: () => void;
   title: string;
   children: React.ReactNode;
   disabled?: boolean;
+  /** For dropdown toggles: whether the menu is open (aria-expanded). */
+  expanded?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
       title={title}
       disabled={disabled}
-      className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm text-ink-soft transition-colors hover:bg-gray-100 hover:text-ink disabled:opacity-40 disabled:hover:bg-transparent"
+      aria-expanded={expanded}
+      className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm text-ink-soft transition-colors hover:bg-chrome-hairline hover:text-ink disabled:opacity-40 disabled:hover:bg-transparent"
     >
       {children}
     </button>
   );
+}
+
+/**
+ * Close a toolbar dropdown on an outside mousedown or on Escape. Escape that
+ * commits an IME conversion is ignored (KBD-IME-ENTER).
+ */
+function useDropdownDismiss(
+  open: boolean,
+  setOpen: (open: boolean) => void,
+  ref: RefObject<HTMLElement | null>
+) {
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (isImeKeyEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open, setOpen, ref]);
 }
 
 export default function Toolbar() {
@@ -70,6 +107,7 @@ export default function Toolbar() {
   const openHelp = useStore((s) => s.openHelp);
   const toggleNetwork = useStore((s) => s.toggleNetwork);
   const networkOpen = useStore((s) => s.networkOpen);
+  const analyzable = useStore((s) => hasAnalyzableContent(s.doc));
   const toggleReviewPanel = useStore((s) => s.toggleReviewPanel);
   const reviewPanelOpen = useStore((s) => s.reviewPanelOpen);
   const toggleFolderTree = useStore((s) => s.toggleFolderTree);
@@ -81,28 +119,23 @@ export default function Toolbar() {
   const fileMenuRef = useRef<HTMLDivElement>(null);
   const [openMenuOpen, setOpenMenuOpen] = useState(false);
   const openMenuRef = useRef<HTMLDivElement>(null);
+  const [saveMenuOpen, setSaveMenuOpen] = useState(false);
+  const saveMenuRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!fileMenuOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (fileMenuRef.current && !fileMenuRef.current.contains(e.target as Node)) {
-        setFileMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [fileMenuOpen]);
+  useDropdownDismiss(fileMenuOpen, setFileMenuOpen, fileMenuRef);
+  useDropdownDismiss(openMenuOpen, setOpenMenuOpen, openMenuRef);
+  useDropdownDismiss(saveMenuOpen, setSaveMenuOpen, saveMenuRef);
 
-  useEffect(() => {
-    if (!openMenuOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (openMenuRef.current && !openMenuRef.current.contains(e.target as Node)) {
-        setOpenMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [openMenuOpen]);
+  const settingsLabel = settingsButtonLabel(model, hasApiKey, t);
+
+  const onSave = () => {
+    setSaveMenuOpen(false);
+    void saveNative();
+  };
+  const onSaveAs = () => {
+    setSaveMenuOpen(false);
+    void saveNativeAs();
+  };
 
   const onOpenFile = () => {
     setOpenMenuOpen(false);
@@ -131,59 +164,90 @@ export default function Toolbar() {
   };
 
   return (
-    <header className="sticky top-0 z-20 flex flex-wrap items-center gap-1 border-b border-gray-200 bg-white/90 px-3 py-1.5 backdrop-blur">
+    <header className="sticky top-0 z-20 flex flex-wrap items-center gap-1 border-b border-chrome-line bg-white/90 px-3 py-1.5 backdrop-blur">
       <div className="flex items-center gap-0.5">
         <div ref={openMenuRef} className="relative">
           <ToolButton
             onClick={() => setOpenMenuOpen((v) => !v)}
-            title={t("Open a file (⌘O) or a folder (⌘⇧O)")}
+            title={t("Open a file (⌘O) or a folder (⇧⌘O)")}
+            expanded={openMenuOpen}
           >
             <FolderIcon /> {t("Open")}
           </ToolButton>
           {openMenuOpen && (
-            <div className="absolute left-0 top-9 z-30 w-48 rounded-lg border border-gray-200 bg-white p-1 shadow-lg">
+            <div className="absolute left-0 top-9 z-30 w-48 rounded-lg border border-chrome-line bg-white p-1 shadow-lg">
               <button
                 onClick={onOpenFile}
-                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-gray-100"
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
               >
                 <FileIcon className="h-4 w-4" /> {t("Open File…")} <span className="ml-auto text-xs text-ink-faint">⌘O</span>
               </button>
               <button
                 onClick={onOpenFolder}
-                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-gray-100"
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
               >
-                <FolderIcon className="h-4 w-4" /> {t("Open Folder…")} <span className="ml-auto text-xs text-ink-faint">⌘⇧O</span>
+                <FolderIcon className="h-4 w-4" /> {t("Open Folder…")} <span className="ml-auto text-xs text-ink-faint">⇧⌘O</span>
               </button>
             </div>
           )}
         </div>
-        <ToolButton onClick={() => void saveNative()} title={t("Save (⌘/Ctrl+S)")}>
-          <SaveIcon /> {t("Save")}
-        </ToolButton>
+        {/* Save split control (BUG-009c): the main button saves; the named
+            chevron offers Save / Save As… with their shortcuts. */}
+        <div ref={saveMenuRef} className="relative flex items-center">
+          <ToolButton onClick={() => void saveNative()} title={t("Save (⌘/Ctrl+S)")}>
+            <SaveIcon /> {t("Save")}
+          </ToolButton>
+          <button
+            onClick={() => setSaveMenuOpen((v) => !v)}
+            title={t("More save options")}
+            aria-label={t("More save options")}
+            aria-expanded={saveMenuOpen}
+            className="-ml-1 rounded-md px-1 py-1.5 text-xs text-ink-faint transition-colors hover:bg-chrome-hairline hover:text-ink"
+          >
+            <span aria-hidden="true">▾</span>
+          </button>
+          {saveMenuOpen && (
+            <div className="absolute left-0 top-9 z-30 w-52 rounded-lg border border-chrome-line bg-white p-1 shadow-lg">
+              <button
+                onClick={onSave}
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
+              >
+                <SaveIcon className="h-4 w-4" /> {t("Save")} <span className="ml-auto text-xs text-ink-faint">⌘S</span>
+              </button>
+              <button
+                onClick={onSaveAs}
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
+              >
+                <SaveIcon className="h-4 w-4" /> {t("Save As…")} <span className="ml-auto text-xs text-ink-faint">⇧⌘S</span>
+              </button>
+            </div>
+          )}
+        </div>
         <ToolButton
           onClick={() => toggleFolderTree()}
           title={folderTreeOpen ? t("Hide files sidebar") : t("Show files sidebar")}
         >
-          <FolderIcon /> {folderTreeOpen ? t("Hide files") : t("Files")}
+          <FolderIcon /> {folderTreeOpen ? t("Hide files") : t("Show files")}
         </ToolButton>
 
         {/* Import + Export merged into one menu (choose after clicking). */}
         <div ref={fileMenuRef} className="relative">
           <ToolButton
             onClick={() => setFileMenuOpen((v) => !v)}
-            title={t("Import or export .txt / .md / .rtf")}
+            title={t("Import .txt / .md / .rtf, or export to .txt / .md / .rtf / .pptx / .pdf")}
+            expanded={fileMenuOpen}
           >
             <ImportIcon /> {t("Import / Export")}
           </ToolButton>
           {fileMenuOpen && (
-            <div className="absolute left-0 top-9 z-30 w-52 rounded-lg border border-gray-200 bg-white p-1 shadow-lg">
+            <div className="absolute left-0 top-9 z-30 w-52 rounded-lg border border-chrome-line bg-white p-1 shadow-lg">
               <button
                 onClick={onImport}
-                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-gray-100"
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
               >
                 <ImportIcon className="h-4 w-4" /> {t("Import .txt / .md / .rtf…")}
               </button>
-              <div className="my-1 border-t border-gray-100" />
+              <div className="my-1 border-t border-chrome-hairline" />
               <div className="px-2.5 pb-0.5 pt-1 text-xs font-medium text-ink-faint">
                 {t("Export as")}
               </div>
@@ -191,20 +255,20 @@ export default function Toolbar() {
                 <button
                   key={fmt}
                   onClick={() => doExport(fmt)}
-                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-gray-100"
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
                 >
                   <ExportIcon className="h-4 w-4" /> .{fmt}
                 </button>
               ))}
               <button
                 onClick={doExportPptx}
-                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-gray-100"
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
               >
                 <ExportIcon className="h-4 w-4" /> .pptx
               </button>
               <button
                 onClick={doExportPdf}
-                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-gray-100"
+                className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm text-ink-soft hover:bg-chrome-hairline"
               >
                 <ExportIcon className="h-4 w-4" /> .pdf
               </button>
@@ -213,14 +277,15 @@ export default function Toolbar() {
         </div>
       </div>
 
-      <div className="mx-1 h-5 w-px bg-gray-200" />
+      <div className="mx-1 h-5 w-px bg-chrome-line" />
 
       {/* Editor, exact-source Markdown, and slide projections share one doc. */}
-      <div className="flex shrink-0 overflow-hidden rounded-md border border-gray-200 text-sm shadow-sm">
+      <div className="flex shrink-0 overflow-hidden rounded-md border border-chrome-line text-sm shadow-sm">
         {(["editor", "markdown", "slide"] as const).map((m) => (
           <button
             key={m}
             onClick={() => setMode(m)}
+            aria-pressed={mode === m}
             title={
               m === "editor"
                 ? t("Paragraph editor view")
@@ -229,13 +294,15 @@ export default function Toolbar() {
                   : t("Slide deck view")
             }
             className={`flex items-center gap-1.5 px-2.5 py-1 ${
-              mode === m ? "bg-accent text-white" : "bg-white text-ink-soft hover:bg-gray-100"
+              mode === m ? "bg-accent text-white" : "bg-white text-ink-soft hover:bg-chrome-hairline"
             }`}
           >
             {m === "editor" ? (
               <FileIcon className="h-3.5 w-3.5" />
             ) : m === "markdown" ? (
-              <span className="font-mono text-[10px] font-semibold">MD</span>
+              <span className="font-mono text-[10px] font-semibold" aria-hidden="true">
+                MD
+              </span>
             ) : (
               <SlidesIcon className="h-3.5 w-3.5" />
             )}
@@ -244,7 +311,7 @@ export default function Toolbar() {
         ))}
       </div>
 
-      <div className="mx-1 h-5 w-px bg-gray-200" />
+      <div className="mx-1 h-5 w-px bg-chrome-line" />
 
       <ToolButton onClick={undo} title={t("Undo (⌘/Ctrl+Z)")} disabled={!canUndo}>
         {t("Undo")}
@@ -253,7 +320,7 @@ export default function Toolbar() {
         {t("Redo")}
       </ToolButton>
 
-      <div className="mx-1 h-5 w-px bg-gray-200" />
+      <div className="mx-1 h-5 w-px bg-chrome-line" />
 
       <ToolButton
         onClick={openDraft}
@@ -306,31 +373,34 @@ export default function Toolbar() {
         {/* Relationship graph: an optional, occasional-use tool (not a weekly
             essential), so it lives here in the quiet secondary cluster rather
             than as a hero peer to Draft/Save/Export — still reachable via the
-            command palette ("Analyze relationships") as the primary path. */}
+            command palette ("Analyze relationships") as the primary path.
+            Disabled, with the reason as its tooltip, while the document has
+            no text to analyze (BUG-015a); "Hide graph" always stays enabled. */}
         <button
           onClick={() => {
             if (networkOpen) toggleNetwork(false);
             else void analyzeDocument();
           }}
-          title={t("Map the logic between paragraphs → optional relationship graph")}
-          disabled={!networkOpen && !!globalBusy}
-          className="flex items-center gap-1 rounded-md px-2 py-1.5 text-xs text-ink-faint transition-colors hover:bg-gray-100 hover:text-ink-soft disabled:opacity-40 disabled:hover:bg-transparent"
+          title={
+            !networkOpen && !analyzable
+              ? t("Nothing to analyze yet — write some text first.")
+              : t("Map the logic between paragraphs → optional relationship graph")
+          }
+          disabled={!networkOpen && (!!globalBusy || !analyzable)}
+          className="flex items-center gap-1 rounded-md px-2 py-1.5 text-xs text-ink-faint transition-colors hover:bg-chrome-hairline hover:text-ink-soft disabled:opacity-40 disabled:hover:bg-transparent"
         >
           <NetworkIcon className="h-3.5 w-3.5" /> {networkOpen ? t("Hide graph") : t("Analyze")}
         </button>
 
         <button
           onClick={openSettings}
-          title={
-            hasApiKey
-              ? `Model: ${model || "(default)"}`
-              : t("API key not set — click to configure")
-          }
-          className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm text-ink-soft hover:bg-gray-100 hover:text-ink"
+          title={settingsLabel}
+          aria-label={settingsLabel}
+          className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm text-ink-soft hover:bg-chrome-hairline hover:text-ink"
         >
           <span
             className={`h-2 w-2 rounded-full ${
-              hasApiKey ? "bg-emerald-500" : "bg-amber-400"
+              hasApiKey ? "bg-ok" : "bg-warn-dot"
             }`}
           />
           <SettingsIcon />

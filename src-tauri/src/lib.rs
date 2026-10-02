@@ -12,10 +12,12 @@ mod mcp;
 mod menu;
 mod models;
 mod net;
+mod openrouter_models;
 mod pdf;
 mod pptx;
 mod rag;
 mod settings;
+mod slidetext;
 
 use tauri::{Emitter, Manager};
 
@@ -57,6 +59,7 @@ pub fn run() {
             commands::import_document,
             commands::export_document,
             commands::export_pptx,
+            commands::export_pdf,
             commands::save_document_json,
             commands::open_document_json,
             commands::list_directory,
@@ -67,6 +70,7 @@ pub fn run() {
             commands::has_api_key,
             commands::delete_api_key,
             commands::get_network_stats,
+            commands::list_openrouter_models,
             commands::ai_process,
             commands::ai_process_stream,
             commands::ai_ghost_complete_stream,

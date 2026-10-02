@@ -1,14 +1,13 @@
 import {
-  createElement,
+  type MutableRefObject,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { defaultKeymap, history, historyKeymap, indentWithTab, isolateHistory } from "@codemirror/commands";
+import { bracketMatching, syntaxHighlighting } from "@codemirror/language";
 import { markdown } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import {
@@ -22,208 +21,96 @@ import {
   lineNumbers,
 } from "@codemirror/view";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { documentToMarkdown } from "../markdown";
-import {
-  findMarkdownLinkAt,
-  markdownUrlTransform,
-  replaceMarkdownRange,
-} from "../markdownPreview";
+import type { TextChange } from "../findReplace";
+import { documentToMarkdown, eolOf, normalizeEol, restoreEol } from "../markdown";
+import { findMarkdownLinkAt } from "../markdownPreview";
+import { markdownSourceHighlightStyle, markdownSourceThemeSpec } from "../markdownSourceTheme";
 import { useT } from "../i18n";
+import { PREVIEW_SCOPE_NOTE, helperFor, type MarkdownSurface } from "../markdownSurfaceHelp";
+import { previewBackgroundOf } from "../previewBackground";
 import { useStore } from "../store";
-import MermaidChunk from "./MermaidChunk";
+import MarkdownPreview, { type LinkRequest } from "./MarkdownPreview";
+import PreviewBackgroundPicker from "./PreviewBackgroundPicker";
+import { editorTopLine, previewTopLine, scrollEditorToLine, scrollPreviewToLine } from "./scrollSync";
+import { usePreviewViewport } from "./usePreviewViewport";
 
-type MarkdownSurface = "edit" | "split" | "preview";
-type PositionedNode = {
-  position?: { start?: { offset?: number }; end?: { offset?: number } };
+
+// ----- Find bridge (BUG-010) -----------------------------------------------
+// The docked FindBar lives outside this component; it reaches the mounted
+// CodeMirror source view (and the Preview → Split switch) through this
+// module-level bridge. Only one Markdown editor is mounted at a time.
+let mountedSourceView: EditorView | null = null;
+let showSourceRequest: (() => void) | null = null;
+
+/** CodeMirror user events of find-bar replacements. The update listener gives
+ *  each its own store undo step (setMarkdownSource … newUndoStep). */
+export const FIND_REPLACE_EVENT = "input.replace";
+
+export const markdownSourceBridge = {
+  /** The mounted source view, or null (Preview surface / not Markdown mode). */
+  view(): EditorView | null {
+    return mountedSourceView;
+  },
+  /** Make the source visible so matches can be shown: Preview → Split. */
+  show(): void {
+    showSourceRequest?.();
+  },
+  /** Select [from, to) and scroll it to the middle; `focus` moves focus into
+   *  the source. False when no source view is mounted. */
+  select(from: number, to: number, focus = false): boolean {
+    const view = mountedSourceView;
+    if (!view) return false;
+    const len = view.state.doc.length;
+    const a = Math.min(Math.max(0, from), len);
+    const b = Math.min(Math.max(a, to), len);
+    view.dispatch({
+      selection: { anchor: a, head: b },
+      effects: EditorView.scrollIntoView(a, { y: "center" }),
+    });
+    if (focus) view.focus();
+    return true;
+  },
+  /** Apply find-bar replacements as ONE isolated CodeMirror history event
+   *  (so ⌘Z in the source undoes exactly the replace) and one store undo
+   *  step. False when no source view is mounted. */
+  replace(changes: readonly TextChange[], all: boolean): boolean {
+    const view = mountedSourceView;
+    if (!view) return false;
+    if (changes.length === 0) return true;
+    view.dispatch({
+      changes: [...changes],
+      annotations: isolateHistory.of("full"),
+      userEvent: all ? `${FIND_REPLACE_EVENT}.all` : FIND_REPLACE_EVENT,
+    });
+    return true;
+  },
 };
-type LinkRequest = { href: string; label: string; x: number; y: number };
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Convert the inline DOM inside one edited rendered block back to Markdown. */
-function renderedInlineToMarkdown(root: HTMLElement): string {
-  const serialize = (node: ChildNode): string => {
-    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
-    if (!(node instanceof HTMLElement)) return "";
-    const body = Array.from(node.childNodes).map(serialize).join("");
-    switch (node.tagName) {
-      case "STRONG":
-      case "B":
-        return `**${body}**`;
-      case "EM":
-      case "I":
-        return `*${body}*`;
-      case "DEL":
-      case "S":
-        return `~~${body}~~`;
-      case "CODE":
-        return `\`${body}\``;
-      case "A":
-        return `[${body}](${node.getAttribute("href") ?? ""})`;
-      case "IMG":
-        return `![${node.getAttribute("alt") ?? ""}](${node.getAttribute("src") ?? ""})`;
-      case "BR":
-        return "\n";
-      case "DIV":
-        return `${body}\n`;
-      default:
-        return body;
-    }
-  };
-  return Array.from(root.childNodes).map(serialize).join("").replace(/\n+$/, "");
-}
-
-function EditableBlock({
-  tag,
-  node,
+function CodeMirrorEditor({
   source,
-  editable,
-  prefix = "",
-  children,
-}: {
-  tag: "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "td" | "th";
-  node?: PositionedNode;
-  source: string;
-  editable: boolean;
-  prefix?: string;
-  children: ReactNode;
-}) {
-  const changed = useRef(false);
-  const t = useT();
-  const setMarkdownSource = useStore((state) => state.setMarkdownSource);
-  const start = node?.position?.start?.offset;
-  const end = node?.position?.end?.offset;
-  const canEdit = editable && typeof start === "number" && typeof end === "number";
-
-  return createElement(
-    tag,
-    {
-      contentEditable: canEdit,
-      suppressContentEditableWarning: true,
-      spellCheck: true,
-      role: canEdit ? "textbox" : undefined,
-      "aria-label": canEdit ? t("Edit rendered Markdown text") : undefined,
-      onInput: () => {
-        changed.current = true;
-      },
-      onBlur: (event: { currentTarget: HTMLElement }) => {
-        if (!canEdit || !changed.current) return;
-        changed.current = false;
-        const current = documentToMarkdown(useStore.getState().doc);
-        // Positions belong to `source`; do not apply a stale span over a newer
-        // simultaneous source edit.
-        if (current !== source) return;
-        const text = renderedInlineToMarkdown(event.currentTarget);
-        setMarkdownSource(replaceMarkdownRange(current, start, end, `${prefix}${text}`));
-      },
-    },
-    children
-  );
-}
-
-function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
-  const [failed, setFailed] = useState(false);
-  const t = useT();
-  useEffect(() => setFailed(false), [src]);
-  if (!src || failed) {
-    return (
-      <span className="markdown-image-error font-sans text-sm text-ink-faint" role="img" aria-label={alt || t("Image")}>
-        {t("Image could not be displayed")}{alt ? `: ${alt}` : "."}
-      </span>
-    );
-  }
-  return <img src={src} alt={alt ?? ""} loading="lazy" onError={() => setFailed(true)} />;
-}
-
-function MarkdownPreview({
-  source,
-  editable = true,
   onLink,
+  viewRef: exposed,
+  onScroll,
 }: {
   source: string;
-  editable?: boolean;
-  onLink?: (request: LinkRequest) => void;
+  onLink: (request: LinkRequest) => void;
+  viewRef?: MutableRefObject<EditorView | null>;
+  onScroll?: () => void;
 }) {
-  const t = useT();
-  const zoom = useStore((state) => state.markdownZoom);
-  if (!source.trim()) {
-    return (
-      <div className="flex h-full items-center justify-center px-8 text-center font-sans text-sm text-ink-faint">
-        {t("Start writing Markdown to see the preview.")}
-      </div>
-    );
-  }
-
-  const block = (tag: Parameters<typeof EditableBlock>[0]["tag"], prefix = "") =>
-    ({ node, children }: { node?: PositionedNode; children?: ReactNode }) => (
-      <EditableBlock tag={tag} node={node} source={source} editable={editable} prefix={prefix}>
-        {children}
-      </EditableBlock>
-    );
-
-  return (
-    /* `zoom` (not font-size) so the WHOLE page scales — text, measure, margins,
-       tables and images together — instead of only reflowing text inside a
-       fixed-width column. Lengths keep their layout meaning, so the scroll
-       container can reach whatever no longer fits. */
-    <article
-      className="markdown-preview mx-auto w-full max-w-prose px-10 py-12 font-sans text-ink"
-      style={{ zoom }}
-    >
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        urlTransform={markdownUrlTransform}
-        components={{
-          h1: block("h1", "# "),
-          h2: block("h2", "## "),
-          h3: block("h3", "### "),
-          h4: block("h4", "#### "),
-          h5: block("h5", "##### "),
-          h6: block("h6", "###### "),
-          p: block("p"),
-          td: block("td"),
-          th: block("th"),
-          a: ({ children, href }) => (
-            <a
-              href={href}
-              contentEditable={false}
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                if (href) onLink?.({ href, label: event.currentTarget.innerText, x: event.clientX, y: event.clientY });
-              }}
-            >
-              {children}
-            </a>
-          ),
-          img: ({ src, alt }) => <MarkdownImage src={src} alt={alt} />,
-          code: ({ className, children, ...props }) => {
-            if (className === "language-mermaid") {
-              return <MermaidChunk code={String(children).replace(/\n$/, "")} />;
-            }
-            return (
-              <code className={className} {...props} contentEditable={false}>
-                {children}
-              </code>
-            );
-          },
-        }}
-      >
-        {source}
-      </ReactMarkdown>
-    </article>
-  );
-}
-
-function CodeMirrorEditor({ source, onLink }: { source: string; onLink: (request: LinkRequest) => void }) {
   const t = useT();
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const setMarkdownSource = useStore((state) => state.setMarkdownSource);
+  // md-slides-export-3: CodeMirror stores LF only. The editor gets LF text and
+  // every write-back is converted to the source's line ending, so opening a
+  // CRLF file is not an edit (no dirty, no undo step) and saving keeps CRLF.
+  // Sticky: a source with no line break yet keeps the last known ending.
+  const eolRef = useRef(eolOf(source));
+  if (/\r\n|\n/.test(source)) eolRef.current = eolOf(source);
 
   const extensions = useMemo(
     () => [
@@ -237,11 +124,18 @@ function CodeMirrorEditor({ source, onLink }: { source: string; onLink: (request
       EditorState.allowMultipleSelections.of(true),
       bracketMatching(),
       markdown(),
-      syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+      syntaxHighlighting(markdownSourceHighlightStyle),
       keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
       EditorView.lineWrapping,
       EditorView.updateListener.of((update) => {
-        if (update.docChanged) setMarkdownSource(update.state.doc.toString());
+        if (!update.docChanged) return;
+        // A find-bar replace is its own store undo step, never merged into
+        // the typing session before it (BUG-010).
+        const replaced = update.transactions.some((tr) => tr.isUserEvent(FIND_REPLACE_EVENT));
+        setMarkdownSource(
+          restoreEol(update.state.doc.toString(), eolRef.current),
+          replaced ? { newUndoStep: true } : undefined
+        );
       }),
       EditorView.domEventHandlers({
         click: (event, view) => {
@@ -254,30 +148,8 @@ function CodeMirrorEditor({ source, onLink }: { source: string; onLink: (request
           return true;
         },
       }),
-      EditorView.theme({
-        "&": {
-          height: "100%",
-          backgroundColor: "transparent",
-          color: "var(--color-ink)",
-          fontSize: "var(--editor-font-size, 17px)",
-        },
-        ".cm-scroller": {
-          fontFamily: "var(--font-content-mono)",
-          lineHeight: "1.75",
-          padding: "28px 0 56px",
-        },
-        ".cm-content": { maxWidth: "52rem", margin: "0 auto", padding: "0 32px" },
-        ".cm-gutters": {
-          backgroundColor: "transparent",
-          color: "var(--color-ink-faint)",
-          border: "none",
-        },
-        ".cm-activeLine, .cm-activeLineGutter": { backgroundColor: "var(--color-accent-wash)" },
-        ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
-          backgroundColor: "var(--color-selection) !important",
-        },
-        "&.cm-focused": { outline: "none" },
-      }),
+      // Layout, active line and selection styling (tokens only; see module doc).
+      EditorView.theme(markdownSourceThemeSpec),
     ],
     [onLink, setMarkdownSource]
   );
@@ -286,19 +158,27 @@ function CodeMirrorEditor({ source, onLink }: { source: string; onLink: (request
     if (!hostRef.current) return;
     const view = new EditorView({
       parent: hostRef.current,
-      state: EditorState.create({ doc: source, extensions }),
+      state: EditorState.create({ doc: normalizeEol(source), extensions }),
     });
     viewRef.current = view;
+    mountedSourceView = view;
+    if (exposed) exposed.current = view;
+    const scroller = view.scrollDOM;
+    const handleScroll = () => onScroll?.();
+    scroller.addEventListener("scroll", handleScroll, { passive: true });
     return () => {
+      scroller.removeEventListener("scroll", handleScroll);
       view.destroy();
       viewRef.current = null;
+      if (mountedSourceView === view) mountedSourceView = null;
+      if (exposed) exposed.current = null;
     };
   }, [extensions]);
 
   useEffect(() => {
     const view = viewRef.current;
-    if (!view || view.state.doc.toString() === source) return;
-    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: source } });
+    if (!view || view.state.doc.toString() === normalizeEol(source)) return;
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: normalizeEol(source) } });
   }, [source]);
 
   return <div ref={hostRef} className="h-full min-h-0 overflow-hidden" aria-label={t("Markdown source editor")} />;
@@ -353,8 +233,63 @@ export default function MarkdownEditor() {
   const [link, setLink] = useState<LinkRequest | null>(null);
   const zoom = useStore((state) => state.markdownZoom);
   const setMarkdownZoom = useStore((state) => state.setMarkdownZoom);
+  const offsetX = useStore((state) => state.markdownOffsetX);
+  const setMarkdownOffsetX = useStore((state) => state.setMarkdownOffsetX);
+  const previewBg = useStore((state) => previewBackgroundOf(state.settings));
 
   const showLink = useCallback((request: LinkRequest) => setLink(request), []);
+
+  // Keep the reading position across Preview / Split / Edit: capture the source
+  // line at the top of the surface being read, switch, then scroll the new
+  // surface(s) to that line. In Split, "being read" = the pane scrolled last.
+  const editorView = useRef<EditorView | null>(null);
+  const previewScroller = useRef<HTMLDivElement>(null);
+  const lastScrolled = useRef<"editor" | "preview">("preview");
+  const pendingLine = useRef<number | null>(null);
+  usePreviewViewport(previewScroller, surface !== "edit");
+  const markEditorScrolled = useCallback(() => {
+    lastScrolled.current = "editor";
+  }, []);
+
+  const switchSurface = (next: MarkdownSurface) => {
+    if (next === surface) return;
+    const fromPreview = surface === "preview" || (surface === "split" && lastScrolled.current === "preview");
+    pendingLine.current = fromPreview ? previewTopLine(previewScroller.current) : editorTopLine(editorView.current);
+    setSurface(next);
+  };
+
+  // BUG-010: opening Find from the Preview shows the source beside it.
+  useEffect(() => {
+    const request = () => {
+      if (surface === "preview") switchSurface("split");
+    };
+    showSourceRequest = request;
+    return () => {
+      if (showSourceRequest === request) showSourceRequest = null;
+    };
+  });
+
+  useEffect(() => {
+    const line = pendingLine.current;
+    pendingLine.current = null;
+    if (line === null) return;
+    const apply = () => {
+      if (surface !== "preview") scrollEditorToLine(editorView.current, line);
+      if (surface !== "edit") scrollPreviewToLine(previewScroller.current, line);
+    };
+    const frame = requestAnimationFrame(apply);
+    // Images and formulas can finish laying out after the first frame and push
+    // the text down; re-anchor a couple of times unless the user takes over.
+    const timers = [250, 700].map((ms) => window.setTimeout(apply, ms));
+    const cancel = () => timers.forEach((id) => window.clearTimeout(id));
+    const events = ["wheel", "keydown", "pointerdown", "touchstart"] as const;
+    events.forEach((type) => window.addEventListener(type, cancel, { once: true, passive: true }));
+    return () => {
+      cancelAnimationFrame(frame);
+      cancel();
+      events.forEach((type) => window.removeEventListener(type, cancel));
+    };
+  }, [surface]);
 
   // ⌘/Ctrl +, −, 0 while the preview is on screen — the shortcuts people
   // already expect for "make this bigger", scoped to this view so they never
@@ -383,7 +318,7 @@ export default function MarkdownEditor() {
   return (
     <section className="flex h-full min-h-0 flex-col bg-white">
       <div className="flex h-10 shrink-0 items-center justify-between border-b border-ink-faint/30 px-3 font-sans">
-        <div className="text-xs text-ink-faint">{t("Edit source or click rendered text to edit it directly.")}</div>
+        <div className="text-xs text-ink-faint">{t(helperFor(surface))}</div>
         <div className="flex items-center gap-2">
           {surface !== "edit" && (
             <div
@@ -394,7 +329,7 @@ export default function MarkdownEditor() {
                 type="button"
                 onClick={() => setMarkdownZoom(zoom - 0.1)}
                 disabled={zoom <= 0.6}
-                title={`${t("Zoom out")} (⌘−)`}
+                title={`${t("Zoom out")} (⌘−)\n${t(PREVIEW_SCOPE_NOTE)}`}
                 aria-label={t("Zoom out")}
                 className="px-2 py-1.5 text-ink-soft hover:bg-accent/5 disabled:opacity-40 disabled:hover:bg-transparent"
               >
@@ -403,7 +338,7 @@ export default function MarkdownEditor() {
               <button
                 type="button"
                 onClick={() => setMarkdownZoom(1)}
-                title={`${t("Reset zoom to 100%")} (⌘0)`}
+                title={`${t("Reset zoom to 100%")} (⌘0)\n${t("⌘ + scroll or pinch to zoom · swipe sideways, Shift + scroll or Option + drag to move left/right")}\n${t(PREVIEW_SCOPE_NOTE)}`}
                 className="min-w-[3.5rem] border-x border-ink-faint/30 px-2 py-1.5 tabular-nums text-ink-soft hover:bg-accent/5"
               >
                 {Math.round(zoom * 100)}%
@@ -412,7 +347,7 @@ export default function MarkdownEditor() {
                 type="button"
                 onClick={() => setMarkdownZoom(zoom + 0.1)}
                 disabled={zoom >= 2.5}
-                title={`${t("Zoom in")} (⌘+)`}
+                title={`${t("Zoom in")} (⌘+)\n${t(PREVIEW_SCOPE_NOTE)}`}
                 aria-label={t("Zoom in")}
                 className="px-2 py-1.5 text-ink-soft hover:bg-accent/5 disabled:opacity-40 disabled:hover:bg-transparent"
               >
@@ -420,14 +355,25 @@ export default function MarkdownEditor() {
               </button>
             </div>
           )}
+          {surface !== "edit" && offsetX !== 0 && (
+            <button
+              type="button"
+              onClick={() => setMarkdownOffsetX(0)}
+              title={t("Move the preview back to the centre")}
+              className="rounded-md border border-ink-faint/30 px-2 py-1.5 text-xs text-ink-soft shadow-sm hover:bg-accent/5"
+            >
+              {t("Re-center")}
+            </button>
+          )}
+          {surface !== "edit" && <PreviewBackgroundPicker />}
         <div className="flex overflow-hidden rounded-md border border-ink-faint/30 text-xs shadow-sm" aria-label={t("Markdown layout")}>
           {(["edit", "split", "preview"] as const).map((item) => (
             <button
               key={item}
-              onClick={() => setSurface(item)}
+              onClick={() => switchSurface(item)}
               className={`px-3 py-1.5 capitalize ${surface === item ? "bg-accent text-white" : "bg-white text-ink-soft hover:bg-accent/5"}`}
             >
-              {t(item === "edit" ? "Edit" : item === "split" ? "Split" : "Preview")}
+              {item === "edit" ? t("Edit") : item === "split" ? t("Split") : t("Preview")}
             </button>
           ))}
         </div>
@@ -439,12 +385,26 @@ export default function MarkdownEditor() {
           <div className={`grid min-h-0 flex-1 ${surface === "split" ? "grid-cols-2" : "grid-cols-1"}`}>
             {surface !== "preview" && (
               <div className={`min-h-0 overflow-hidden ${surface === "split" ? "border-r border-ink-faint/30" : ""}`}>
-                <CodeMirrorEditor source={source} onLink={showLink} />
+                <CodeMirrorEditor source={source} onLink={showLink} viewRef={editorView} onScroll={markEditorScrolled} />
               </div>
             )}
             {surface !== "edit" && (
-              <div className="min-h-0 overflow-auto bg-white">
-                <MarkdownPreview source={source} onLink={showLink} />
+              <div
+                ref={previewScroller}
+                className="min-h-0 overflow-y-auto overflow-x-hidden"
+                data-preview-bg={previewBg}
+                onScroll={() => {
+                  lastScrolled.current = "preview";
+                }}
+              >
+                {/* Outer wrapper: sideways offset in screen px. Inner: `zoom` (not
+                    font-size) so the WHOLE page scales — text, measure, margins,
+                    tables and images together. */}
+                <div className="relative h-full" style={{ left: offsetX }}>
+                  <div className="h-full" style={{ zoom }}>
+                    <MarkdownPreview source={source} onLink={showLink} />
+                  </div>
+                </div>
               </div>
             )}
           </div>

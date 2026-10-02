@@ -4,13 +4,14 @@
 // read the selection aloud.
 
 import { editSelection, generateImageFromSelection, speakChunks } from "../aiActions";
-import { useT } from "../i18n";
+import { tf, translateWith, useLang, useT } from "../i18n";
 import { canMergeChunks, useStore } from "../store";
 import { promptDialog } from "./PromptModal";
 import { EditIcon, ImageIcon, MergeIcon, SpeakerIcon, SpinnerIcon } from "./icons";
 
 export default function SelectionBar() {
   const t = useT();
+  const lang = useLang();
   const count = useStore((s) => s.selectedChunkIds.length);
   const selectedChunkIds = useStore((s) => s.selectedChunkIds);
   const clearSelection = useStore((s) => s.clearSelection);
@@ -25,9 +26,9 @@ export default function SelectionBar() {
 
   const onEditAll = async () => {
     const instruction = await promptDialog({
-      title: `Edit ${count} paragraphs`,
+      title: tf("Edit {n} paragraphs", { n: count }),
       label: t("Describe the change to apply to every selected paragraph"),
-      placeholder: "e.g. Make each more concise and formal",
+      placeholder: t("e.g. Make each more concise and formal"),
       multiline: true,
       submitLabel: t("Apply to all"),
     });
@@ -37,7 +38,7 @@ export default function SelectionBar() {
   const onMerge = () => {
     const n = selectedChunkIds.length;
     const merged = mergeChunks(selectedChunkIds);
-    if (merged) notify(`Merged ${n} paragraphs.`, "success");
+    if (merged) notify(tf("Merged {n} paragraphs.", { n }), "success");
   };
 
   const onReadSelection = () => {
@@ -51,7 +52,7 @@ export default function SelectionBar() {
 
   return (
     <div className="pointer-events-auto fixed bottom-5 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-full border border-gray-200 bg-white px-4 py-2 shadow-lg">
-      <span className="text-sm text-ink-soft">{count} selected</span>
+      <span className="text-sm text-ink-soft">{translateWith("{n} selected", lang, { n: count })}</span>
       <button
         onClick={() => void onEditAll()}
         disabled={!!globalBusy}
@@ -63,8 +64,8 @@ export default function SelectionBar() {
         disabled={!!globalBusy || !mergeable}
         title={
           mergeable
-            ? "Merge the selected paragraphs into one"
-            : "Select 2+ adjacent text paragraphs to merge"
+            ? t("Merge the selected paragraphs into one")
+            : t("Select 2+ adjacent text paragraphs to merge")
         }
         className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-ink-soft hover:bg-gray-100 disabled:opacity-50"
       >
@@ -75,7 +76,7 @@ export default function SelectionBar() {
         title={t("Read the selected paragraphs aloud (document order)")}
         className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-ink-soft hover:bg-gray-100 disabled:opacity-50"
       >
-        <SpeakerIcon className="h-4 w-4" /> Read
+        <SpeakerIcon className="h-4 w-4" /> {t("Read")}
       </button>
       <button
         onClick={() => void generateImageFromSelection()}

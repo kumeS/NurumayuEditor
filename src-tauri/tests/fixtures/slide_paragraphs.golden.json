@@ -1,0 +1,401 @@
+{
+  "_comment": "Golden contract for the Markdown -> slide paragraph converter (BUG-020, invariant 3). TS chunkToParagraphs (src/slideText.ts) and Rust chunk_to_paragraphs (src-tauri/src/slidetext.rs) must produce exactly `expected` for every case (Rust compares serde_json::Value, so false/None fields must be omitted, never serialized). `lines` locks the shared overflow line count (paragraphLines / paragraph_lines) used by the rail badge and the PPTX overflow warning. `clickable` locks which link targets both renderers treat as links (isClickableHref / is_clickable_href); others render as plain text. Cases marked `oracle` are also checked against react-markdown + remark-gfm (the Markdown Preview renderer) by src/slideText.test.ts. Emphasis follows CommonMark flanking rules exactly like the Preview, so `**「強調」**の` stays literal (a closing ** preceded by punctuation and followed by a letter is not right-flanking), while `の**太字**と` and `「**強調**」の` are bold.",
+  "cases": [
+    {
+      "name": "QA BUG-020 slide 1: bold and link become runs",
+      "input": "最初の段落。**太字**と[リンク](https://example.com)。",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [
+            { "text": "最初の段落。" },
+            { "text": "太字", "bold": true },
+            { "text": "と" },
+            { "text": "リンク", "href": "https://example.com" },
+            { "text": "。" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "QA BUG-020 slide 2: list items are separate bullets without the dash",
+      "input": "- 項目A\n- 項目B",
+      "expected": [
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "項目A" }] },
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "項目B" }] }
+      ]
+    },
+    {
+      "name": "QA BUG-020 slide 2: fenced code is a code paragraph without fences or info string",
+      "input": "```text\nコード行\n```",
+      "expected": [{ "kind": "code", "level": 0, "runs": [{ "text": "コード行" }] }]
+    },
+    {
+      "name": "CJK-adjacent bold",
+      "input": "の**太字**と",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [{ "text": "の" }, { "text": "太字", "bold": true }, { "text": "と" }]
+        }
+      ]
+    },
+    {
+      "name": "bold inside CJK brackets",
+      "input": "「**強調**」の",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [{ "text": "「" }, { "text": "強調", "bold": true }, { "text": "」の" }]
+        }
+      ]
+    },
+    {
+      "name": "bold closing after CJK punctuation before a letter stays literal (CommonMark, same as Preview)",
+      "input": "**「強調」**の",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "**「強調」**の" }] }]
+    },
+    {
+      "name": "intraword underscores never italicize (snake_case, CJK)",
+      "input": "snake_case_name と 日本語_斜体_です",
+      "oracle": true,
+      "expected": [
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "snake_case_name と 日本語_斜体_です" }] }
+      ]
+    },
+    {
+      "name": "an intraword underscore can neither open nor close (foo_bar_, _foo_bar)",
+      "input": "foo_bar_ and _foo_bar",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "foo_bar_ and _foo_bar" }] }]
+    },
+    {
+      "name": "italic with star and underscore",
+      "input": "*斜体*と _italic_ end",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [
+            { "text": "斜体", "italic": true },
+            { "text": "と " },
+            { "text": "italic", "italic": true },
+            { "text": " end" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "bold+italic and nested emphasis",
+      "input": "***both*** and a **b *c* d** e",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [
+            { "text": "both", "bold": true, "italic": true },
+            { "text": " and a " },
+            { "text": "b ", "bold": true },
+            { "text": "c", "bold": true, "italic": true },
+            { "text": " d", "bold": true },
+            { "text": " e" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rule of 3: a both-flanking ** inside *…* does not close the single star",
+      "input": "*foo**bar**baz*",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [
+            { "text": "foo", "italic": true },
+            { "text": "bar", "bold": true, "italic": true },
+            { "text": "baz", "italic": true }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "unclosed bold stays literal",
+      "input": "**unclosed",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "**unclosed" }] }]
+    },
+    {
+      "name": "backslash escapes are removed",
+      "input": "\\*literal\\* and \\_x\\_",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "*literal* and _x_" }] }]
+    },
+    {
+      "name": "code spans (including a longer backtick fence)",
+      "input": "`code`と**b** and `` a`b ``",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [
+            { "text": "code", "code": true },
+            { "text": "と" },
+            { "text": "b", "bold": true },
+            { "text": " and " },
+            { "text": "a`b", "code": true }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "link with a title",
+      "input": "[t](http://x.com \"title\")",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "t", "href": "http://x.com" }] }]
+    },
+    {
+      "name": "bold link keeps bold and href; the destination is never scanned for emphasis",
+      "input": "**[リンク](https://x.y/a_b)**",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [{ "text": "リンク", "bold": true, "href": "https://x.y/a_b" }]
+        }
+      ]
+    },
+    {
+      "name": "inline image stays literal (inline images on slides are planned)",
+      "input": "前 ![図](fig.png) 後",
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "前 ![図](fig.png) 後" }] }]
+    },
+    {
+      "name": "astral neighbours (emoji) around bold",
+      "input": "😀**x**😀",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [{ "text": "😀" }, { "text": "x", "bold": true }, { "text": "😀" }]
+        }
+      ]
+    },
+    {
+      "name": "nested and numbered lists",
+      "input": "1. 一\n2. 二\n   - 子\n     - 孫\n3) 三",
+      "expected": [
+        { "kind": "numbered", "level": 0, "label": "1.", "runs": [{ "text": "一" }] },
+        { "kind": "numbered", "level": 0, "label": "2.", "runs": [{ "text": "二" }] },
+        { "kind": "bullet", "level": 1, "runs": [{ "text": "子" }] },
+        { "kind": "bullet", "level": 2, "runs": [{ "text": "孫" }] },
+        { "kind": "numbered", "level": 0, "label": "3)", "runs": [{ "text": "三" }] }
+      ]
+    },
+    {
+      "name": "soft and hard breaks inside a paragraph stay line breaks",
+      "input": "一行目\n二行目  \n三行目",
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "一行目\n二行目\n三行目" }] }]
+    },
+    {
+      "name": "backslash hard break",
+      "input": "a\\\nb",
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "a\nb" }] }]
+    },
+    {
+      "name": "longer tilde fence keeps inner backticks and blank lines",
+      "input": "~~~~ rust\nfn main() {}\n\n```\n~~~~",
+      "expected": [
+        { "kind": "code", "level": 0, "runs": [{ "text": "fn main() {}" }] },
+        { "kind": "code", "level": 0, "runs": [] },
+        { "kind": "code", "level": 0, "runs": [{ "text": "```" }] }
+      ]
+    },
+    {
+      "name": "unclosed fence runs to the end of the chunk",
+      "input": "```\na\nb",
+      "expected": [
+        { "kind": "code", "level": 0, "runs": [{ "text": "a" }] },
+        { "kind": "code", "level": 0, "runs": [{ "text": "b" }] }
+      ]
+    },
+    {
+      "name": "block quote: markers stripped, inline parsed, lines joined",
+      "input": "> 引用 **強調**\n> 続き",
+      "expected": [
+        {
+          "kind": "quote",
+          "level": 0,
+          "runs": [{ "text": "引用 " }, { "text": "強調", "bold": true }, { "text": "\n続き" }]
+        }
+      ]
+    },
+    {
+      "name": "table stays raw monospace text (structured tables planned)",
+      "input": "| a | b |\n|---|---|\n| 1 | 2 |",
+      "expected": [
+        { "kind": "plain", "level": 0, "runs": [{ "text": "| a | b |", "code": true }] },
+        { "kind": "plain", "level": 0, "runs": [{ "text": "|---|---|", "code": true }] },
+        { "kind": "plain", "level": 0, "runs": [{ "text": "| 1 | 2 |", "code": true }] }
+      ]
+    },
+    {
+      "name": "HTML block stays raw monospace text",
+      "input": "<div>\n**x**\n</div>",
+      "expected": [
+        { "kind": "plain", "level": 0, "runs": [{ "text": "<div>", "code": true }] },
+        { "kind": "plain", "level": 0, "runs": [{ "text": "**x**", "code": true }] },
+        { "kind": "plain", "level": 0, "runs": [{ "text": "</div>", "code": true }] }
+      ]
+    },
+    {
+      "name": "empty input",
+      "input": "",
+      "expected": []
+    },
+    {
+      "name": "a bullet list interrupts a paragraph",
+      "input": "前文\n- a\n- b",
+      "expected": [
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "前文" }] },
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "a" }] },
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "b" }] }
+      ]
+    },
+    {
+      "name": "an ordered item not starting at 1 does not interrupt a paragraph",
+      "input": "text\n2. foo",
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "text\n2. foo" }] }]
+    },
+    {
+      "name": "list item continuation line",
+      "input": "- item\n  continued",
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "item\ncontinued" }] }]
+    },
+    {
+      "name": "autolink",
+      "input": "see <https://a.b/c>",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [{ "text": "see " }, { "text": "https://a.b/c", "href": "https://a.b/c" }]
+        }
+      ]
+    },
+    {
+      "name": "dunder bold",
+      "input": "__init__",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "init", "bold": true }] }]
+    },
+    {
+      "name": "angle-bracket and parenthesised link destinations",
+      "input": "[a](<u v>) [b](x(y)z)",
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [{ "text": "a", "href": "u v" }, { "text": " " }, { "text": "b", "href": "x(y)z" }]
+        }
+      ]
+    },
+    {"name": "an unmatched [ before a link stays literal", "input": "[ [a](u)", "oracle": true, "expected": [{"kind": "bullet", "level": 0, "runs": [{"text": "[ "}, {"text": "a", "href": "u"}]}]},
+    {"name": "balanced brackets inside link text", "input": "[a [b] c](u)", "oracle": true, "expected": [{"kind": "bullet", "level": 0, "runs": [{"text": "a [b] c", "href": "u"}]}]},
+    {"name": "32 nested parentheses in a destination are allowed (micromark limit)", "input": "[a](x((((((((((((((((((((((((((((((((y)))))))))))))))))))))))))))))))))", "oracle": true, "expected": [{"kind": "bullet", "level": 0, "runs": [{"text": "a", "href": "x((((((((((((((((((((((((((((((((y))))))))))))))))))))))))))))))))"}]}]},
+    {"name": "33 nested parentheses make it literal text", "input": "[a](x(((((((((((((((((((((((((((((((((y))))))))))))))))))))))))))))))))))", "oracle": true, "expected": [{"kind": "bullet", "level": 0, "runs": [{"text": "[a](x(((((((((((((((((((((((((((((((((y))))))))))))))))))))))))))))))))))"}]}]},
+    {
+      "name": "intraword star italic",
+      "input": "foo*bar*baz",
+      "oracle": true,
+      "expected": [
+        {
+          "kind": "bullet",
+          "level": 0,
+          "runs": [{ "text": "foo" }, { "text": "bar", "italic": true }, { "text": "baz" }]
+        }
+      ]
+    },
+    {
+      "name": "code span across a soft break",
+      "input": "`a\nb`",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "a b", "code": true }] }]
+    },
+    {
+      "name": "two paragraphs are two bullets",
+      "input": "p1\n\np2",
+      "expected": [
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "p1" }] },
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "p2" }] }
+      ]
+    },
+    {
+      "name": "a non-web link keeps its href in the model (renderers decide what is clickable)",
+      "input": "[x](javascript:alert(1))",
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "x", "href": "javascript:alert(1)" }] }]
+    },
+    {
+      "name": "thematic breaks are dropped",
+      "input": "a\n\n---\n\n* * *\nb",
+      "expected": [
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "a" }] },
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "b" }] }
+      ]
+    },
+    {
+      "name": "marker-free text is unchanged (idempotent for AI Bulletize / slideBody lines)",
+      "input": "まとめ: 要点を三つ",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "まとめ: 要点を三つ" }] }]
+    },
+    {
+      "name": "ideographic space counts as whitespace for flanking",
+      "input": "a**　b**",
+      "oracle": true,
+      "expected": [{ "kind": "bullet", "level": 0, "runs": [{ "text": "a**　b**" }] }]
+    },
+    {
+      "name": "CRLF line endings",
+      "input": "- a\r\n- b\r\n",
+      "expected": [
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "a" }] },
+        { "kind": "bullet", "level": 0, "runs": [{ "text": "b" }] }
+      ]
+    }
+  ],
+  "lines": [
+    { "name": "two list items", "input": "- a\n- b", "cpl": 110, "expected": 2 },
+    { "name": "a soft break starts a new line", "input": "一行目\n二行目", "cpl": 110, "expected": 2 },
+    { "name": "an empty code line still takes a line", "input": "```\nx\n\ny\n```", "cpl": 110, "expected": 3 },
+    { "name": "a link's URL is not visible text", "input": "[t](https://example.com/a/very/long/path/that/would/wrap/if/it/were/counted)", "cpl": 10, "expected": 1 },
+    { "name": "a numbered label is visible text", "input": "1. abcdefghij", "cpl": 5, "expected": 3 },
+    { "name": "markers are not visible text", "input": "**abcd**", "cpl": 4, "expected": 1 },
+    { "name": "code points, not UTF-16 units", "input": "😀😀😀", "cpl": 2, "expected": 2 },
+    { "name": "nothing to show", "input": "", "cpl": 110, "expected": 0 }
+  ],
+  "clickable": [
+    { "href": "https://example.com", "expected": true },
+    { "href": "HTTP://EXAMPLE.COM", "expected": true },
+    { "href": "mailto:a@b.c", "expected": true },
+    { "href": "  https://padded.example", "expected": true },
+    { "href": "javascript:alert(1)", "expected": false },
+    { "href": "notes.md", "expected": false },
+    { "href": "#anchor", "expected": false },
+    { "href": "file:///etc/passwd", "expected": false },
+    { "href": "", "expected": false }
+  ]
+}

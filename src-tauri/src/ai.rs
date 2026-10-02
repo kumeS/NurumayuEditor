@@ -19,14 +19,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // ----- "zero external transmission" visibility (開発.txt Stage 2, item 2-2) --
 //
 // Process-wide counters for actual LLM API traffic. NOTE for future readers:
-// unlike reference/image fetches (guarded through `net::safe_fetch`), the LLM
+// unlike reference/image fetches (guarded through `net::safe_fetch`) and the
+// OpenRouter model list (`net::safe_fetch_bearer`), the LLM
 // calls below do NOT go through that chokepoint at all — `complete()`,
 // `complete_stream()`, and `generate_image()` each build their own
 // `reqwest::Client` and funnel the real request through `send_with_retry`
 // here. That is deliberately the single instrumentation point (one counter
 // bump covers all three call sites) rather than three separate ones. Kept as
 // a SEPARATE pair of counters from `net::stats()` — LLM calls and
-// reference/image fetches are conceptually different traffic, and a user
+// reference/image/model-list fetches are conceptually different traffic, and a user
 // should be able to tell them apart in the health bar.
 static AI_CALLS: AtomicU64 = AtomicU64::new(0);
 static AI_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -71,7 +72,8 @@ impl OpenRouterProvider {
 /// frequently return 429 (or transient 5xx) under load, and a laptop's network
 /// can blip mid-request — so retry a few times with backoff, honouring
 /// Retry-After, before handing the final response (or error) back to the
-/// caller for its own status/error mapping.
+/// caller. Callers map a non-success status with `map_provider_error`, BEFORE
+/// parsing the body as JSON (an error body is often HTML from a proxy).
 async fn send_with_retry(
     client: &reqwest::Client,
     endpoint: &str,
@@ -91,7 +93,7 @@ async fn send_with_retry(
             .post(endpoint)
             .header("Authorization", format!("Bearer {api_key}"))
             // OpenRouter attribution headers (optional but recommended).
-            .header("HTTP-Referer", "https://github.com/kumeS/NurumayuFacet")
+            .header("HTTP-Referer", "https://github.com/kumeS/NurumayuEditor")
             .header("X-Title", "NurumayuEditor")
             .json(payload)
             .send()
@@ -128,6 +130,89 @@ async fn send_with_retry(
     }
 }
 
+/// Longest provider detail (in chars) quoted from a non-JSON error body.
+const PROVIDER_DETAIL_MAX_CHARS: usize = 200;
+
+/// The provider's own error text: `error.message` / `error` from a JSON body;
+/// otherwise the first `PROVIDER_DETAIL_MAX_CHARS` chars of the body as
+/// whitespace-collapsed lossy UTF-8 (HTML error pages from proxies/custom
+/// endpoints); "unknown error" when there is nothing usable.
+fn provider_detail(raw: &[u8]) -> String {
+    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(raw) {
+        return body["error"]["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("unknown error")
+            .to_string();
+    }
+    let text = String::from_utf8_lossy(raw);
+    let collapsed: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(PROVIDER_DETAIL_MAX_CHARS)
+        .collect();
+    if collapsed.is_empty() {
+        "unknown error".to_string()
+    } else {
+        collapsed
+    }
+}
+
+/// True when `endpoint` is served by OpenRouter (host `openrouter.ai` or a
+/// subdomain of it), where a 404 on chat completions means "no provider
+/// serves this model id" rather than a wrong URL.
+fn is_openrouter_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|h| h == "openrouter.ai" || h.ends_with(".openrouter.ai"))
+}
+
+/// Classify a non-success provider response. The ONE status→error mapping
+/// shared by `complete`, `complete_stream_with` and `generate_image`, so the
+/// same HTTP status yields the same error on every path. Pure; never fails
+/// on a non-JSON body (the status is kept, the body is quoted as detail).
+///
+/// - 404 on OpenRouter, or a 404 body that names `model` → `ModelUnavailable`
+/// - any other 404 (custom/local endpoint: wrong URL path or un-pulled model)
+///   → a "model or endpoint URL" message, never "model unavailable"
+/// - 429 / 401 / 403 → actionable rate-limit / auth guidance
+/// - anything else → "API {code}: {detail}"
+///
+/// The leading text of each message is matched by src/aiErrors.ts; the
+/// contract test there raw-reads this function, so keep the literals inline.
+fn map_provider_error(status: u16, raw: &[u8], model: &str, endpoint: &str) -> AppError {
+    let provider_msg = provider_detail(raw);
+    let body_names_model =
+        !model.is_empty() && String::from_utf8_lossy(raw).contains(model);
+    AppError::Network(match status {
+        404 if is_openrouter_endpoint(endpoint) || body_names_model => {
+            return AppError::ModelUnavailable {
+                model: model.to_string(),
+                detail: provider_msg,
+            };
+        }
+        404 => format!(
+            "Not found (404): the model '{model}' or the endpoint URL is wrong. \
+             Check both in Settings. (provider: {provider_msg})"
+        ),
+        429 => format!(
+            "Rate limited (429). Free OpenRouter models share tight limits — wait a minute and \
+             retry, switch to another model in Settings, or add credit at openrouter.ai. \
+             (provider: {provider_msg})"
+        ),
+        401 | 403 => format!(
+            "Authorization failed ({status}). Check your OpenRouter API key in Settings. \
+             (provider: {provider_msg})"
+        ),
+        code => format!("API {code}: {provider_msg}"),
+    })
+}
+
 impl LlmProvider for OpenRouterProvider {
     async fn complete(&self, system: &str, user: &str) -> AppResult<String> {
         let client = reqwest::Client::new();
@@ -145,32 +230,17 @@ impl LlmProvider for OpenRouterProvider {
         let status = res.status();
         let raw = res.bytes().await?;
         AI_BYTES.fetch_add(raw.len() as u64, Ordering::Relaxed);
-        let body: serde_json::Value = serde_json::from_slice(&raw)?;
 
+        // Status first: an error body may not be JSON at all.
         if !status.is_success() {
-            let provider_msg = body["error"]["message"]
-                .as_str()
-                .or_else(|| body["error"].as_str())
-                .unwrap_or("unknown error");
-            let msg = match status.as_u16() {
-                429 => format!(
-                    "Rate limited (429). Free OpenRouter models share tight limits — wait a minute and \
-                     retry, switch to another model in Settings, or add credit at openrouter.ai. \
-                     (provider: {provider_msg})"
-                ),
-                401 | 403 => format!(
-                    "Authorization failed ({}). Check your OpenRouter API key in Settings. \
-                     (provider: {provider_msg})",
-                    status.as_u16()
-                ),
-                404 => format!(
-                    "Model not found (404). Verify the model id in Settings — it may be unavailable or \
-                     have changed. (provider: {provider_msg})"
-                ),
-                code => format!("API {code}: {provider_msg}"),
-            };
-            return Err(AppError::Network(msg));
+            return Err(map_provider_error(
+                status.as_u16(),
+                &raw,
+                &self.config.model,
+                &self.config.endpoint,
+            ));
         }
+        let body: serde_json::Value = serde_json::from_slice(&raw)?;
 
         let out = body["choices"][0]["message"]["content"]
             .as_str()
@@ -260,24 +330,15 @@ impl OpenRouterProvider {
 
         let status = res.status();
         if !status.is_success() {
-            let body: serde_json::Value = res.json().await.unwrap_or_else(|_| json!({}));
-            let provider_msg = body["error"]["message"]
-                .as_str()
-                .or_else(|| body["error"].as_str())
-                .unwrap_or("unknown error");
-            return Err(AppError::Network(match status.as_u16() {
-                429 => format!(
-                    "Rate limited (429). Free OpenRouter models share tight limits — wait a minute and \
-                     retry, switch to another model in Settings, or add credit at openrouter.ai. \
-                     (provider: {provider_msg})"
-                ),
-                401 | 403 => format!(
-                    "Authorization failed ({}). Check your OpenRouter API key in Settings. \
-                     (provider: {provider_msg})",
-                    status.as_u16()
-                ),
-                code => format!("API {code}: {provider_msg}"),
-            }));
+            // Mapped before any delta is emitted (rust.md rule 8).
+            let raw = res.bytes().await.unwrap_or_default();
+            AI_BYTES.fetch_add(raw.len() as u64, Ordering::Relaxed);
+            return Err(map_provider_error(
+                status.as_u16(),
+                &raw,
+                &self.config.model,
+                &self.config.endpoint,
+            ));
         }
 
         // Server-Sent Events: bytes arrive on arbitrary boundaries, so buffer
@@ -697,17 +758,16 @@ pub async fn generate_image(config: &LlmConfig, prompt: &str) -> AppResult<Strin
     let status = res.status();
     let raw = res.bytes().await?;
     AI_BYTES.fetch_add(raw.len() as u64, Ordering::Relaxed);
-    let body: serde_json::Value = serde_json::from_slice(&raw)?;
+    // Status first: an error body may not be JSON at all.
     if !status.is_success() {
-        let provider_msg = body["error"]["message"]
-            .as_str()
-            .or_else(|| body["error"].as_str())
-            .unwrap_or("unknown error");
-        return Err(AppError::Network(format!(
-            "Image API {}: {provider_msg}",
-            status.as_u16()
-        )));
+        return Err(map_provider_error(
+            status.as_u16(),
+            &raw,
+            &config.model,
+            &config.endpoint,
+        ));
     }
+    let body: serde_json::Value = serde_json::from_slice(&raw)?;
 
     if let Some(url) = extract_image_url(&body) {
         return Ok(url);
@@ -786,9 +846,60 @@ const DRAFT_SYSTEM_PROMPT: &str =
      Do NOT restate the theme verbatim as the very first line, and do NOT use bullet lists, tables, code \
      fences, or any commentary — output ONLY the draft itself (headings and paragraphs).";
 
+/// Approximate characters per English word used to turn the Draft dialog's
+/// word target into a character target for CJK output, which has no word
+/// unit. A heuristic, not a measurement. Mirrored by the frontend's length
+/// labels/counter (src/textStats.ts), which contract-tests this literal line.
+pub const JA_CHARS_PER_WORD: u32 = 2;
+
+/// Output languages (the Settings language names) whose drafts are measured
+/// in characters (文字) rather than words.
+const CHAR_MEASURED_LANGUAGES: &[&str] = &["日本語", "中文", "한국어"];
+
+/// Length clause for the draft system prompt. For a CJK output language the
+/// word target becomes `target × JA_CHARS_PER_WORD` characters; otherwise it
+/// stays in words. Both name a ceiling of +20% (rounded up). The model is only
+/// asked, not forced (no max_tokens cap), so the achieved length is
+/// approximate. Empty when there is no positive target.
+fn draft_length_instruction(target_words: Option<u32>, output_language: Option<&str>) -> String {
+    let Some(w) = target_words.filter(|w| *w > 0) else {
+        return String::new();
+    };
+    let in_chars = output_language
+        .map(str::trim)
+        .is_some_and(|l| CHAR_MEASURED_LANGUAGES.contains(&l));
+    let (n, unit) = if in_chars {
+        (w.saturating_mul(JA_CHARS_PER_WORD), "characters (文字)")
+    } else {
+        (w, "words")
+    };
+    // ceil(n × 1.2) in integers.
+    let max = (u64::from(n) * 12).div_ceil(10);
+    let short_unit = if in_chars { "characters" } else { "words" };
+    format!(
+        " Aim for approximately {n} {unit} in total (within about ±20%) — do not exceed about \
+         {max} {short_unit}; plan the number of sections so the total fits."
+    )
+}
+
+/// The full draft system prompt: base instructions + length clause + output
+/// language/tone constraints. Pure, so the prompt is testable without I/O.
+fn draft_system_prompt(
+    target_words: Option<u32>,
+    output_language: Option<&str>,
+    tone: Option<&str>,
+) -> String {
+    let mut system = DRAFT_SYSTEM_PROMPT.to_string();
+    system.push_str(&draft_length_instruction(target_words, output_language));
+    system.push_str(&output_constraints(output_language, tone));
+    system
+}
+
 /// Stream a draft, invoking `on_delta` with the full accumulated text as it grows.
-/// `target_words` sets an approximate length; `output_language`/`tone` pin the
-/// language and voice; `reference` is optional supporting material (pasted text,
+/// `target_words` sets an approximate length — requested in words, or in
+/// characters for CJK output (see `draft_length_instruction`); it is a prompt
+/// request, not an enforced limit. `output_language`/`tone` pin the language
+/// and voice; `reference` is optional supporting material (pasted text,
 /// fetched URL/PDF text) the draft should draw on.
 pub async fn generate_draft_stream<F: FnMut(&str)>(
     config: &LlmConfig,
@@ -801,14 +912,7 @@ pub async fn generate_draft_stream<F: FnMut(&str)>(
 ) -> AppResult<String> {
     let provider = OpenRouterProvider::new(config.clone());
 
-    let mut system = DRAFT_SYSTEM_PROMPT.to_string();
-    if let Some(w) = target_words.filter(|w| *w > 0) {
-        system.push_str(&format!(
-            " Aim for approximately {w} words in total (within about ±20%); pace the \
-             structure and depth to hit that length."
-        ));
-    }
-    system.push_str(&output_constraints(output_language, tone));
+    let system = draft_system_prompt(target_words, output_language, tone);
 
     let user = match reference.map(str::trim).filter(|r| !r.is_empty()) {
         Some(r) => {
@@ -1113,6 +1217,9 @@ mod tests {
     // keeps each of the 3 attempts (and their capped backoff) fast.
     #[test]
     fn send_with_retry_counts_one_call_despite_internal_retries() {
+        // Other tests in this module also send (loopback stubs); hold the lock
+        // so their AI_CALLS bumps can't land between the two reads below.
+        let _g = net_test_guard();
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (calls_before, _) = ai_call_stats();
 
@@ -1232,5 +1339,300 @@ mod tests {
         )));
         // Only the heading and the text paragraph made it in.
         assert_eq!(listing.matches("- id:").count(), 2);
+    }
+
+    // ----- provider error mapping, end to end over a loopback stub ----------
+    //
+    // No mock-HTTP crate is available, so these spin up a one-shot
+    // `std::net::TcpListener` on 127.0.0.1 that answers a single request with a
+    // fixed response. 404 is never retried by `send_with_retry`, so one
+    // connection is enough. They prove the REAL call sites (`complete`,
+    // `complete_stream_with`, `generate_image`) route their non-success
+    // responses through the shared mapper — not just that the mapper exists.
+
+    /// Serializes every test that sends through `send_with_retry`: each such
+    /// call bumps the process-wide `AI_CALLS`, which would race the exact
+    /// equality asserted in `send_with_retry_counts_one_call_despite_internal_retries`
+    /// (and rag.rs's exact AI_CALLS check). It is the crate-wide network-counter
+    /// guard, so it also excludes the net/rag/commands/openrouter counter tests.
+    /// Take it once per test, at the top — it is not re-entrant.
+    fn net_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::net::network_counter_test_guard()
+    }
+
+    /// Answer exactly one HTTP request with `status_line` / `content_type` /
+    /// `body`, after reading the full request (headers + Content-Length body)
+    /// so the client never sees a reset. Returns the endpoint URL to call.
+    fn serve_once(status_line: &str, content_type: &str, body: &str) -> String {
+        serve_once_capturing(status_line, content_type, body).0
+    }
+
+    /// `serve_once`, also handing back the raw request the client sent.
+    fn serve_once_capturing(
+        status_line: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut need: Option<usize> = None;
+            loop {
+                if let Some(total) = need {
+                    if buf.len() >= total {
+                        break;
+                    }
+                }
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                if need.is_none() {
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        need = Some(end + 4 + len);
+                    }
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}/v1/chat/completions"), rx)
+    }
+
+    fn stub_config(endpoint: String) -> LlmConfig {
+        LlmConfig {
+            endpoint,
+            model: "test/model:free".to_string(),
+            api_key: "test-key".to_string(),
+            temperature: 0.3,
+        }
+    }
+
+    #[test]
+    fn complete_non_json_404_keeps_the_status_and_names_the_model() {
+        let _g = net_test_guard();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let endpoint = serve_once("404 Not Found", "text/html", "<html><body>Not Found</body></html>");
+        let provider = OpenRouterProvider::new(stub_config(endpoint));
+        let err = rt.block_on(provider.complete("sys", "user")).expect_err("404 must fail");
+        assert!(!matches!(err, AppError::Serde(_)), "status lost to a JSON parse error: {err}");
+        let s = err.to_string();
+        assert!(s.contains("404") && s.contains("test/model:free"), "got: {s}");
+    }
+
+    #[test]
+    fn stream_404_is_classified_like_the_non_stream_path() {
+        let _g = net_test_guard();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let endpoint = serve_once(
+            "404 Not Found",
+            "application/json",
+            r#"{"error":{"message":"No endpoints found for test/model:free."}}"#,
+        );
+        let provider = OpenRouterProvider::new(stub_config(endpoint));
+        let mut deltas = 0;
+        let err = rt
+            .block_on(provider.complete_stream_with("sys", "user", None, |_| deltas += 1))
+            .expect_err("404 must fail");
+        assert_eq!(deltas, 0, "no delta may be emitted for an error response");
+        assert!(
+            matches!(&err, AppError::ModelUnavailable { model, .. } if model == "test/model:free"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_image_non_json_404_keeps_the_status_and_names_the_model() {
+        let _g = net_test_guard();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let endpoint = serve_once("404 Not Found", "text/html", "<html>gone</html>");
+        let err = rt
+            .block_on(generate_image(&stub_config(endpoint), "a cat"))
+            .expect_err("404 must fail");
+        assert!(!matches!(err, AppError::Serde(_)), "status lost to a JSON parse error: {err}");
+        let s = err.to_string();
+        assert!(s.contains("404") && s.contains("test/model:free"), "got: {s}");
+    }
+
+    // ----- map_provider_error (pure) ------------------------------------------
+
+    const OR: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+    #[test]
+    fn openrouter_404_names_the_model_as_unavailable() {
+        let e = map_provider_error(
+            404,
+            br#"{"error":{"message":"No endpoints found for meta-llama/llama-3.3-70b-instruct:free."}}"#,
+            "meta-llama/llama-3.3-70b-instruct:free",
+            OR,
+        );
+        assert!(
+            matches!(&e, AppError::ModelUnavailable { model, detail }
+                if model == "meta-llama/llama-3.3-70b-instruct:free"
+                && detail == "No endpoints found for meta-llama/llama-3.3-70b-instruct:free."),
+            "got: {e:?}"
+        );
+        assert!(e
+            .to_string()
+            .starts_with("Model unavailable: 'meta-llama/llama-3.3-70b-instruct:free'"));
+    }
+
+    #[test]
+    fn non_json_404_body_still_names_the_model() {
+        let e = map_provider_error(404, b"<html>Not Found</html>", "x/y:free", OR);
+        assert!(!matches!(e, AppError::Serde(_)));
+        assert!(matches!(&e, AppError::ModelUnavailable { model, detail }
+            if model == "x/y:free" && detail == "<html>Not Found</html>"), "got: {e:?}");
+    }
+
+    #[test]
+    fn openrouter_subdomain_counts_as_openrouter() {
+        let e = map_provider_error(404, b"{}", "m", "https://api.openrouter.ai/v1/chat/completions");
+        assert!(matches!(e, AppError::ModelUnavailable { .. }), "got: {e:?}");
+        // …but a look-alike host does not.
+        let e = map_provider_error(404, b"{}", "m", "https://evilopenrouter.ai/v1/chat");
+        assert!(!matches!(e, AppError::ModelUnavailable { .. }), "got: {e:?}");
+    }
+
+    #[test]
+    fn custom_endpoint_404_mentions_model_or_endpoint() {
+        let e = map_provider_error(404, b"{}", "llama3", "http://localhost:11434/v1/chat/completions");
+        assert!(!matches!(e, AppError::ModelUnavailable { .. }), "got: {e:?}");
+        assert_eq!(
+            e.to_string(),
+            "Network / API error: Not found (404): the model 'llama3' or the endpoint URL is wrong. \
+             Check both in Settings. (provider: unknown error)"
+        );
+    }
+
+    #[test]
+    fn custom_endpoint_404_whose_body_names_the_model_is_model_unavailable() {
+        // Ollama's answer for a model that was never pulled.
+        let e = map_provider_error(
+            404,
+            br#"{"error":{"message":"model \"llama3\" not found, try pulling it first"}}"#,
+            "llama3",
+            "http://localhost:11434/v1/chat/completions",
+        );
+        assert!(matches!(&e, AppError::ModelUnavailable { model, .. } if model == "llama3"), "got: {e:?}");
+        // An empty model id must not "match" every body.
+        let e = map_provider_error(404, b"{}", "", "http://localhost:11434/v1/chat/completions");
+        assert!(!matches!(e, AppError::ModelUnavailable { .. }), "got: {e:?}");
+    }
+
+    #[test]
+    fn status_429_and_401_mapping_unchanged() {
+        let e = map_provider_error(429, br#"{"error":"busy"}"#, "m", OR).to_string();
+        assert!(e.starts_with("Network / API error: Rate limited (429). "), "got: {e}");
+        assert!(e.ends_with("(provider: busy)"), "got: {e}");
+        let e = map_provider_error(401, b"{}", "m", OR).to_string();
+        assert!(e.starts_with("Network / API error: Authorization failed (401). "), "got: {e}");
+        let e = map_provider_error(403, b"{}", "m", OR).to_string();
+        assert!(e.starts_with("Network / API error: Authorization failed (403). "), "got: {e}");
+    }
+
+    #[test]
+    fn other_status_codes_keep_the_generic_api_shape() {
+        let e = map_provider_error(500, br#"{"error":{"message":"boom"}}"#, "m", OR).to_string();
+        assert_eq!(e, "Network / API error: API 500: boom");
+    }
+
+    #[test]
+    fn non_json_detail_is_whitespace_collapsed_and_char_capped() {
+        // 300 multibyte chars: a byte slice at 200 would panic mid-codepoint.
+        let body = format!("<p>\n  {}\n</p>", "あ".repeat(300));
+        let e = map_provider_error(502, body.as_bytes(), "m", OR).to_string();
+        let detail = e.strip_prefix("Network / API error: API 502: ").expect("generic shape");
+        assert_eq!(detail.chars().count(), 200, "got: {detail}");
+        assert!(detail.starts_with("<p> あ"), "got: {detail}");
+        // Empty body → the explicit placeholder, never an empty detail.
+        let e = map_provider_error(502, b"", "m", OR).to_string();
+        assert_eq!(e, "Network / API error: API 502: unknown error");
+    }
+
+    // ----- draft length instruction -------------------------------------------
+
+    #[test]
+    fn draft_length_instruction_uses_characters_for_japanese() {
+        let s = draft_length_instruction(Some(3000), Some("日本語"));
+        assert!(!s.contains("3000 words"), "got: {s}");
+        // 3000 words × JA_CHARS_PER_WORD (2) = 6000 characters, ceiling +20%.
+        assert!(s.contains("approximately 6000 characters (文字)"), "got: {s}");
+        assert!(s.contains("do not exceed about 7200 characters"), "got: {s}");
+    }
+
+    #[test]
+    fn draft_length_instruction_uses_characters_for_every_cjk_output_language() {
+        for lang in ["中文", "한국어", "  日本語 "] {
+            let s = draft_length_instruction(Some(300), Some(lang));
+            assert!(s.contains("approximately 600 characters"), "{lang}: {s}");
+        }
+    }
+
+    #[test]
+    fn draft_length_instruction_uses_words_otherwise() {
+        for lang in [Some("English"), Some("Français"), None] {
+            let s = draft_length_instruction(Some(3000), lang);
+            assert!(s.contains("approximately 3000 words"), "{lang:?}: {s}");
+            assert!(s.contains("do not exceed about 3600 words"), "{lang:?}: {s}");
+            assert!(!s.contains("characters"), "{lang:?}: {s}");
+        }
+    }
+
+    #[test]
+    fn draft_length_instruction_is_empty_without_a_target() {
+        assert_eq!(draft_length_instruction(None, Some("日本語")), "");
+        assert_eq!(draft_length_instruction(Some(0), None), "");
+    }
+
+    #[test]
+    fn generate_draft_stream_sends_the_character_target_for_japanese() {
+        let _g = net_test_guard();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (endpoint, request) = serve_once_capturing("404 Not Found", "application/json", "{}");
+        let _ = rt.block_on(generate_draft_stream(
+            &stub_config(endpoint),
+            "テーマ",
+            Some(3000),
+            Some("日本語"),
+            None,
+            None,
+            |_| {},
+        ));
+        let raw = request
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the stub saw a request");
+        let body_start = raw.find("\r\n\r\n").expect("header/body separator") + 4;
+        let payload: serde_json::Value = serde_json::from_str(&raw[body_start..]).expect("JSON payload");
+        let system = payload["messages"][0]["content"].as_str().expect("system message");
+        assert!(system.contains("approximately 6000 characters"), "got: {system}");
+        assert!(!system.contains("3000 words"), "got: {system}");
+    }
+
+    #[test]
+    fn draft_system_prompt_carries_the_length_and_language() {
+        let s = draft_system_prompt(Some(1000), Some("日本語"), None);
+        assert!(s.starts_with(DRAFT_SYSTEM_PROMPT));
+        assert!(s.contains(&draft_length_instruction(Some(1000), Some("日本語"))));
+        assert!(s.contains("approximately 2000 characters"), "got: {s}");
+        assert!(s.contains("write your ENTIRE output in 日本語"), "got: {s}");
     }
 }

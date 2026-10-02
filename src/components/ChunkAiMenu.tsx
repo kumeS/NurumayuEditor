@@ -8,7 +8,8 @@ import {
   generateDiagramFromChunk,
   generatePresentationFromChunk,
 } from "../aiActions";
-import { useT } from "../i18n";
+import { translateWith, useLang, useT } from "../i18n";
+import { analyzedLabel } from "../networkLabels";
 import { staleSummaryChunkIds, useStore } from "../store";
 import type { ChunkType } from "../types";
 import { promptDialog } from "./PromptModal";
@@ -31,6 +32,7 @@ import {
 
 // Quick-pick proofreading styles. The value is the phrase sent to the model;
 // leaving the field blank falls back to a scholarly/academic tone (ai.rs).
+// Labels are dictionary keys: PromptModal renders them as t(p.label).
 const PROOFREAD_STYLES = [
   { label: "Academic", value: "scholarly and academic" },
   { label: "Formal", value: "formal and professional" },
@@ -38,16 +40,6 @@ const PROOFREAD_STYLES = [
   { label: "Plain", value: "plain and easy to read for a general audience" },
   { label: "Persuasive", value: "persuasive and compelling" },
 ];
-
-/** Compact relative time for the freshness footer ("analyzed 5 min ago"). */
-function relTime(ts: number): string {
-  const mins = Math.round((Date.now() - ts) / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins} min ago`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours} h ago`;
-  return `${Math.round(hours / 24)} d ago`;
-}
 
 interface Props {
   chunkId: string;
@@ -57,6 +49,7 @@ interface Props {
 
 export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
   const t = useT();
+  const lang = useLang();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const defaultLang = useStore((s) => s.settings?.defaultTargetLanguage ?? "English");
@@ -95,7 +88,7 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
       title: t("Translate paragraph"),
       label: t("Target language"),
       defaultValue: defaultLang,
-      placeholder: "e.g. English, Japanese, French",
+      placeholder: t("e.g. English, Japanese, French"),
       submitLabel: t("Translate"),
     });
     if (lang === null) return;
@@ -109,7 +102,7 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
       label: t("Pick a style to rewrite toward (or type your own):"),
       presets: PROOFREAD_STYLES,
       defaultValue: "",
-      placeholder: "e.g. concise and formal",
+      placeholder: t("e.g. concise and formal"),
       submitLabel: t("Proofread"),
     });
     if (style === null) return;
@@ -163,7 +156,7 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
       title: t("Generate diagram"),
       label: t("Optional guidance for the diagram (leave blank for automatic)"),
       defaultValue: "",
-      placeholder: "e.g. as a flowchart of the process",
+      placeholder: t("e.g. as a flowchart of the process"),
       submitLabel: t("Generate"),
     });
     if (instruction === null) return;
@@ -175,9 +168,9 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
     const instruction = await promptDialog({
       title: t("Custom AI instruction"),
       label: t("Describe what the AI should do with this paragraph"),
-      placeholder: "e.g. Rewrite this for a general audience",
+      placeholder: t("e.g. Rewrite this for a general audience"),
       multiline: true,
-      submitLabel: "Run",
+      submitLabel: t("Run"),
     });
     if (!instruction) return;
     await runChunkAction(chunkId, "custom", { instruction });
@@ -205,24 +198,31 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
       <div className="space-y-0.5 border-t border-gray-100 px-2.5 pb-1 pt-1.5 text-xs">
         {analyzedAt !== undefined && (
           <div className={analysisStale ? "text-amber-600" : "text-ink-faint"}>
-            analyzed {relTime(analyzedAt)}
-            {analysisStale ? " · graph out of date" : ""}
+            {analyzedLabel(analyzedAt, lang)}
+            {analysisStale ? ` · ${t("graph out of date")}` : ""}
           </div>
         )}
         {staleCount > 0 && (
           <div className="text-ink-faint">
-            {staleCount} context {staleCount === 1 ? "summary" : "summaries"} will
-            refresh on run
+            {staleCount === 1
+              ? t("1 context summary will refresh on run")
+              : translateWith("{n} context summaries will refresh on run", lang, { n: staleCount })}
           </div>
         )}
       </div>
     );
 
+  // Named by outcome (ui.md #13): the accessible name and the tooltip are the
+  // same string, so VoiceOver reads what the menu offers, not "AI actions".
+  const triggerLabel = isHeading
+    ? t("Rewrite this heading with AI…")
+    : t("Rewrite, translate or illustrate with AI…");
+
   return (
     <div ref={rootRef} className="relative">
-      <Tooltip label={isHeading ? t("AI actions for this heading") : t("AI actions for this paragraph")}>
+      <Tooltip label={triggerLabel}>
         <button
-          aria-label={t("AI actions")}
+          aria-label={triggerLabel}
           onClick={() => setOpen((v) => !v)}
           className={`flex h-7 w-7 items-center justify-center rounded-full text-ink-faint transition-colors hover:bg-accent/10 hover:text-accent ${
             open ? "bg-accent/10 text-accent" : ""
@@ -279,7 +279,7 @@ export default function ChunkAiMenu({ chunkId, chunkType, busy }: Props) {
                   distinction visible at a glance, not just on hover. */}
               <div className={warnGroup}>
                 <div className={groupLabel}>{t("Restructures immediately")}</div>
-                <Tooltip label="Rewrites this paragraph in place as bullet points — replaces its text immediately, with no reviewable diff (⌘/Ctrl+Z to undo).">
+                <Tooltip label={t("Rewrites this paragraph in place as bullet points — replaces its text immediately, with no reviewable diff (⌘/Ctrl+Z to undo).")}>
                   <button className={item} onClick={onBulletize} disabled={!!globalBusy}>
                     <BulletListIcon />{t("Bulletize")}</button>
                 </Tooltip>

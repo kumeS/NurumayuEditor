@@ -32,7 +32,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { create } from "zustand";
 import { api } from "../api";
 import { spliceTextAtCursor } from "../citationInsert";
-import { useT } from "../i18n";
+import { tf, translateWith, useLang, useT } from "../i18n";
 import { useStore } from "../store";
 import type {
   CitationEntry,
@@ -97,7 +97,9 @@ function insertAtCursor(citationText: string): boolean {
   const caret = isFocused ? textarea!.selectionStart : chunk.content.length;
   const { content: newContent, caretAfter } = spliceTextAtCursor(chunk.content, caret, citationText);
 
-  st.updateChunkContent(chunkId, newContent);
+  // A citation insert is its own undo step (BUG-002): ⌘Z removes exactly the
+  // citation, never the typing that preceded it.
+  st.updateChunkContent(chunkId, newContent, { newUndoStep: true });
   if (isFocused) {
     requestAnimationFrame(() => textarea!.setSelectionRange(caretAfter, caretAfter));
   }
@@ -108,6 +110,7 @@ type Tab = "library" | "lookup";
 
 export default function CitationsPanel() {
   const t = useT();
+  const lang = useLang();
   const open_ = useCitationsPanelStore((s) => s.open);
   const setOpen = useCitationsPanelStore((s) => s.setOpen);
   const filePath = useStore((s) => s.filePath);
@@ -173,14 +176,18 @@ export default function CitationsPanel() {
         useStore
           .getState()
           .notify(
-            `Imported ${result.added.length} citation${result.added.length === 1 ? "" : "s"} from ${fileName(selected)}, ${result.warnings.length} skipped — see the details below.`,
+            tf("Imported {n} citation(s) from {file}, {skipped} skipped — see the details below.", {
+              n: result.added.length,
+              file: fileName(selected),
+              skipped: result.warnings.length,
+            }),
             "info"
           );
       } else {
         useStore
           .getState()
           .notify(
-            `Imported ${result.added.length} citation${result.added.length === 1 ? "" : "s"} from ${fileName(selected)}.`,
+            tf("Imported {n} citation(s) from {file}.", { n: result.added.length, file: fileName(selected) }),
             "success"
           );
       }
@@ -199,7 +206,7 @@ export default function CitationsPanel() {
     setError(null);
     try {
       await api.citationsRemoveEntry(filePath, id);
-      useStore.getState().notify(`Removed "${title}" from the citation library.`, "success");
+      useStore.getState().notify(tf("Removed “{title}” from the citation library.", { title }), "success");
       setCitedIds((ids) => ids.filter((i) => i !== id));
       await refresh();
     } catch (e) {
@@ -253,7 +260,7 @@ export default function CitationsPanel() {
     if (!filePath || !lookupResult) return;
     try {
       await api.citationsAddLookupResult(filePath, lookupResult, lookupQuery.trim());
-      useStore.getState().notify(`Added "${lookupResult.title}" to the citation library.`, "success");
+      useStore.getState().notify(tf("Added “{title}” to the citation library.", { title: lookupResult.title }), "success");
       setLookupResult(null);
       setLookupQuery("");
       setTab("library");
@@ -306,16 +313,14 @@ export default function CitationsPanel() {
       </div>
 
       <p className="mb-2 text-xs text-ink-faint">
-        Import your own BibTeX library (from Zotero or any reference manager),
-        or look up a DOI/arXiv id — this is not a literature search engine, it
-        only formats references you already have. Supported styles: APA
-        (7th ed.) and IEEE.
+        {t(
+          "Import your own BibTeX library (from Zotero or any reference manager), or look up a DOI/arXiv id — this is not a literature search engine, it only formats references you already have. Supported styles: APA (7th ed.) and IEEE."
+        )}
       </p>
 
       {!filePath && (
         <div className="rounded-md bg-amber-50/60 px-2 py-3 text-center text-xs text-amber-700">
-          Save this document first — the citation library is stored alongside
-          the saved file.
+          {t("Save this document first — the citation library is stored alongside the saved file.")}
         </div>
       )}
 
@@ -360,7 +365,11 @@ export default function CitationsPanel() {
             <>
               <div className="flex items-center justify-between">
                 <span className="text-[11px] text-ink-faint">
-                  {entries === null ? "" : `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`}
+                  {entries === null
+                    ? ""
+                    : entries.length === 1
+                      ? t("1 entry")
+                      : translateWith("{n} entries", lang, { n: entries.length })}
                 </span>
                 <button
                   onClick={() => void importBibtex()}
@@ -374,7 +383,9 @@ export default function CitationsPanel() {
 
               {importWarnings.length > 0 && (
                 <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
-                  {importWarnings.length} entr{importWarnings.length === 1 ? "y" : "ies"} skipped during import:
+                  {importWarnings.length === 1
+                    ? t("1 entry skipped during import:")
+                    : translateWith("{n} entries skipped during import:", lang, { n: importWarnings.length })}
                   <ul className="mt-1 list-disc pl-4">
                     {importWarnings.map((w, i) => (
                       <li key={i}>{w}</li>
@@ -389,7 +400,7 @@ export default function CitationsPanel() {
 
               {!loading && entries !== null && entries.length === 0 && !error && (
                 <p className="mt-3 rounded-md bg-gray-50/60 px-2 py-3 text-center text-xs text-ink-faint">
-                  Nothing imported yet. Import a .bib file above, or look up a DOI/arXiv id.
+                  {t("Nothing imported yet. Import a .bib file above, or look up a DOI/arXiv id.")}
                 </p>
               )}
 
@@ -406,9 +417,11 @@ export default function CitationsPanel() {
                             {e.title}
                           </div>
                           <div className="truncate text-[10px] text-ink-faint">
-                            {e.authors.join(", ") || "Unknown author"}
+                            {e.authors.join(", ") || t("Unknown author")}
                             {e.year ? ` · ${e.year}` : ""}
-                            {citedIds.includes(e.id) ? ` · cited [${citedIds.indexOf(e.id) + 1}]` : ""}
+                            {citedIds.includes(e.id)
+                              ? ` · ${translateWith("cited [{n}]", lang, { n: citedIds.indexOf(e.id) + 1 })}`
+                              : ""}
                           </div>
                         </div>
                         <div className="flex shrink-0 items-center gap-1">
@@ -422,7 +435,7 @@ export default function CitationsPanel() {
                             onClick={() => void removeEntry(e.id, e.title)}
                             disabled={removingId === e.id}
                             className="text-ink-faint hover:text-red-600 disabled:opacity-50"
-                            aria-label={`Remove "${e.title}" from the citation library`}
+                            aria-label={translateWith("Remove “{title}” from the citation library", lang, { title: e.title })}
                             title={t("Remove from library")}
                           >
                             {removingId === e.id ? (
@@ -441,14 +454,16 @@ export default function CitationsPanel() {
               <div className="mt-3 border-t border-gray-100 pt-2">
                 <div className="flex items-center justify-between">
                   <span className="text-[11px] text-ink-faint">
-                    {citedIds.length} cited entr{citedIds.length === 1 ? "y" : "ies"} this session
+                    {citedIds.length === 1
+                      ? t("1 cited entry this session")
+                      : translateWith("{n} cited entries this session", lang, { n: citedIds.length })}
                   </span>
                   <button
                     onClick={() => void buildBibliography()}
                     disabled={citedIds.length === 0 || buildingBibliography}
                     className="rounded-md px-2.5 py-1.5 text-xs text-ink-soft hover:bg-gray-100 disabled:opacity-40"
                   >
-                    {buildingBibliography ? "…" : "Build references list"}
+                    {buildingBibliography ? "…" : t("Build references list")}
                   </button>
                 </div>
                 {bibliography && bibliography.length > 0 && (
@@ -479,7 +494,7 @@ export default function CitationsPanel() {
                   className="rounded-md border border-gray-300 px-1.5 py-1.5 text-xs"
                 >
                   <option value="doi">DOI</option>
-                  <option value="arxiv">arXiv id</option>
+                  <option value="arxiv">{t("arXiv id")}</option>
                 </select>
                 <input
                   value={lookupQuery}
@@ -495,7 +510,7 @@ export default function CitationsPanel() {
                   disabled={!lookupQuery.trim() || looking}
                   className="shrink-0 rounded-md bg-accent px-2.5 py-1.5 text-xs font-medium text-white hover:bg-accent-soft disabled:opacity-50"
                 >
-                  {looking ? <SpinnerIcon className="h-3.5 w-3.5" /> : "Look up"}
+                  {looking ? <SpinnerIcon className="h-3.5 w-3.5" /> : t("Look up")}
                 </button>
               </div>
 
@@ -503,7 +518,7 @@ export default function CitationsPanel() {
                 <div className="mt-2 rounded-md border border-gray-100 bg-gray-50/60 p-2 text-xs">
                   <div className="font-medium text-ink">{lookupResult.title}</div>
                   <div className="mt-0.5 text-[10px] text-ink-faint">
-                    {lookupResult.authors.join(", ") || "Unknown author"}
+                    {lookupResult.authors.join(", ") || t("Unknown author")}
                     {lookupResult.year ? ` · ${lookupResult.year}` : ""}
                     {lookupResult.venue ? ` · ${lookupResult.venue}` : ""}
                   </div>

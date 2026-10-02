@@ -7,7 +7,7 @@
 import type { DragEvent } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useStore } from "../store";
-import { tNow, useT } from "../i18n";
+import { tNow, tf, useT } from "../i18n";
 import ChunkView from "./ChunkView";
 import { PlusIcon } from "./icons";
 
@@ -65,10 +65,10 @@ export default function Editor() {
           const dataUrl = await readFileAsDataUrl(file);
           afterId = s.insertLocalImageAfter(afterId, dataUrl, file.name);
         } catch {
-          s.notify(`Could not read "${file.name}".`, "error");
+          s.notify(tf("Could not read “{name}”.", { name: file.name }), "error");
         }
       }
-      s.notify(files.length > 1 ? `${files.length} ${tNow("images inserted.")}` : tNow("Image inserted."), "success");
+      s.notify(files.length > 1 ? tf("{n} images inserted.", { n: files.length }) : tNow("Image inserted."), "success");
     })();
   };
 
@@ -104,6 +104,7 @@ export default function Editor() {
         value={title}
         onChange={(e) => setTitle(e.target.value)}
         placeholder={t("Untitled Document")}
+        title={t("Editing the title writes it as the Markdown H1; it also titles any slide content before the first heading")}
         className="mb-10 w-full bg-transparent font-sans text-4xl font-bold text-ink outline-none placeholder:text-ink-faint/40"
       />
 

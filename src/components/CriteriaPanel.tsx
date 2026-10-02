@@ -19,7 +19,7 @@
 import { useState } from "react";
 import { create } from "zustand";
 import { checkAgainstCriteria, type CriteriaCheckResult } from "../aiActions";
-import { useT } from "../i18n";
+import { translateWith, useLang, useT } from "../i18n";
 import { useStore } from "../store";
 import { CheckSquareIcon, CloseIcon, SquareIcon } from "./icons";
 
@@ -50,6 +50,7 @@ function chunkPreview(content: string, max = 60): string {
 
 export default function CriteriaPanel() {
   const t = useT();
+  const lang = useLang();
   const open = useCriteriaPanelStore((s) => s.open);
   const setOpen = useCriteriaPanelStore((s) => s.setOpen);
   const chunks = useStore((s) => s.doc.chunks);
@@ -81,7 +82,7 @@ export default function CriteriaPanel() {
       // visible if the toast has already faded.
       if (r === null) {
         setError(
-          "The check could not run — see the notification for why (e.g. run Analyze first, or set an API key)."
+          t("The check could not run — see the notification for why (e.g. run Analyze first, or set an API key).")
         );
       } else {
         setResults(r);
@@ -111,24 +112,28 @@ export default function CriteriaPanel() {
       </div>
 
       <p className="mb-2 text-xs text-ink-faint">
-        Type your own review criteria, one per line (e.g. from a grant's review
-        rubric) — this app has no built-in list. The AI checks whether each one
-        has a supporting paragraph anywhere in the document (run Analyze first).
+        {t(
+          "Type your own review criteria, one per line (e.g. from a grant's review rubric) — this app has no built-in list. The AI checks whether each one has a supporting paragraph anywhere in the document (run Analyze first)."
+        )}
       </p>
 
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
         rows={4}
-        placeholder={
-          "One criterion per line, e.g.:\nExplains the significance of the research\nStates a clear methodology"
-        }
+        placeholder={[
+          t("One criterion per line, e.g.:"),
+          t("Explains the significance of the research"),
+          t("States a clear methodology"),
+        ].join("\n")}
         className="w-full resize-none rounded-md border border-gray-300 p-2 text-xs text-ink-soft outline-none focus:border-accent"
       />
 
       <div className="mt-2 flex items-center justify-between">
         <span className="text-[11px] text-ink-faint">
-          {criteria.length} criteri{criteria.length === 1 ? "on" : "a"}
+          {criteria.length === 1
+            ? t("1 criterion")
+            : translateWith("{n} criteria", lang, { n: criteria.length })}
         </span>
         <button
           onClick={() => void runCheck()}

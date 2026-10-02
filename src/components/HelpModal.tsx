@@ -3,9 +3,10 @@
 // several languages, picked from a selector next to the title; the initial
 // language follows the user's Default language (Settings) when it matches.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { tNow } from "../i18n";
+import { JA, tNow, translateWith, useLang } from "../i18n";
+import { APP_VERSION, BUILD_ID } from "../buildInfo";
 import { useStore } from "../store";
 import {
   CloseIcon,
@@ -18,6 +19,7 @@ import {
   SpeakerIcon,
   ExportIcon,
 } from "./icons";
+import Modal from "./Modal";
 
 const OPENROUTER_URL = "https://openrouter.ai/";
 
@@ -59,6 +61,12 @@ interface HelpContent {
    * paragraph rather than guess a translation.
    */
   ghostText?: { title: string; body: string };
+  /**
+   * Find / Replace, Save As and closing tabs — keyboard-driven editing
+   * chores, documented outside the numbered workflow. Optional like
+   * `ghostText`: only English and 日本語 carry it so far.
+   */
+  editing?: { title: string; body: string };
 }
 
 // Icons for the six workflow steps, shared across all languages (paired by index).
@@ -73,9 +81,15 @@ const STEP_ICONS = [
 
 // Localized help content. Strings use two lightweight markup tokens, expanded by
 // `renderRich`: `**bold**` → <strong>, and `[label](openrouter)` → a link to
-// OpenRouter. On-screen UI labels (Settings, Draft by AI, …) stay in English to
-// match the app interface, which is English-only.
-const HELP_I18N: Record<HelpLang, HelpContent> = {
+// OpenRouter. Controls are named by the label the user actually sees: the app
+// chrome is English or Japanese (src/i18n.ts), so the 日本語 bundle interpolates
+// its control names from the JA dictionary (`ja(...)`) and can never drift from
+// the Japanese UI (guarded by src/helpContent.test.ts). 中文/Español/Français
+// readers see the English chrome, so those bundles keep the English labels.
+// OpenRouter's own site navigation (sign in → Keys → Create Key) stays English.
+const ja = (key: string): string => JA[key] ?? key;
+
+export const HELP_I18N: Record<HelpLang, HelpContent> = {
   English: {
     heading: "How to write with NurumayuEditor",
     apiTitle: "Before you start — set an API key",
@@ -100,7 +114,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "3. Add images & diagrams",
-        body: "From a paragraph’s right gutter, generate an image, or convert it to a Mermaid diagram. Select several paragraphs (checkbox) and use the bottom bar to generate one combined image. Regenerate to get alternatives and pick your favourite.",
+        body: "From a paragraph’s right gutter, generate an image. To turn a paragraph into a Mermaid diagram, use “Generate diagram…” in its ✨ menu (left gutter). Select several paragraphs (checkbox) and use the bottom bar to generate one combined image. Regenerate to get alternatives and pick your favourite.",
       },
       {
         title: "4. Check the structure",
@@ -112,14 +126,19 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. Save & export",
-        body: "Save as a native .aix file (lossless), or export to .txt / .md / .rtf / .pdf. PDF uses the system print dialog, so choose “Save as PDF”.",
+        body: "Save as a native .aix file (lossless), or export to .txt / .md / .rtf / .pdf. PDF export asks where to save and writes an A4 PDF; images become text placeholders and diagrams print as their Mermaid source (both listed in the export report on the status bar — embedding them is planned).",
       },
     ],
     tip: "Tip: set your **Default language** and **Writing tone** in Settings — every AI action then keeps that language and voice.",
     ghostText: {
       title: "Ghost-text suggestions",
       body:
-        "While your cursor sits at the end of a paragraph, pausing briefly may show a faint grey inline suggestion for how the sentence continues. It only appears when AI is available (an API key set, or a local endpoint) and stays invisible otherwise — no dialog, no toast. Press Tab to accept it, or Escape (or keep typing) to dismiss it. In Settings, “Limit ghost-text completion to a local model” restricts it to a local endpoint only (e.g. Ollama), so it never reaches a remote server unless you choose one.",
+        "After you type in a paragraph and pause briefly with the cursor at its end, a faint grey inline suggestion for how the sentence continues may appear. Opening a file, switching tabs or clicking into a paragraph never requests one — only typing does. It only appears when AI is available (an API key set, or a local endpoint) and stays invisible otherwise — no dialog, no toast. Press Tab to accept it, or Escape (or keep typing) to dismiss it. In Settings, “Limit ghost-text completion to a local model” restricts it to a local endpoint only (e.g. Ollama), so it never reaches a remote server unless you choose one.",
+    },
+    editing: {
+      title: "Find, Save As & tabs",
+      body:
+        "⌘F opens “Find…” and ⌥⌘F opens “Find and Replace…”. ⌘G / ⇧⌘G (or Enter / ⇧Enter in the find bar) step to the next / previous match; Esc closes the bar. “Replace All” is a single undo step. ⌘L is “Go to Line…”. Go to Line works in Markdown source — switch to Markdown to use it. Find in Slides is planned — switch to Editor or Markdown to search. ⇧⌘S (“Save As…”) saves under a new name, as .aix or .md. Closing a tab — or quitting — with unsaved changes asks Save / Don't Save / Cancel. Closing the last tab leaves a fresh untitled tab.",
     },
   },
 
@@ -127,12 +146,11 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
     heading: "NurumayuEditor で書くには",
     apiTitle: "始める前に — API キーを設定する",
     apiIntro:
-      "AI 機能は OpenAI-compatible なエンドポイントであればどれでも利用できます。既定では、無料モデルを提供する OpenRouter を使用します。",
+      "AI 機能は OpenAI 互換のエンドポイントであればどれでも利用できます。既定では、無料モデルを提供する OpenRouter を使用します。",
     apiStep1: "[openrouter.ai](openrouter) でキーを作成します（sign in → Keys → Create Key）。",
-    apiStep2:
-      "**Settings**（右上の歯車アイコン、または ⌘,）を開き、「OpenRouter API key」の欄に貼り付けてください。キーは macOS keychain に保存され、平文でディスクに書き込まれることはありません。",
+    apiStep2: `**${ja("Settings")}**（右上の歯車アイコン、または ⌘,）を開き、「${ja("OpenRouter API key")}」の欄に貼り付けてください。キーは macOS のキーチェーンに保存され、平文でディスクに書き込まれることはありません。`,
     getKeyBtn: "API キーを取得 →",
-    openSettingsBtn: "Settings を開く",
+    openSettingsBtn: `${ja("Settings")}を開く`,
     ollamaNote:
       "代わりにローカルの Ollama エンドポイントを使う場合は、キーは空欄のままでかまいません。",
     flowIntro:
@@ -140,34 +158,37 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
     steps: [
       {
         title: "1. 文書全体を下書きする",
-        body: "「Draft by AI」をクリックし、テーマを入力して、おおよその分量を選びます。必要に応じて、参考テキスト、ファイル（.txt/.md/.rtf/.pdf）、または URL を添付できます。AI が見出しと段落からなる構造化された初稿を、新しいタブにストリーミングで生成します。",
+        body: `「${ja("Draft by AI")}」をクリックし、テーマを入力して、おおよその分量を選びます。必要に応じて、参考テキスト、ファイル（.txt/.md/.rtf/.pdf）、または URL を添付できます。AI が見出しと段落からなる構造化された初稿を、新しいタブにストリーミングで生成します。`,
       },
       {
         title: "2. 段落ごとに練り上げる",
-        body: "段落を選択し、左側の余白にある ✨ メニューを使います：Translate、Proofread（スタイル指定あり）、Expand、Add detail、Concentrate、Focus、または Custom の指示。各操作は、文脈を把握するために前後の段落を読み取ります。⌘/Ctrl+Enter で素早く校正を実行でき、結果は ⌘/Ctrl+Z で元に戻せます。",
+        body: `段落を選択し、左側の余白にある ✨（${ja("Rewrite, translate or illustrate with AI…")}）メニューを使います：「${ja("Expand")}」「${ja("Add detail")}」「${ja("Concentrate")}」「${ja("Focus")}」「${ja("Translate…")}」「${ja("Proofread…")}」（スタイル指定あり）、または「${ja("Custom instruction…")}」。各操作は、文脈を把握するために前後の段落を読み取ります。⌘/Ctrl+Enter で素早く校正を実行でき、結果は ⌘/Ctrl+Z で元に戻せます。`,
       },
       {
         title: "3. 画像と図を追加する",
-        body: "段落の右側の余白から、画像を生成したり、Mermaid 図に変換したりできます。複数の段落を選択（チェックボックス）し、下部のバーを使えば、それらをまとめた 1 枚の画像を生成できます。再生成すると別の候補が得られるので、気に入ったものを選べます。",
+        body: `段落の右側の余白から画像を生成できます。段落を Mermaid 図に変換するには、左側の余白の ✨ メニューにある「${ja("Generate diagram…")}」を使います。複数の段落を選択（チェックボックス）し、下部のバーを使えば、それらをまとめた 1 枚の画像を生成できます。再生成すると別の候補が得られるので、気に入ったものを選べます。`,
       },
       {
         title: "4. 構成を確認する",
-        body: "「Analyze」を使うと、段落や文どうしの関係を、操作可能なネットワークグラフとして抽出できます。ノードをクリックすると、その段落へジャンプします。",
+        body: `「${ja("Analyze")}」を使うと、段落や文どうしの関係を、操作可能なネットワークグラフとして抽出できます。ノードをクリックすると、その段落へジャンプします。`,
       },
       {
         title: "5. 読み上げを聞く",
-        body: "段落の読み上げ（🔊）コントロールを使うと、その内容を音声で聞けます — 不自然な言い回しに気づくための手軽な方法です。出力言語は Settings の Default language に従います。",
+        body: `段落の 🔊（${ja("Read this paragraph aloud")}）ボタンを使うと、その内容を音声で聞けます — 不自然な言い回しに気づくための手軽な方法です。出力言語は${ja("Settings")}の「${ja("Default language")}」に従います。`,
       },
       {
         title: "6. 保存と書き出し",
-        body: "ネイティブの .aix ファイル（無劣化）として保存するか、.txt / .md / .rtf / .pdf に書き出せます。PDF はシステムの印刷ダイアログを使うため、「Save as PDF」を選んでください。",
+        body: `ネイティブの .aix ファイル（無劣化）として保存するか、「${ja("Import / Export")}」メニューから .txt / .md / .rtf / .pdf に書き出せます。PDF は保存先を選ぶと A4 の PDF ファイルとして書き出されます。画像はテキストの代替表示に、図は Mermaid のソースとして出力されます（ステータスバーの書き出しレポートに一覧表示されます。埋め込みは今後対応予定です）。`,
       },
     ],
-    tip: "ヒント：Settings で **Default language** と **Writing tone** を設定しておくと、以降のすべての AI 操作がその言語と文体を保ちます。",
+    tip: `ヒント：${ja("Settings")}で **${ja("Default language")}** と **${ja("Writing tone")}** を設定しておくと、以降のすべての AI 操作がその言語と文体を保ちます。`,
     ghostText: {
-      title: "ゴーストテキスト（先読み候補）",
-      body:
-        "段落の末尾にカーソルがある状態で少し手を止めると、文の続きの候補が薄いグレーの文字でカーソルの先に表示されることがあります。これは AI が利用可能なとき（API キーが設定されている、またはローカルのエンドポイントを使っている場合）にだけ現れ、それ以外は何も表示されません — ダイアログもトーストも出ません。Tab キーで候補を確定し、Escape キー（またはそのまま入力を続ける）で消せます。Settings の「Limit ghost-text completion to a local model」を有効にすると、ローカルのエンドポイント（例：Ollama）のときにしか働かなくなり、リモートのサーバーに送られることはなくなります。",
+      title: "インライン補完（ゴーストテキスト）",
+      body: `段落に入力してから、カーソルを末尾に置いたまま少し手を止めると、文の続きの候補が薄いグレーの文字でカーソルの先に表示されることがあります。ファイルを開いたり、タブを切り替えたり、段落をクリックしただけでは表示されません — 入力したときだけです。これは AI が利用可能なとき（API キーが設定されている、またはローカルのエンドポイントを使っている場合）にだけ現れ、それ以外は何も表示されません — ダイアログもトーストも出ません。Tab キーで候補を確定し、Escape キー（またはそのまま入力を続ける）で消せます。${ja("Settings")}の「${ja("Limit ghost-text completion to a local model")}」を有効にすると、ローカルのエンドポイント（例：Ollama）のときにしか働かなくなり、リモートのサーバーに送られることはなくなります。`,
+    },
+    editing: {
+      title: "検索・別名で保存・タブ",
+      body: `⌘F で「${ja("Find…")}」、⌥⌘F で「${ja("Find and Replace…")}」を開きます。⌘G / ⇧⌘G（検索バーでは Enter / ⇧Enter）で次 / 前の一致へ移動し、Esc で検索バーを閉じます。「${ja("Replace All")}」は 1 回の取り消しでまとめて元に戻せます。⌘L は「${ja("Go to Line…")}」です。${ja("Go to Line works in Markdown source — switch to Markdown to use it.")}${ja("Find in Slides is planned — switch to Editor or Markdown to search.")}⇧⌘S（「${ja("Save As…")}」）で、別の名前で .aix または .md として保存できます。未保存の変更があるタブを閉じるとき（「${ja("Close tab")}」）やアプリを終了するときは、「${ja("Save")}」「${ja("Don't Save")}」「${ja("Cancel")}」から選べます。最後のタブを閉じると、新しい「${ja("Untitled")}」タブに置き換わります。`,
     },
   },
 
@@ -194,7 +215,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "3. 添加图片与图表",
-        body: "在段落的右侧栏，可生成图片，或将其转换为 Mermaid 图表。勾选多个段落（复选框），再使用底部栏生成一张合并图片。重新生成可获得不同方案，挑选你最满意的一张。",
+        body: "在段落的右侧栏可生成图片；要将段落转换为 Mermaid 图表，请使用左侧栏 ✨ 菜单中的“Generate diagram…”。勾选多个段落（复选框），再使用底部栏生成一张合并图片。重新生成可获得不同方案，挑选你最满意的一张。",
       },
       {
         title: "4. 检查结构",
@@ -206,7 +227,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. 保存与导出",
-        body: "保存为原生 .aix 文件（无损），或导出为 .txt / .md / .rtf / .pdf。PDF 使用系统打印对话框，因此请选择“Save as PDF”。",
+        body: "保存为原生 .aix 文件（无损），或导出为 .txt / .md / .rtf / .pdf。导出 PDF 时选择保存位置即可生成 A4 PDF；图片会以文字占位符代替，图表以其 Mermaid 源代码输出（列在状态栏的导出报告中，嵌入功能计划中）。",
       },
     ],
     tip: "提示：在 Settings 中设置你的 **Default language** 和 **Writing tone** — 此后每个 AI 操作都会沿用该语言与语气。",
@@ -237,7 +258,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "3. Añade imágenes y diagramas",
-        body: "Desde el margen derecho de un párrafo, genera una imagen o conviértelo en un diagrama Mermaid. Selecciona varios párrafos (casilla) y usa la barra inferior para generar una sola imagen combinada. Vuelve a generar para obtener alternativas y elige tu favorita.",
+        body: "Desde el margen derecho de un párrafo, genera una imagen. Para convertir un párrafo en un diagrama Mermaid, usa «Generate diagram…» en su menú ✨ (margen izquierdo). Selecciona varios párrafos (casilla) y usa la barra inferior para generar una sola imagen combinada. Vuelve a generar para obtener alternativas y elige tu favorita.",
       },
       {
         title: "4. Revisa la estructura",
@@ -249,7 +270,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. Guarda y exporta",
-        body: "Guárdalo como archivo nativo .aix (sin pérdidas) o expórtalo a .txt / .md / .rtf / .pdf. El PDF usa el cuadro de diálogo de impresión del sistema, así que elige «Save as PDF».",
+        body: "Guárdalo como archivo nativo .aix (sin pérdidas) o expórtalo a .txt / .md / .rtf / .pdf. Al exportar a PDF eliges dónde guardarlo y se genera un PDF A4; las imágenes se sustituyen por marcadores de texto y los diagramas se imprimen como su código fuente Mermaid (se listan en el informe de exportación de la barra de estado; su inclusión está prevista).",
       },
     ],
     tip: "Consejo: configura tu **Default language** y tu **Writing tone** en Settings — así cada acción de IA mantendrá ese idioma y esa voz.",
@@ -280,7 +301,7 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "3. Ajoutez des images et des diagrammes",
-        body: "Depuis la gouttière de droite d'un paragraphe, générez une image ou convertissez-le en diagramme Mermaid. Sélectionnez plusieurs paragraphes (case à cocher) et utilisez la barre du bas pour générer une seule image combinée. Régénérez pour obtenir des variantes et choisissez votre préférée.",
+        body: "Depuis la gouttière de droite d'un paragraphe, générez une image. Pour convertir un paragraphe en diagramme Mermaid, utilisez « Generate diagram… » dans son menu ✨ (gouttière de gauche). Sélectionnez plusieurs paragraphes (case à cocher) et utilisez la barre du bas pour générer une seule image combinée. Régénérez pour obtenir des variantes et choisissez votre préférée.",
       },
       {
         title: "4. Vérifiez la structure",
@@ -292,14 +313,15 @@ const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. Enregistrez et exportez",
-        body: "Enregistrez au format natif .aix (sans perte), ou exportez vers .txt / .md / .rtf / .pdf. Le PDF utilise la boîte de dialogue d'impression du système, alors choisissez « Save as PDF ».",
+        body: "Enregistrez au format natif .aix (sans perte), ou exportez vers .txt / .md / .rtf / .pdf. L'export PDF vous demande où enregistrer et produit un PDF A4 ; les images sont remplacées par des repères textuels et les diagrammes sont imprimés sous forme de leur source Mermaid (listés dans le rapport d'export de la barre d'état ; leur intégration est prévue).",
       },
     ],
     tip: "Astuce : définissez votre **Default language** et votre **Writing tone** dans Settings — chaque action d'IA conserve alors cette langue et ce ton.",
-    // `ghostText` intentionally omitted: only English and 日本語 are translated
-    // for this paragraph so far (see the interface doc comment above) — 中文/
-    // Español/Français readers simply don't see this paragraph rather than
-    // risk an unverified machine translation of a behavioural description.
+    // `ghostText` and `editing` intentionally omitted: only English and 日本語
+    // are translated for these paragraphs so far (see the interface doc
+    // comments above) — 中文/Español/Français readers simply don't see them
+    // rather than risk an unverified machine translation of a behavioural
+    // description.
   },
 };
 
@@ -342,10 +364,12 @@ export default function HelpModal() {
   const close = useStore((s) => s.closeHelp);
   const openSettings = useStore((s) => s.openSettings);
   const settings = useStore((s) => s.settings);
+  const uiLang = useLang();
 
   const [lang, setLang] = useState<HelpLang>("English");
   // Once the user picks a language manually, stop following the Settings default.
   const userPicked = useRef(false);
+  const titleId = useId();
 
   useEffect(() => {
     if (open && !userPicked.current && isHelpLang(settings?.defaultTargetLanguage)) {
@@ -359,17 +383,15 @@ export default function HelpModal() {
   const openRouter = () => void openUrl(OPENROUTER_URL);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
-      onMouseDown={close}
+    <Modal
+      name="help"
+      onClose={close}
+      labelledBy={titleId}
+      panelClassName="flex max-h-[90vh] w-full max-w-xl flex-col rounded-xl bg-white shadow-2xl"
     >
-      <div
-        className="flex max-h-[90vh] w-full max-w-xl flex-col rounded-xl bg-white shadow-2xl"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-gray-100 px-6 pb-3 pt-5">
           <div className="flex min-w-0 items-center gap-3">
-            <h2 className="truncate text-lg font-semibold text-ink">{t.heading}</h2>
+            <h2 id={titleId} className="truncate text-lg font-semibold text-ink">{t.heading}</h2>
             <div className="flex shrink-0 items-center gap-1.5 text-ink-faint">
               <LanguagesIcon className="h-4 w-4" />
               <select
@@ -436,19 +458,23 @@ export default function HelpModal() {
               </div>
             </div>
           ))}
-          {t.ghostText && (
-            <div className="rounded-lg border border-gray-100 bg-gray-50/60 p-3">
-              <div className="text-sm font-semibold text-ink">{t.ghostText.title}</div>
-              <p className="mt-0.5 text-sm leading-relaxed text-ink-soft">
-                {t.ghostText.body}
-              </p>
-            </div>
+          {[t.ghostText, t.editing].map(
+            (section) =>
+              section && (
+                <div key={section.title} className="rounded-lg border border-gray-100 bg-gray-50/60 p-3">
+                  <div className="text-sm font-semibold text-ink">{section.title}</div>
+                  <p className="mt-0.5 text-sm leading-relaxed text-ink-soft">{section.body}</p>
+                </div>
+              ),
           )}
           <p className="border-t border-gray-100 pt-3 text-xs text-ink-faint">
             {renderRich(t.tip, openRouter)}
           </p>
+          {/* Build identity (MISS-02): ties what the user runs to a commit. */}
+          <p className="text-xs text-ink-faint" data-build-id={BUILD_ID}>
+            {translateWith("Version {version} ({build})", uiLang, { version: APP_VERSION, build: BUILD_ID })}
+          </p>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

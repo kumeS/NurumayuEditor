@@ -433,6 +433,21 @@ fn call_analyze(args: &Value) -> Result<String, ToolError> {
     }
 }
 
+/// MCP `export`: write `path`'s document to `outPath` in `format` through
+/// `cli::export` and return `{wrote, warnings}`.
+///
+/// Known limits (deliberate; see docs/ai/06 "MCP export: no document-relative
+/// figures"):
+/// - Document-relative figures are NOT resolved: `cli::export` passes no
+///   source path, so a relative path, absolute path or `file:` figure is never
+///   read from disk and comes back as the "local image(s) couldn't be read"
+///   PPTX warning. Resolving them (`cli::export_from(.., Some(path))`) would let
+///   an external MCP client pull any readable image-extension file into an
+///   output path it chooses; that waits for the confinement decision
+///   (planned: confine reads to the document folder's subtree).
+///
+/// RTF and PDF exports return their counted report warnings (`cli::export`
+/// routes RTF through `fileio::export_with_report`).
 fn call_export(args: &Value) -> Result<String, ToolError> {
     let path = required_string_arg(args, "path")?;
     let format = required_string_arg(args, "format")?;

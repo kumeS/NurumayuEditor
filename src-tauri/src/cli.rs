@@ -125,7 +125,7 @@ fn run(cmd: &str, rest: &[String]) -> Result<(), String> {
                 .get(1)
                 .ok_or("export: missing <out.{txt,md,rtf,pdf,pptx}>")?;
             let doc = load(input)?;
-            let warnings = export(&doc, output)?;
+            let warnings = export_from(&doc, output, Some(input))?;
             for w in warnings {
                 eprintln!("warning: {w}");
             }
@@ -250,7 +250,7 @@ fn cli_api_key_for(endpoint: &str) -> Result<String, String> {
 }
 
 /// Resolve an `LlmConfig` the same way the GUI's `ai_process` command does
-/// (`commands.rs`: `Settings::load(config_dir)` + `api_key_for(endpoint)`),
+/// (`commands.rs`: `load_settings_in(config_dir)` + `api_key_for(endpoint)`),
 /// but from a CLI-resolved config dir since there is no `AppHandle` here.
 fn load_cli_llm_config() -> Result<LlmConfig, String> {
     let config_dir = cli_config_dir()?;
@@ -326,11 +326,29 @@ pub(crate) fn load(path: &str) -> Result<Document, String> {
 }
 
 /// Export `doc` to `output` (extension picks the format). Returns any
-/// non-fatal warnings collected during export (currently only pptx produces
-/// any); the caller decides how to surface them (CLI: stderr, MCP: response
+/// non-fatal warnings collected during export (pptx and pdf produce them);
+/// the caller decides how to surface them (CLI: stderr, MCP: response
 /// field) — this function never swallows them. `pub(crate)` so `mcp.rs`'s
 /// `export` tool reuses this exact implementation rather than a second copy.
+/// Without a source path, local figure references are not read (see
+/// `export_from`).
 pub(crate) fn export(doc: &Document, output: &str) -> Result<Vec<String>, String> {
+    export_from(doc, output, None)
+}
+
+/// `export`, plus: for `.pptx`, image chunks that reference a local file
+/// (`figures/x.png` next to `source`, an absolute path, or a `file:` URL) are
+/// read through `imageio::embed_local_images` — the same checks as the GUI
+/// (regular non-symlink file, extension allowlist, size cap, content sniff;
+/// `imageio::read_local_image_file`) — so they embed like they do from the app. A
+/// figure that can't be read still comes back as the "local image(s)
+/// couldn't be read" warning. `source` is the input document's path
+/// (relative paths resolve against the current directory).
+pub(crate) fn export_from(
+    doc: &Document,
+    output: &str,
+    source: Option<&str>,
+) -> Result<Vec<String>, String> {
     let ext = output
         .rsplit('.')
         .next()
@@ -354,12 +372,28 @@ pub(crate) fn export(doc: &Document, output: &str) -> Result<Vec<String>, String
             rt.block_on(imageio::resolve_remote_images(
                 d.slides.iter_mut().flat_map(|s| s.chunks.iter_mut()),
             ));
+            if let Some(src) = source {
+                let abs = std::path::absolute(src)
+                    .map_err(|e| format!("resolve {src}: {e}"))?;
+                imageio::embed_local_images(
+                    d.slides.iter_mut().flat_map(|s| s.chunks.iter_mut()),
+                    &abs.to_string_lossy(),
+                );
+            }
             let (bytes, warnings) = pptx::deck_to_pptx(&d).map_err(|e| e.to_string())?;
             fileio::write_atomic(output, &bytes).map_err(|e| format!("write {output}: {e}"))?;
             Ok(warnings)
         }
-        _ => fileio::export_to_path(doc, output, &ext)
-            .map(|()| Vec::new())
+        // PDF placeholders (images, diagram source, literal Markdown) come
+        // back as counted warnings — the same report the GUI shows.
+        "pdf" => crate::pdf::write_pdf(doc, output)
+            .map(|report| report.warnings)
+            .map_err(|e| e.to_string()),
+        // RTF placeholders (unembeddable images, diagram source) come back as
+        // the RtfReport's counted warnings — the report the GUI shows; txt/md
+        // carry none.
+        _ => fileio::export_with_report(doc, output, &ext)
+            .map(|report| report.map(|r| r.warnings).unwrap_or_default())
             .map_err(|e| e.to_string()),
     }
 }
@@ -510,6 +544,58 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(mcp_tools.as_slice(), crate::mcp::MCP_TOOLS);
+    }
+
+    #[test]
+    fn pdf_export_returns_the_lossy_content_warnings() {
+        // The same path the CLI `export` verb and the MCP `export` tool use:
+        // PDF placeholders must reach the caller as warnings, not vanish.
+        if crate::pdf::document_to_pdf(&Document::new("probe")).is_err() {
+            eprintln!("skipping: no usable TTF font on this system");
+            return;
+        }
+        let mut doc = Document::new("CLI PDF");
+        doc.chunks.push(Chunk::new_text(0, "Body."));
+        doc.chunks
+            .push(Chunk::new_diagram(1, "graph TD; A-->B;", "mermaid"));
+        let out = std::env::temp_dir().join(format!("aix_cli_pdf_{}.pdf", crate::models::new_id()));
+        let warnings = export(&doc, out.to_str().unwrap()).expect("export pdf");
+        let written = std::fs::read(&out).map(|b| b.starts_with(b"%PDF")).unwrap_or(false);
+        let _ = std::fs::remove_file(&out);
+        assert!(written, "no PDF written");
+        assert_eq!(
+            warnings,
+            vec!["1 diagram was exported as its source text (diagram rendering in PDF is planned)."]
+        );
+    }
+
+    #[test]
+    fn rtf_export_returns_the_rtf_report_warnings() {
+        // The CLI `export` verb and the MCP `export` tool share this path: the
+        // RTF placeholders must reach the caller as counted warnings (rust.md
+        // rule 4), the same RtfReport the GUI's export_document returns.
+        let mut doc = Document::new("CLI RTF");
+        doc.chunks.push(Chunk::new_text(0, "本文。"));
+        doc.chunks
+            .push(Chunk::new_diagram(1, "graph TD; A-->B;", "mermaid"));
+        let out = std::env::temp_dir().join(format!("aix_cli_rtf_{}.rtf", crate::models::new_id()));
+        let warnings = export(&doc, out.to_str().unwrap()).expect("export rtf");
+        let written = std::fs::read_to_string(&out).map(|s| s.starts_with("{\\rtf")).unwrap_or(false);
+        let _ = std::fs::remove_file(&out);
+        assert!(written, "no RTF written");
+        assert_eq!(
+            warnings,
+            vec!["1 diagram(s) had no rendered snapshot and were exported as source text."]
+        );
+
+        // txt/md carry no report and still write.
+        for ext in ["txt", "md"] {
+            let out = std::env::temp_dir().join(format!("aix_cli_txt_{}.{ext}", crate::models::new_id()));
+            let warnings = export(&doc, out.to_str().unwrap()).expect(ext);
+            assert!(out.exists(), "{ext} written");
+            let _ = std::fs::remove_file(&out);
+            assert!(warnings.is_empty(), "{ext}: {warnings:?}");
+        }
     }
 
     #[test]
@@ -742,5 +828,96 @@ mod tests {
         assert!(is_local_endpoint("http://[::1]:11434"));
         assert!(is_local_endpoint("HTTP://LOCALHOST:11434")); // case-insensitive
         assert!(!is_local_endpoint("https://openrouter.ai/api/v1/chat/completions"));
+    }
+
+    // ----- document-relative figures in a headless PPTX export -----
+
+    fn png_1x1() -> Vec<u8> {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png
+    }
+
+    fn figure_doc(src: &str) -> Document {
+        let mut doc = Document::new("Figures");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Pic"));
+        let mut img = Chunk::new_text(1, src);
+        img.metadata.chunk_type = crate::models::CHUNK_TYPE_IMAGE.to_string();
+        doc.chunks.push(img);
+        doc
+    }
+
+    fn media_parts(pptx: &std::path::Path) -> Vec<String> {
+        let bytes = std::fs::read(pptx).expect("pptx written");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        (0..zip.len())
+            .map(|i| zip.by_index(i).expect("entry").name().to_string())
+            .filter(|n| n.starts_with("ppt/media/"))
+            .collect()
+    }
+
+    #[test]
+    fn pptx_export_embeds_figures_next_to_the_input_file() {
+        let dir = std::env::temp_dir().join(format!("aix_cli_fig_{}", crate::models::new_id()));
+        std::fs::create_dir_all(dir.join("figures")).expect("dir");
+        std::fs::write(dir.join("figures/fig.png"), png_1x1()).expect("png");
+        let input = dir.join("note.aix");
+        let out = dir.join("out.pptx");
+
+        let warnings = export_from(
+            &figure_doc("figures/fig.png"),
+            out.to_str().expect("utf8"),
+            Some(input.to_str().expect("utf8")),
+        )
+        .expect("export pptx");
+
+        assert_eq!(media_parts(&out), vec!["ppt/media/image1.png".to_string()]);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pptx_export_still_warns_about_a_figure_it_cannot_read() {
+        let dir = std::env::temp_dir().join(format!("aix_cli_fig_missing_{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let input = dir.join("note.aix");
+        let out = dir.join("out.pptx");
+
+        let warnings = export_from(
+            &figure_doc("figures/missing.png"),
+            out.to_str().expect("utf8"),
+            Some(input.to_str().expect("utf8")),
+        )
+        .expect("export pptx");
+
+        assert!(media_parts(&out).is_empty());
+        assert_eq!(
+            warnings,
+            vec!["1 local image(s) couldn't be read from the document's folder and were left out."]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_verb_resolves_figures_against_the_input_file() {
+        // The `export` arm itself passes the input path through (wiring).
+        let dir = std::env::temp_dir().join(format!("aix_cli_fig_verb_{}", crate::models::new_id()));
+        std::fs::create_dir_all(dir.join("figures")).expect("dir");
+        std::fs::write(dir.join("figures/fig.png"), png_1x1()).expect("png");
+        let input = dir.join("note.aix");
+        let json = serde_json::to_string(&figure_doc("figures/fig.png")).expect("json");
+        std::fs::write(&input, json).expect("aix");
+        let out = dir.join("out.pptx");
+
+        run(
+            "export",
+            &[input.to_string_lossy().into_owned(), out.to_string_lossy().into_owned()],
+        )
+        .expect("export verb");
+
+        assert_eq!(media_parts(&out), vec!["ppt/media/image1.png".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3,30 +3,30 @@
 # with no Gatekeeper / notarization prompt, and it targets the host CPU
 # (Apple Silicon or Intel) automatically.
 #
-# This formula lives in the app's own public repo (kumeS/NurumayuFacet) under
+# This formula lives in the app's own public repo (kumeS/NurumayuEditor) under
 # Formula/. Two ways to install it:
 #
 #   A) Single repo — no separate tap repo needed (two commands):
-#        brew tap kumeS/tap https://github.com/kumeS/NurumayuFacet
-#        brew install kumeS/tap/nurumayufacet
+#        brew tap kumeS/tap https://github.com/kumeS/NurumayuEditor
+#        brew install kumeS/tap/nurumayueditor
 #
 #   B) One command for anyone — needs a tap repo literally named
 #      kumeS/homebrew-tap with this file in its Formula/ dir:
-#        # then: brew install kumeS/tap/nurumayufacet   (no prior `brew tap`)
+#        # then: brew install kumeS/tap/nurumayueditor   (no prior `brew tap`)
 #
 # After tagging a new release, refresh `sha256`:
-#   curl -sL https://github.com/kumeS/NurumayuFacet/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
-class Nurumayufacet < Formula
+#   curl -sL https://github.com/kumeS/NurumayuEditor/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+class Nurumayueditor < Formula
   desc "Writing app where every document is already a slide deck"
-  homepage "https://github.com/kumeS/NurumayuFacet"
-  url "https://github.com/kumeS/NurumayuFacet/archive/refs/tags/v1.3.0.tar.gz"
-  # TODO(release): no v1.3.0 tag exists yet — this placeholder WILL fail
+  homepage "https://github.com/kumeS/NurumayuEditor"
+  url "https://github.com/kumeS/NurumayuEditor/archive/refs/tags/v1.4.0.tar.gz"
+  # TODO(release): no v1.4.0 tag exists yet — this placeholder WILL fail
   # Homebrew's checksum check (intentionally, rather than installing the wrong
   # bytes). After tagging, regenerate with:
-  #   curl -sL https://github.com/kumeS/NurumayuFacet/archive/refs/tags/v1.3.0.tar.gz | shasum -a 256
+  #   curl -sL https://github.com/kumeS/NurumayuEditor/archive/refs/tags/v1.4.0.tar.gz | shasum -a 256
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Artistic-2.0"
-  head "https://github.com/kumeS/NurumayuFacet.git", branch: "main"
+  head "https://github.com/kumeS/NurumayuEditor.git", branch: "main"
 
   depends_on "node" => :build
   depends_on "rust" => :build

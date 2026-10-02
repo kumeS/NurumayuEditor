@@ -7,7 +7,7 @@
 // Selectors are per-chunk, so typing in one paragraph re-renders only this
 // component (Phase 5 performance goal).
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api";
 import {
   aiReady,
@@ -22,10 +22,14 @@ import { caretVerticalEdge } from "../caret";
 import { changed, wordDiff } from "../diff";
 import { pickAndInsertLocalImage } from "../fileActions";
 import { editorBodyFontStyle } from "../fonts";
-import { useT } from "../i18n";
-import { useStore } from "../store";
+import { shouldRequestGhost } from "../ghostText";
+import { translateWith, useLang, useT } from "../i18n";
+import { isImeKeyEvent } from "../modalBehavior";
+import { useStore, type GhostContext } from "../store";
+import { createCompositionTracker, startsNewUndoStep } from "../undoBoundary";
 import ChunkAiMenu from "./ChunkAiMenu";
 import MermaidChunk from "./MermaidChunk";
+import ResolvedImage from "./ResolvedImage";
 import Tooltip from "./Tooltip";
 import {
   ArrowDownIcon,
@@ -46,15 +50,36 @@ import {
   TrashIcon,
 } from "./icons";
 
-// Desired caret offset to apply when a chunk gains focus via keyboard nav.
-const pendingCaret = new Map<string, number>();
+// Desired selection to apply when a chunk gains focus via keyboard nav (a
+// collapsed caret) or when the find bar hands focus back (the current match).
+const pendingSelection = new Map<string, { from: number; to: number }>();
 export function setPendingCaret(id: string, offset: number) {
-  pendingCaret.set(id, offset);
+  pendingSelection.set(id, { from: offset, to: offset });
+}
+export function setPendingSelection(id: string, from: number, to: number) {
+  pendingSelection.set(id, { from, to });
+}
+
+// Mounted chunks register how to focus their textarea and apply a pending
+// selection, for a chunk that is ALREADY the focused one (its focus effect
+// would not re-run).
+const focusers = new Map<string, () => void>();
+
+/**
+ * Focus chunk `id`'s textarea, selecting [from, to) when given (BUG-010: the
+ * find bar returns focus to the editor on its current match).
+ */
+export function focusChunkRange(id: string, from?: number, to?: number) {
+  if (from !== undefined) setPendingSelection(id, from, to ?? from);
+  const st = useStore.getState();
+  if (st.focusedChunkId === id) focusers.get(id)?.();
+  else st.setFocused(id);
 }
 
 // Ghost-text inline completion (開発.txt Stage 2, item 2-4). A nice-to-have
 // quality-of-life feature, not a differentiator — kept deliberately lean:
-// debounce after typing stops, one in-flight request per chunk (last one
+// debounce after the USER types and stops (focus alone never requests —
+// BUG-001a, see ghostText.ts), one in-flight request per chunk (last one
 // wins), no error surface (a failed/slow completion is simply invisible).
 const GHOST_DEBOUNCE_MS = 400;
 
@@ -80,6 +105,7 @@ interface Props {
 
 export default function ChunkView({ chunkId, index, total, slideScope }: Props) {
   const t = useT();
+  const lang = useLang();
   const chunk = useStore((s) => s.doc.chunks.find((c) => c.id === chunkId));
   const busy = useStore((s) => !!s.busyChunks[chunkId]);
   const isFocused = useStore((s) => s.focusedChunkId === chunkId);
@@ -111,6 +137,8 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const toggleReviewPanel = useStore((s) => s.toggleReviewPanel);
   const setReviewTarget = useStore((s) => s.setReviewTarget);
   const flashChunk = useStore((s) => s.flashChunk);
+  // BUG-010: the find bar's current match, when it is in this chunk.
+  const findHit = useStore((s) => (s.find.open && s.find.hit?.chunkId === chunkId ? s.find.hit : null));
 
   // Ghost-text inline completion (開発.txt Stage 2, item 2-4).
   const ghostText = useStore((s) =>
@@ -120,7 +148,58 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const setGhostSuggestion = useStore((s) => s.setGhostSuggestion);
   const clearGhostSuggestion = useStore((s) => s.clearGhostSuggestion);
 
-  const textRef = useRef<HTMLTextAreaElement>(null);
+  const textRef = useRef<HTMLTextAreaElement | null>(null);
+  // BUG-001a: a ghost request needs a user edit since this chunk gained focus.
+  const editedSinceFocus = useRef(false);
+  // BUG-002: undo boundary recorded by the native beforeinput /
+  // compositionstart listeners (pre-mutation selection), consumed by the next
+  // change so updateChunkContent starts a new step for it.
+  const pendingNewStep = useRef(false);
+  // state-async-1: composition state for the store's idle rule — a pause while
+  // choosing an IME candidate must not split the undo step.
+  const composition = useRef(createCompositionTracker());
+  // The finished ghost suggestion, for the screen-reader live region.
+  const [announcedGhost, setAnnouncedGhost] = useState<string | null>(null);
+  const ghostHintId = useId();
+
+  // One ref for every textarea branch (heading / body / diagram). The element
+  // changes with the chunk type and streaming state, so the native listeners
+  // are attached per element (React 19 ref callback with cleanup). React's
+  // onBeforeInput is not the native InputEvent (no inputType), hence native.
+  const bindTextarea = useCallback((el: HTMLTextAreaElement | null) => {
+    textRef.current = el;
+    if (!el) return;
+    const onBeforeInput = (e: Event) => {
+      const ie = e as InputEvent;
+      pendingNewStep.current ||= startsNewUndoStep({
+        inputType: ie.inputType,
+        isComposing: ie.isComposing,
+        selectionStart: el.selectionStart,
+        selectionEnd: el.selectionEnd,
+      });
+      composition.current.input(ie);
+    };
+    const onCompositionStart = () => {
+      pendingNewStep.current ||= startsNewUndoStep({
+        inputType: "",
+        isComposing: false,
+        compositionJustStarted: true,
+        selectionStart: el.selectionStart,
+        selectionEnd: el.selectionEnd,
+      });
+      composition.current.start();
+    };
+    const onCompositionEnd = () => composition.current.end();
+    el.addEventListener("beforeinput", onBeforeInput);
+    el.addEventListener("compositionstart", onCompositionStart);
+    el.addEventListener("compositionend", onCompositionEnd);
+    return () => {
+      el.removeEventListener("beforeinput", onBeforeInput);
+      el.removeEventListener("compositionstart", onCompositionStart);
+      el.removeEventListener("compositionend", onCompositionEnd);
+      if (textRef.current === el) textRef.current = null;
+    };
+  }, []);
   const containerRef = useRef<HTMLDivElement>(null);
   const [showHistory, setShowHistory] = useState(false);
   // UI3: read-aloud state lives in the store (a single global "speaking" chunk),
@@ -140,19 +219,49 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
     el.style.height = `${el.scrollHeight}px`;
   }, [chunk?.content, chunk?.metadata.chunkType, isFocused]);
 
-  // Apply focus + any pending caret when this chunk becomes the focused one.
+  // Focus (or the chunk) changed: nothing has been typed here yet, and no
+  // boundary recorded for the previous focus may leak into the next edit.
   useEffect(() => {
-    if (!isFocused) return;
+    editedSinceFocus.current = false;
+    pendingNewStep.current = false;
+    composition.current.reset();
+  }, [isFocused, chunkId]);
+
+  // Focus the textarea and apply any pending caret/selection.
+  const applyFocus = useCallback(() => {
     const el = textRef.current;
     if (!el) return;
     if (document.activeElement !== el) el.focus();
-    const caret = pendingCaret.get(chunkId);
-    if (caret !== undefined) {
-      const pos = Math.min(caret, el.value.length);
-      el.setSelectionRange(pos, pos);
-      pendingCaret.delete(chunkId);
+    const sel = pendingSelection.get(chunkId);
+    if (sel !== undefined) {
+      const len = el.value.length;
+      el.setSelectionRange(Math.min(sel.from, len), Math.min(sel.to, len));
+      pendingSelection.delete(chunkId);
     }
-  }, [isFocused, chunkId]);
+  }, [chunkId]);
+  useEffect(() => {
+    focusers.set(chunkId, applyFocus);
+    return () => {
+      if (focusers.get(chunkId) === applyFocus) focusers.delete(chunkId);
+    };
+  }, [chunkId, applyFocus]);
+
+  // Apply focus + any pending caret when this chunk becomes the focused one.
+  useEffect(() => {
+    if (!isFocused) return;
+    applyFocus();
+  }, [isFocused, applyFocus]);
+
+  // BUG-010: the find bar's current match is here — scroll it to the middle
+  // of the view. Focus stays in the find bar while stepping, and WebKit does
+  // not paint an unfocused textarea's selection, so the match is shown by the
+  // <mark> overlay below (text) or the ring (heading); the textarea selection
+  // is applied when the bar hands focus back (focusChunkRange).
+  const findMarkRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!findHit) return;
+    (findMarkRef.current ?? containerRef.current)?.scrollIntoView({ block: "center" });
+  }, [findHit]);
 
   // Scroll into view + flash when navigated from the network graph.
   useEffect(() => {
@@ -162,38 +271,41 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   }, [isFlashing]);
 
   // Ghost-text inline completion (開発.txt Stage 2, item 2-4): after the user
-  // stops typing in a focused, non-empty TEXT chunk (headings/diagrams/images
-  // are out of scope — this is a prose quality-of-life feature, not a
-  // differentiator) with the caret at the very END of the content, wait
-  // GHOST_DEBOUNCE_MS and then request one short continuation. Any keystroke
-  // (content or caret move) cancels the pending timer and clears whatever
-  // suggestion was showing — "let normal typing win" beats a stale ghost.
+  // TYPES in a focused, non-empty TEXT chunk (headings/diagrams/images are
+  // out of scope — this is a prose quality-of-life feature, not a
+  // differentiator) and stops with the caret at the very END of the content,
+  // wait GHOST_DEBOUNCE_MS and then request one short continuation. Focus
+  // alone (open, tab/mode switch, click) never requests (BUG-001a):
+  // shouldRequestGhost requires `editedSinceFocus`. Any keystroke (content or
+  // caret move) cancels the pending timer and clears whatever suggestion was
+  // showing — "let normal typing win" beats a stale ghost.
   useEffect(() => {
     clearGhostSuggestion();
     if (!chunk || chunk.metadata.chunkType !== "text" || !isFocused) return;
-    if (!chunk.content.trim()) return;
-    if (!aiReady()) return; // silent — no toast for a background nicety
 
     const timer = window.setTimeout(() => {
-      // Check the CURRENT caret/content right before firing, not what the
-      // effect captured when it started — the user may have kept the caret
-      // still but moved it away from the end (e.g. arrow keys) without a new
-      // content change re-running this effect.
+      // Decide on the CURRENT caret/content/focus right before firing, not
+      // what the effect captured when it started — the user may have kept the
+      // caret still but moved it away from the end (e.g. arrow keys) without a
+      // new content change re-running this effect.
       const el = textRef.current;
-      if (
-        !el ||
-        el.selectionStart !== el.value.length ||
-        el.selectionEnd !== el.value.length
-      ) {
-        return;
-      }
-      const live = useStore.getState().doc.chunks.find((c) => c.id === chunkId);
-      if (!live || !live.content.trim()) return;
+      const s = useStore.getState();
+      const live = s.doc.chunks.find((c) => c.id === chunkId);
+      if (!el || !live) return;
+      const request = shouldRequestGhost({
+        chunkType: live.metadata.chunkType,
+        isFocused: s.focusedChunkId === chunkId,
+        content: live.content,
+        caretAtEnd: el.selectionStart === el.value.length && el.selectionEnd === el.value.length,
+        editedSinceFocus: editedSinceFocus.current,
+        aiReady: aiReady(), // silent — no toast for a background nicety
+      });
+      if (!request) return;
 
       // Cheap context hint: the nearest preceding heading, if any — NOT a
       // full document map (that's for one-click actions, not a
       // must-feel-instant background completion).
-      const chunks = useStore.getState().doc.chunks;
+      const chunks = s.doc.chunks;
       const idx = chunks.findIndex((c) => c.id === chunkId);
       let contextHint = "";
       for (let i = idx - 1; i >= 0; i--) {
@@ -203,12 +315,35 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
         }
       }
 
+      // What this suggestion continues: the exact text sent, in this tab and
+      // document load. The store drops, and Tab refuses, a suggestion once
+      // any of these changed (BUG-001a/d).
+      const ctx: GhostContext = {
+        chunkId,
+        prefix: live.content,
+        tabId: s.activeTabId,
+        docNonce: s.docNonce,
+      };
       const requestId = startGhostRequest();
+      s.logAiOp({
+        opId: requestId,
+        phase: "start",
+        action: "ghost",
+        tabId: ctx.tabId,
+        docNonce: ctx.docNonce,
+        chunkId,
+      });
       void api
-        .aiGhostCompleteStream(live.content, contextHint, (text) => {
-          setGhostSuggestion(chunkId, text, requestId);
+        .aiGhostCompleteStream(ctx.prefix, contextHint, (text) => {
+          setGhostSuggestion(ctx, text, requestId);
         })
-        .then((finalText) => setGhostSuggestion(chunkId, finalText, requestId))
+        .then((finalText) => {
+          setGhostSuggestion(ctx, finalText, requestId);
+          // Announce the finished suggestion only (never each delta), and
+          // only if the store kept it.
+          const g = useStore.getState().ghostSuggestion;
+          if (g && g.chunkId === chunkId && g.text === finalText) setAnnouncedGhost(finalText);
+        })
         .catch(() => {
           // Silent by design (item 8 of the spec): a completion failing or
           // being slow is invisible — never a toast for this background
@@ -257,34 +392,59 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
   const unresolvedComments = (chunk.metadata.comments ?? []).filter(
     (cm) => !cm.resolved
   ).length;
+  const commentLabel = unresolvedComments
+    ? translateWith("Review comments ({n} open)", lang, { n: unresolvedComments })
+    : t("Add a review comment");
 
   // Typing "# ", "## " or "### " at the start of a text chunk turns it into a
   // heading of that level (Markdown-style). Disabled inside the slide editor
   // (D4): a heading there starts a NEW slide, so auto-converting a bullet you're
   // typing would silently split the current slide.
+  //
+  // Every textarea change goes through takeUndoBoundary: it consumes the
+  // boundary the native listeners recorded for this input (BUG-002) and marks
+  // that the user edited since focus (BUG-001a).
+  const takeUndoBoundary = () => {
+    const newUndoStep = pendingNewStep.current;
+    pendingNewStep.current = false;
+    editedSinceFocus.current = true;
+    return { newUndoStep, composing: composition.current.take() };
+  };
   const handleTextChange = (value: string) => {
+    const { newUndoStep, composing } = takeUndoBoundary();
     const m = /^(#{1,3})[ \t](.*)$/.exec(value);
     if (m && !slideScope) convertToHeading(chunkId, m[1].length, m[2]);
-    else updateChunkContent(chunkId, value);
+    else updateChunkContent(chunkId, value, { newUndoStep, composing });
   };
+  // Heading and diagram source: plain content edits, same undo boundaries.
+  const handleRawChange = (value: string) =>
+    updateChunkContent(chunkId, value, takeUndoBoundary());
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return; // don't interrupt IME composition
+    // Don't interrupt IME composition (keyCode 229 too: WebKit — KBD-IME-ENTER).
+    if (isImeKeyEvent(e.nativeEvent)) return;
     const mod = e.metaKey || e.ctrlKey;
     const el = e.currentTarget;
 
     // Ghost-text (開発.txt Stage 2, item 2-4): plain Tab (no modifier) accepts
-    // the visible suggestion by inserting it at the cursor. Only intercepted
-    // when a suggestion is actually showing — with nothing suggested, Tab
-    // falls through untouched (normal focus-move behaviour is preserved; this
-    // codebase has no other global Tab handler to conflict with). Escape
-    // dismisses; every other key just lets the suggestion vanish naturally on
-    // the next debounce effect run — no explicit handling needed here.
-    if (ghostText && !mod && !e.shiftKey && !e.altKey && e.key === "Tab") {
+    // the visible suggestion through the store's acceptGhostSuggestion, which
+    // commits it as its own undo step ONLY if it was generated for this
+    // chunk's exact current text, in this tab and document load (BUG-001a).
+    // Otherwise it discards the suggestion and Tab falls through untouched
+    // (normal focus-move behaviour is preserved; this codebase has no other
+    // global Tab handler to conflict with). Escape dismisses; every other key
+    // just lets the suggestion vanish naturally on the next debounce effect
+    // run — no explicit handling needed here.
+    if (
+      ghostText &&
+      !mod &&
+      !e.shiftKey &&
+      !e.altKey &&
+      e.key === "Tab" &&
+      useStore.getState().acceptGhostSuggestion(chunkId)
+    ) {
       e.preventDefault();
-      const accepted = chunk.content + ghostText;
-      clearGhostSuggestion();
-      updateChunkContent(chunkId, accepted);
+      const accepted = useStore.getState().doc.chunks.find((c) => c.id === chunkId)?.content ?? "";
       setPendingCaret(chunkId, accepted.length);
       return;
     }
@@ -383,7 +543,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
       id={`chunk-${chunkId}`}
       data-chunk-id={chunkId}
       className={`group relative rounded-md transition-shadow ${
-        isFlashing ? "ring-2 ring-accent/60" : ""
+        isFlashing || findHit ? "ring-2 ring-accent/60" : ""
       } ${isSelected ? "bg-accent/5 ring-1 ring-accent/40" : ""}`}
     >
       {/* Left gutter: AI actions + focused accent rail. Shown only for the
@@ -397,7 +557,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             <ChunkAiMenu chunkId={chunkId} chunkType={type} busy={busy} />
             <div className="flex flex-col items-center gap-0.5">
               {[1, 2, 3].map((lv) => (
-                <Tooltip key={lv} label={`Set heading level ${lv}`}>
+                <Tooltip key={lv} label={translateWith("Set heading level {n}", lang, { n: lv })}>
                   <button
                     onClick={() => setHeadingLevel(chunkId, lv)}
                     className={`h-5 w-6 rounded text-[11px] font-semibold ${
@@ -430,22 +590,23 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           className="my-1 outline-none"
         >
           {chunk.content ? (
-            <img
+            <ResolvedImage
               src={chunk.content}
               alt={chunk.metadata.summary || (isLocalImage ? t("Inserted image") : t("Generated image"))}
               className="max-h-[28rem] max-w-full rounded-lg border border-gray-200"
+              placeholderClassName="block rounded-lg border border-dashed border-gray-300 p-6 text-center text-sm text-ink-faint"
             />
           ) : (
             <div className="rounded-lg border border-dashed border-gray-300 p-6 text-center text-sm text-ink-faint">
-              (empty image)
+              {t("(empty image)")}
             </div>
           )}
           {chunk.content && (
             <Tooltip
               label={
                 isLocalImage
-                  ? "Your figure — inserted from a file on your computer"
-                  : "AI-generated image"
+                  ? t("Your figure — inserted from a file on your computer")
+                  : t("AI-generated image")
               }
             >
               <span className="mt-1 inline-block rounded-full border border-gray-200 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-ink-faint">
@@ -464,7 +625,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
               {imageVersions.map((v, i) => (
                 <Tooltip
                   key={v}
-                  label={v === chunk.content ? "Current version" : `Use version ${i + 1}`}
+                  label={v === chunk.content ? t("Current version") : translateWith("Use version {n}", lang, { n: i + 1 })}
                 >
                   <button
                     onClick={() => selectChunkVersion(chunkId, v)}
@@ -474,7 +635,12 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
                         : "border-gray-200 hover:border-accent"
                     }`}
                   >
-                    <img src={v} alt={`version ${i + 1}`} className="h-full w-full object-cover" />
+                    <ResolvedImage
+                      src={v}
+                      alt={translateWith("Version {n}", lang, { n: i + 1 })}
+                      className="h-full w-full object-cover"
+                      placeholderClassName="flex h-full w-full items-center justify-center text-[8px] text-ink-faint"
+                    />
                   </button>
                 </Tooltip>
               ))}
@@ -497,12 +663,13 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             </div>
           ) : (
             <textarea
-              ref={textRef}
+              ref={bindTextarea}
+              data-doc-history="true"
               value={chunk.content}
               spellCheck
               placeholder={`${t("Heading")} ${headingLevel}`}
               onFocus={() => setFocused(chunkId)}
-              onChange={(e) => updateChunkContent(chunkId, e.target.value)}
+              onChange={(e) => handleRawChange(e.target.value)}
               onKeyDown={onKeyDown}
               rows={1}
               className={headingCls}
@@ -535,8 +702,34 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
                 <span className="text-ink-faint/50">{ghostText}</span>
               </div>
             )}
+            {/* The overlay above is aria-hidden; assistive tech gets the
+                FINISHED suggestion (never each streamed delta) through this
+                always-mounted live region, which the textarea also
+                references via aria-describedby (BUG-001a). */}
+            {/* Find match highlight (BUG-010): same mirror technique, with the
+                current match painted behind the real (transparent-bg) text. */}
+            {findHit && !ghostText && (
+              <div
+                aria-hidden="true"
+                className={`${textCls} pointer-events-none absolute inset-0 whitespace-pre-wrap break-words !text-transparent`}
+                style={bodyFontStyle}
+              >
+                {chunk.content.slice(0, findHit.from)}
+                <mark ref={findMarkRef} className="rounded-sm bg-accent/25 text-transparent">
+                  {chunk.content.slice(findHit.from, findHit.to)}
+                </mark>
+                {chunk.content.slice(findHit.to)}
+              </div>
+            )}
+            <span id={ghostHintId} className="sr-only" aria-live="polite">
+              {ghostText !== null && announcedGhost === ghostText
+                ? translateWith("Suggestion: {text} (Tab to accept, Esc to dismiss)", lang, { text: ghostText })
+                : ""}
+            </span>
             <textarea
-              ref={textRef}
+              ref={bindTextarea}
+              data-doc-history="true"
+              aria-describedby={ghostHintId}
               value={chunk.content}
               spellCheck
               placeholder={
@@ -559,11 +752,12 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
         <div>
           <MermaidChunk code={chunk.content} />
           <textarea
-            ref={textRef}
+            ref={bindTextarea}
+            data-doc-history="true"
             value={chunk.content}
             spellCheck={false}
             onFocus={() => setFocused(chunkId)}
-            onChange={(e) => updateChunkContent(chunkId, e.target.value)}
+            onChange={(e) => handleRawChange(e.target.value)}
             onKeyDown={onKeyDown}
             rows={1}
             className={`mt-1 w-full resize-none overflow-hidden rounded-md border bg-gray-50/70 p-2 font-mono text-xs leading-5 text-ink-soft outline-none transition-all ${
@@ -584,7 +778,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           className="mt-1 flex items-center gap-1 text-xs text-ink-faint hover:text-red-500"
           title={t("Stop this AI action (the result will be discarded)")}
         >
-          <StopIcon className="h-3 w-3" /> Stop
+          <StopIcon className="h-3 w-3" /> {t("Stop")}
         </button>
       )}
 
@@ -638,11 +832,11 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
                   op.type === "equal" ? (
                     <span key={i}>{op.text}</span>
                   ) : op.type === "insert" ? (
-                    <mark key={i} className="rounded bg-emerald-200/70 text-ink">
+                    <mark key={i} className="rounded bg-additive-mark/70 text-ink">
                       {op.text}
                     </mark>
                   ) : (
-                    <span key={i} className="rounded bg-red-200/50 text-ink-faint line-through">
+                    <span key={i} className="rounded bg-removed-mark/50 text-ink-faint line-through">
                       {op.text}
                     </span>
                   )
@@ -660,7 +854,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
                     className="block w-full truncate rounded px-2 py-1 text-left text-xs text-ink-soft hover:bg-white"
                     title={v}
                   >
-                    {v.trim().slice(0, 140) || "(empty)"}
+                    {v.trim().slice(0, 140) || t("(empty)")}
                   </button>
                 ))}
               </div>
@@ -699,7 +893,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           </Tooltip>
         )}
         {(isText || isHeading) && (
-          <Tooltip label="Generate an image from this paragraph">
+          <Tooltip label={t("Generate an image from this paragraph")}>
             <button
               className={`${gutterBtn} hover:text-accent`}
               aria-label={t("Generate an image from this paragraph")}
@@ -710,7 +904,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             </button>
           </Tooltip>
         )}
-        <Tooltip label="Insert an image from a file on your computer">
+        <Tooltip label={t("Insert an image from a file on your computer")}>
           <button
             className={`${gutterBtn} hover:text-accent`}
             aria-label={t("Insert an image from a file on your computer")}
@@ -721,7 +915,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           </button>
         </Tooltip>
         {isImage && !isLocalImage && (
-          <Tooltip label="Regenerate this image (keeps previous versions)">
+          <Tooltip label={t("Regenerate this image (keeps previous versions)")}>
             <button
               className={`${gutterBtn} hover:text-accent`}
               aria-label={t("Regenerate this image (keeps previous versions)")}
@@ -733,7 +927,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
           </Tooltip>
         )}
         {(isText || isHeading) && history.length > 0 && (
-          <Tooltip label="Version history (swap to an earlier version)">
+          <Tooltip label={t("Version history (swap to an earlier version)")}>
             <button
               className={`${gutterBtn} ${showHistory ? "text-accent" : ""}`}
               aria-label={t("Version history (swap to an earlier version)")}
@@ -746,22 +940,12 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             </button>
           </Tooltip>
         )}
-        <Tooltip
-          label={
-            unresolvedComments
-              ? `Review comments (${unresolvedComments} open)`
-              : "Add a review comment"
-          }
-        >
+        <Tooltip label={commentLabel}>
           <button
             className={`${gutterBtn} relative hover:text-accent ${
               unresolvedComments ? "text-accent" : ""
             }`}
-            aria-label={
-              unresolvedComments
-                ? `Review comments (${unresolvedComments} open)`
-                : "Add a review comment"
-            }
+            aria-label={commentLabel}
             onClick={() => {
               setReviewTarget(chunkId);
               toggleReviewPanel(true);
@@ -776,7 +960,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             )}
           </button>
         </Tooltip>
-        <Tooltip label="Add a paragraph below">
+        <Tooltip label={t("Add a paragraph below")}>
           <button
             className={gutterBtn}
             aria-label={t("Add a paragraph below")}
@@ -785,7 +969,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             <PlusIcon />
           </button>
         </Tooltip>
-        <Tooltip label="Move up">
+        <Tooltip label={t("Move up")}>
           <button
             className={gutterBtn}
             aria-label={t("Move up")}
@@ -797,7 +981,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             <ArrowUpIcon />
           </button>
         </Tooltip>
-        <Tooltip label="Move down">
+        <Tooltip label={t("Move down")}>
           <button
             className={gutterBtn}
             aria-label={t("Move down")}
@@ -846,7 +1030,7 @@ export default function ChunkView({ chunkId, index, total, slideScope }: Props) 
             </button>
           </Tooltip>
         )}
-        <Tooltip label="Delete this paragraph">
+        <Tooltip label={t("Delete this paragraph")}>
           <button
             className={`${gutterBtn} hover:text-red-500`}
             aria-label={t("Delete this paragraph")}

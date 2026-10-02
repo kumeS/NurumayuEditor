@@ -1,0 +1,192 @@
+{
+  "_comment": "Golden contract for the NO-baseline Markdown serializer (invariant 3): TS documentToMarkdown (src/markdown.ts serializeChunks, markdownSource undefined, mode editor) and Rust document_to_md (src-tauri/src/fileio.rs) must produce exactly `expected` for each case. Read by src/markdown.test.ts and fileio.rs tests. Heading levels stay within 1-3 (normalize clamps; TS clamps 1-6 but never sees 4-6).",
+  "cases": [
+    {
+      "name": "title, headings, text, diagram, captioned image",
+      "title": "My Title",
+      "chunks": [
+        {
+          "id": "c0",
+          "order": 0,
+          "content": "Methods",
+          "metadata": {
+            "chunkType": "heading",
+            "linkedChunks": [],
+            "level": 2
+          }
+        },
+        {
+          "id": "c1",
+          "order": 1,
+          "content": "We did things.",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        },
+        {
+          "id": "c2",
+          "order": 2,
+          "content": "graph TD; A-->B;\n",
+          "metadata": {
+            "chunkType": "diagram",
+            "linkedChunks": [],
+            "format": "mermaid"
+          }
+        },
+        {
+          "id": "c3",
+          "order": 3,
+          "content": "figures/f.png",
+          "metadata": {
+            "chunkType": "image",
+            "linkedChunks": [],
+            "summary": "Fig 1"
+          }
+        }
+      ],
+      "expected": "# My Title\n\n## Methods\n\nWe did things.\n\n```mermaid\ngraph TD; A-->B;\n```\n\n![Fig 1](figures/f.png)\n"
+    },
+    {
+      "name": "blank title emits no H1",
+      "title": "   ",
+      "chunks": [
+        {
+          "id": "c0",
+          "order": 0,
+          "content": "a",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        },
+        {
+          "id": "c1",
+          "order": 1,
+          "content": "b",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        }
+      ],
+      "expected": "a\n\nb\n"
+    },
+    {
+      "name": "title-only document",
+      "title": "T",
+      "chunks": [],
+      "expected": "# T\n"
+    },
+    {
+      "name": "empty document",
+      "title": "",
+      "chunks": [],
+      "expected": "\n"
+    },
+    {
+      "name": "a trailing empty chunk adds no trailing blank lines",
+      "title": "T",
+      "chunks": [
+        {
+          "id": "c0",
+          "order": 0,
+          "content": "a",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        },
+        {
+          "id": "c1",
+          "order": 1,
+          "content": "",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        }
+      ],
+      "expected": "# T\n\na\n"
+    },
+    {
+      "name": "CJK with U+3000 padding, internal blank lines and trailing whitespace",
+      "title": "日本語の題　",
+      "chunks": [
+        {
+          "id": "c0",
+          "order": 0,
+          "content": "　見出し　",
+          "metadata": {
+            "chunkType": "heading",
+            "linkedChunks": [],
+            "level": 1
+          }
+        },
+        {
+          "id": "c1",
+          "order": 1,
+          "content": "本文。\n\n二段落目",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        },
+        {
+          "id": "c2",
+          "order": 2,
+          "content": "末尾  　",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        }
+      ],
+      "expected": "# 日本語の題\n\n# 見出し\n\n本文。\n\n二段落目\n\n末尾\n"
+    },
+    {
+      "name": "level-3 heading, format-less diagram, caption-less image, padded text kept inside",
+      "title": "D",
+      "chunks": [
+        {
+          "id": "c0",
+          "order": 0,
+          "content": " Deep ",
+          "metadata": {
+            "chunkType": "heading",
+            "linkedChunks": [],
+            "level": 3
+          }
+        },
+        {
+          "id": "c1",
+          "order": 1,
+          "content": "flowchart LR\n  x-->y\n\n",
+          "metadata": {
+            "chunkType": "diagram",
+            "linkedChunks": []
+          }
+        },
+        {
+          "id": "c2",
+          "order": 2,
+          "content": " https://e.x/i.png ",
+          "metadata": {
+            "chunkType": "image",
+            "linkedChunks": []
+          }
+        },
+        {
+          "id": "c3",
+          "order": 3,
+          "content": "  indented line\nnext  ",
+          "metadata": {
+            "chunkType": "text",
+            "linkedChunks": []
+          }
+        }
+      ],
+      "expected": "# D\n\n### Deep\n\n```mermaid\nflowchart LR\n  x-->y\n```\n\n![](https://e.x/i.png)\n\n  indented line\nnext\n"
+    }
+  ]
+}

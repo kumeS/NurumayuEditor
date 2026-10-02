@@ -1,12 +1,11 @@
 // Top-level layout: toolbar over a scrollable editor, with an optional
 // relationship network panel docked on the right.
 
-import { Suspense, lazy, useEffect } from "react";
+import { Suspense, lazy, useEffect, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
 import { advanceSpeechQueue, analyzeDocument } from "./aiActions";
-import { confirmDiscard } from "./confirm";
 import {
   exportDocument,
   exportPdf,
@@ -14,16 +13,22 @@ import {
   importDocument,
   openFolder,
   openNative,
+  requestCloseTab,
+  resolveDirtyTabsForQuit,
   saveNative,
   saveNativeAs,
 } from "./fileActions";
-import { tNow } from "./i18n";
+import { tNow, useT } from "./i18n";
+import { menuAllowedWithModal } from "./shortcuts";
+import { autosaveStep } from "./sessionAutosave";
 import { useStore } from "./store";
 import type { PersistedTab, SessionData } from "./types";
 import { useShortcuts } from "./useShortcuts";
+import { LocalImageCacheContext, createLocalImageCache } from "./useLocalImage";
 import CommandPalette from "./components/CommandPalette";
 import DraftModal from "./components/DraftModal";
 import Editor from "./components/Editor";
+import FindBar, { findStep, openFindBar } from "./components/FindBar";
 import FolderTree from "./components/FolderTree";
 import MarkdownEditor from "./components/MarkdownEditor";
 import HealthBar from "./components/HealthBar";
@@ -37,6 +42,7 @@ import TabBar from "./components/TabBar";
 import Toolbar from "./components/Toolbar";
 import Toasts from "./components/Toasts";
 import { PromptHost } from "./components/PromptModal";
+import { useModalStack } from "./components/Modal";
 
 // Cytoscape is heavy; load the network panel only when it is first opened.
 const NetworkPanel = lazy(() => import("./components/NetworkPanel"));
@@ -67,20 +73,23 @@ function collectSession(): SessionData {
 }
 
 /**
- * Ask before discarding unsaved work. Returns true if it is safe to close
- * (nothing dirty, or the user confirmed). Used by both the window-close path
- * and the app Quit menu so neither can silently lose unsaved tabs (B1).
+ * Resolve unsaved work before quitting. Returns true if it is safe to quit:
+ * nothing dirty, or every dirty tab was saved or explicitly not saved
+ * (Save / Don't Save / Cancel per tab, in tab order — BUG-011). Used by the
+ * app Quit menu (⌘Q); the window close button only hides the window.
  */
 async function okToClose(): Promise<boolean> {
-  if (!anyTabDirty()) return true;
-  return confirmDiscard("quit");
+  return resolveDirtyTabsForQuit();
 }
 
 function App() {
+  const t = useT();
   const networkOpen = useStore((s) => s.networkOpen);
   const reviewPanelOpen = useStore((s) => s.reviewPanelOpen);
   const folderTreeOpen = useStore((s) => s.folderTreeOpen);
   const presentationOpen = useStore((s) => s.presentationOpen);
+  // While any dialog is open the rest of the app is inert (BUG-017).
+  const modalOpen = useModalStack((s) => s.stack.length > 0);
   const mode = useStore((s) => s.doc.mode ?? "editor");
   const activeTabId = useStore((s) => s.activeTabId);
   const setSettings = useStore((s) => s.setSettings);
@@ -90,6 +99,10 @@ function App() {
   // call time — so it has to wait for the saved language to land in the store,
   // or it asks in English inside an otherwise-Japanese app.
   const settingsLoaded = useStore((s) => s.settings !== null);
+  // Local figures are read from disk once per tab + view: stable while you edit
+  // (no re-reading multi-MB images on every keystroke), fresh when you switch
+  // tabs/views or reopen the file — so a regenerated figure shows up.
+  const imageCache = useMemo(() => createLocalImageCache(), [activeTabId, mode]);
 
   useShortcuts();
 
@@ -97,6 +110,10 @@ function App() {
   useEffect(() => {
     const unlisten = listen<string>("menu", async (e) => {
       const st = useStore.getState();
+      // Under a dialog, the menu must not act on the hidden document (BUG-017b).
+      if (useModalStack.getState().stack.length > 0 && !menuAllowedWithModal(e.payload)) return;
+      // ux-a11y-i18n-3: nothing but quit acts behind the presentation overlay.
+      if (useStore.getState().presentationOpen && !menuAllowedWithModal(e.payload)) return;
       switch (e.payload) {
         case "new_tab":
           st.newTab();
@@ -112,6 +129,10 @@ function App() {
           break;
         case "save_as":
           void saveNativeAs();
+          break;
+        case "close_tab":
+          // Same close path as ⌘W (Save / Don't Save / Cancel; BUG-018).
+          void requestCloseTab(st.activeTabId);
           break;
         case "import":
           void importDocument();
@@ -136,6 +157,22 @@ function App() {
           break;
         case "redo":
           st.redo();
+          break;
+        // Find (BUG-010) — same actions as ⌘F / ⌥⌘F / ⌘G / ⇧⌘G / ⌘L.
+        case "find":
+          openFindBar("find");
+          break;
+        case "find_replace":
+          openFindBar("replace");
+          break;
+        case "find_next":
+          findStep("next");
+          break;
+        case "find_previous":
+          findStep("prev");
+          break;
+        case "go_to_line":
+          openFindBar("line");
           break;
         case "settings":
           st.openSettings();
@@ -222,10 +259,15 @@ function App() {
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let written = false; // this subscriber has a session on disk
     const unsub = useStore.subscribe(() => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        if (anyTabDirty()) void api.saveSession(collectSession()).catch(() => {});
+        // state-async-6: undo back to clean (no save path runs) also clears.
+        const step = autosaveStep({ anyDirty: anyTabDirty(), written });
+        written = step.written;
+        if (step.action === "save") void api.saveSession(collectSession()).catch(() => {});
+        else if (step.action === "clear") void api.clearSession().catch(() => {});
       }, 1500);
     });
     return () => {
@@ -276,9 +318,20 @@ function App() {
 
   return (
     <ErrorBoundary>
+    <LocalImageCacheContext.Provider value={imageCache}>
     <div className="flex h-full flex-col bg-white text-ink">
+      {/* BUG-017: everything except the dialogs and toasts goes inert while a
+          modal is open, so neither focus nor clicks can reach the document
+          behind it. (Modal's own focus trap covers WebKit without `inert`.) */}
+      <div
+        className="flex min-h-0 flex-1 flex-col"
+        inert={modalOpen}
+        aria-hidden={modalOpen || undefined}
+      >
       <TabBar />
       <Toolbar />
+      {/* BUG-010: docked find bar — part of the page, not a dialog. */}
+      <FindBar />
       <div className="flex min-h-0 flex-1">
         {folderTreeOpen && <FolderTree />}
         <main className="min-h-0 min-w-0 flex-1 overflow-y-auto">
@@ -302,7 +355,7 @@ function App() {
           <Suspense
             fallback={
               <aside className="flex h-full w-80 shrink-0 items-center justify-center border-l border-gray-200 bg-white text-sm text-ink-faint">
-                Loading graph…
+                {t("Loading graph…")}
               </aside>
             }
           >
@@ -313,7 +366,7 @@ function App() {
           <Suspense
             fallback={
               <aside className="flex h-full w-80 shrink-0 items-center justify-center border-l border-gray-200 bg-white text-sm text-ink-faint">
-                Loading review…
+                {t("Loading review…")}
               </aside>
             }
           >
@@ -333,15 +386,17 @@ function App() {
         </ErrorBoundary>
       )}
       <HealthBar />
+      <SelectionBar />
+      </div>
 
       <SettingsModal />
       <DraftModal />
       <HelpModal />
       <CommandPalette />
       <PromptHost />
-      <SelectionBar />
       <Toasts />
     </div>
+    </LocalImageCacheContext.Provider>
     </ErrorBoundary>
   );
 }

@@ -6,9 +6,27 @@
   color-scheme: light;
   --color-ink: #1f2933;
   --color-ink-faint: #7b8794;
+  /* Single source for the accent: tailwind.config.js colors.accent. The rgba
+     tints below reuse its channels (contract-tested). */
+  --color-accent: theme("colors.accent.DEFAULT");
   --color-accent-wash: rgba(37, 99, 235, 0.06);
   --color-selection: rgba(37, 99, 235, 0.2);
-  --font-content-mono: "SFMono-Regular", Consolas, "Liberation Mono", "Hiragino Kaku Gothic ProN", monospace;
+  /* Markdown source editor (markdownSourceTheme.ts): a barely-there active
+     line, and a neutral selection once the editor loses focus. */
+  --color-active-line: rgba(37, 99, 235, 0.03);
+  --color-selection-inactive: rgba(123, 135, 148, 0.18);
+  /* ui-monospace is how WebKit exposes SF Mono; "SFMono-Regular" alone doesn't
+     resolve there. Hiragino only supplies CJK glyphs, after the Latin monos. */
+  --font-content-mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Hiragino Kaku Gothic ProN", monospace;
+  /* Markdown preview background tones (Settings.previewBackground). Kept light
+     so body ink, inline code and table headers (all translucent/dark) keep
+     their contrast. The key list is contract-tested against Rust + TS. */
+  --preview-bg-white: #ffffff;
+  --preview-bg-warm: #f4f4f1; /* rgb(244, 244, 241) — requested */
+  --preview-bg-gray: #f7f8f9;
+  --preview-bg-paper: #fbf8f1;
+  --preview-bg-mint: #f4f9f5;
+  --preview-bg-blue: #f4f7fb;
 }
 
 html,
@@ -29,6 +47,14 @@ body {
 textarea {
   font-family: inherit;
 }
+
+/* Preview surface + swatches paint from the same tokens (screen only). */
+[data-preview-bg="white"] { background-color: var(--preview-bg-white); }
+[data-preview-bg="warm"] { background-color: var(--preview-bg-warm); }
+[data-preview-bg="gray"] { background-color: var(--preview-bg-gray); }
+[data-preview-bg="paper"] { background-color: var(--preview-bg-paper); }
+[data-preview-bg="mint"] { background-color: var(--preview-bg-mint); }
+[data-preview-bg="blue"] { background-color: var(--preview-bg-blue); }
 
 /* Markdown preview typography. Kept here rather than scattered across the
    renderer so GFM tables, task lists and prose share one visual contract. */
@@ -56,6 +82,36 @@ textarea {
   background: var(--color-accent-wash);
   box-shadow: 0 0 0 2px var(--color-selection);
 }
+
+/* Figures inside an editable paragraph are atomic embeds (see MarkdownImage). */
+.markdown-preview .markdown-embed { display: inline-block; max-width: 100%; }
+.markdown-preview .markdown-embed img { display: block; max-width: 100%; }
+
+/* A list item's own text is edited in place (its nested list isn't part of it). */
+.markdown-preview .md-li-text { outline: none; border-radius: 0.25rem; }
+.markdown-preview .md-li-text[contenteditable="true"]:hover,
+.markdown-preview .md-li-text[contenteditable="true"]:focus { background: var(--color-accent-wash); }
+
+/* An empty paragraph/heading being typed (enters the source once it has text). */
+.markdown-preview .md-draft {
+  min-height: 1.85em;
+  border-radius: 0.25rem;
+  outline: none;
+  background: var(--color-accent-wash);
+  box-shadow: 0 0 0 2px var(--color-selection);
+}
+.markdown-preview .md-draft-heading { font-size: 1.46em; font-weight: 600; }
+.markdown-preview .md-draft:empty::before {
+  content: attr(data-placeholder); /* translated in the component */
+  color: var(--color-ink-faint);
+}
+
+/* Rendered formulas: atomic, click to edit. */
+.markdown-preview .math-atom { cursor: pointer; border-radius: 0.2rem; }
+.markdown-preview .math-atom:hover,
+.markdown-preview .math-atom:focus-visible { background: var(--color-accent-wash); outline: none; }
+.markdown-preview .math-display-block { margin: 1.25em 0; overflow-x: auto; text-align: center; }
+.markdown-preview .math-atom-display { display: block; }
 
 .markdown-image-error {
   display: block;
@@ -111,16 +167,42 @@ textarea {
   padding-left: 1em;
 }
 
+/* A newline in the source is shown as a line break (not joined into one line,
+   as strict CommonMark would): what you typed on two lines stays on two lines.
+   Display only — the source is unchanged. */
+.markdown-preview p,
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4,
+.markdown-preview h5,
+.markdown-preview h6,
+.markdown-preview .md-li-text {
+  white-space: pre-line;
+}
+
 .markdown-preview a { color: #2563eb; text-decoration: underline; text-underline-offset: 0.15em; }
 .markdown-preview strong { font-weight: 700; }
 .markdown-preview hr { border: 0; border-top: 1px solid rgba(123, 135, 148, 0.3); margin: 2em 0; }
 
+/* Inline code: an outlined pill — a thin ink border on a slightly lighter
+   fill, so it reads on every preview background tone (white included). */
 .markdown-preview code {
-  background: rgba(123, 135, 148, 0.12);
-  border-radius: 0.25rem;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(31, 41, 51, 0.32);
+  border-radius: 0.5em;
+  color: var(--color-ink);
   font-family: var(--font-content-mono);
-  font-size: 0.88em;
-  padding: 0.12em 0.32em;
+  font-size: 0.86em;
+  padding: 0.12em 0.45em;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+/* Code inside a link: link-coloured, no outline (the link is the emphasis). */
+.markdown-preview a code {
+  background: rgba(123, 135, 148, 0.1);
+  border-color: transparent;
+  color: inherit;
 }
 
 .markdown-preview pre {
@@ -131,7 +213,7 @@ textarea {
   padding: 1em 1.1em;
 }
 
-.markdown-preview pre code { background: transparent; color: inherit; padding: 0; }
+.markdown-preview pre code { background: transparent; border: 0; border-radius: 0; color: inherit; padding: 0; }
 .markdown-preview img { display: block; max-width: 100%; height: auto; margin: 1.25em auto; border-radius: 0.5rem; }
 
 .markdown-preview table { width: 100%; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 0.9em; }

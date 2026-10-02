@@ -1,13 +1,38 @@
 // High-level AI orchestration shared by the toolbar and per-chunk menus.
 // Each function manages busy state, gathers surrounding-chunk context, calls the
 // Rust command, applies the result to the store, and surfaces errors as toasts.
+//
+// Invariants (BUG-001b / MISS-01 / UX-errors-en / BUG-013c):
+// - Every action captures an `OpTicket` (captureOp) when invoked and commits
+//   ONLY while `ownsOp(op)` holds — same tab AND same document load. Chunk ids
+//   are persisted UUIDs, so id existence alone cannot tell a reopened copy
+//   apart. Actions that overwrite paragraph text (runChunkAction, bulletize,
+//   the context-summary refresh) also require the text to equal what was sent.
+// - Busy/stream flags keep routing to the originating tab (routeTabPatch).
+// - Each op that reaches the backend logs exactly one `start` and one `commit`
+//   or `discard` (with a machine-readable reason) to the store's aiOpLog: ids
+//   and reason codes only, never content. The context-summary refresh inside
+//   an action is not logged separately.
+// - Backend errors are shown through localizeAiError (UI language); only the
+//   "model-unavailable" kind flags `aiModelIssue`.
+// - Busy labels are stored ALREADY TRANSLATED (tNow/tf) in `globalBusy`, so
+//   every surface renders the string as-is. A language switch mid-operation
+//   keeps the old label until the op ends.
 
 import { api } from "./api";
+import { localizeAiError } from "./aiErrors";
 import { validateMermaid } from "./mermaidRender";
 import { groupSlides, slideBullets, slideImages, slideTitle } from "./slides";
-import { tNow } from "./i18n";
-import { staleSummaryChunkIds, useStore } from "./store";
-import type { AiAction, Chunk, RagSearchHit, SlideLayout } from "./types";
+import { tf, tNow, uiLangFor } from "./i18n";
+import {
+  captureOp,
+  ownsOp,
+  staleSummaryChunkIds,
+  useStore,
+  type AiOpLogEntry,
+  type OpTicket,
+} from "./store";
+import type { AiAction, Chunk, Document, RagSearchHit, SlideLayout } from "./types";
 
 // T1 — whole-document context assembly.
 const LINKED_MAX_CHARS = 2500;
@@ -169,6 +194,69 @@ function message(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * Show an AI/provider failure in the UI language (aiErrors.ts). Flags the
+ * configured model as unusable ONLY for the "model-unavailable" kind. Returns
+ * the machine-readable discard reason for the op log (never the message: the
+ * provider detail can echo content).
+ */
+function notifyAiError(e: unknown): string {
+  const s = useStore.getState();
+  const err = localizeAiError(message(e), uiLangFor(s.settings?.defaultTargetLanguage));
+  if (err.kind === "model-unavailable" && err.model) s.setAiModelIssue({ model: err.model });
+  s.notify(err.text, "error");
+  return `error:${err.kind}`;
+}
+
+// ---- Op ownership + correlation log (BUG-001b, MISS-01) --------------------
+
+type OpPhase = AiOpLogEntry["phase"];
+
+function logOp(op: OpTicket, phase: OpPhase, action: string, chunkId?: string, reason?: string): void {
+  useStore.getState().logAiOp({
+    opId: op.opId,
+    phase,
+    action,
+    tabId: op.tabId,
+    docNonce: op.docNonce,
+    ...(chunkId !== undefined ? { chunkId } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  });
+}
+
+/** Why `op` may no longer commit: null while it still owns the active load. */
+function staleReason(op: OpTicket): "tab-changed" | "doc-changed" | null {
+  if (ownsOp(op)) return null;
+  return useStore.getState().activeTabId !== op.tabId ? "tab-changed" : "doc-changed";
+}
+
+/** Current content of `chunkId` in the active document (undefined if gone). */
+function chunkContent(chunkId: string): string | undefined {
+  return useStore.getState().doc.chunks.find((c) => c.id === chunkId)?.content;
+}
+
+/**
+ * The op log as JSON lines (oldest first), for the NetworkPanel Copy button —
+ * a QA report attachment. Entries hold ids and reason codes only.
+ */
+export function aiOpLogToJsonLines(entries: readonly AiOpLogEntry[]): string {
+  return entries.map((e) => JSON.stringify(e)).join("\n");
+}
+
+/**
+ * Whether Analyze has anything to send: some text/heading chunk with non-blank
+ * content. Conservative w.r.t. ai.rs `analysis_listing` (which also skips a
+ * chunk whose first 800 chars are blank): when this is false the backend would
+ * return an empty result without a network call anyway (aiActionsWiring.test).
+ */
+export function hasAnalyzableContent(doc: Document): boolean {
+  return doc.chunks.some(
+    (c) =>
+      (c.metadata.chunkType === "text" || c.metadata.chunkType === "heading") &&
+      c.content.trim() !== ""
+  );
+}
+
 /** Last path segment (works for both '/' and '\' separators), for a compact
  * "Grounded from: x, y" notice rather than full absolute paths. */
 function baseName(path: string): string {
@@ -189,7 +277,7 @@ function baseName(path: string): string {
 export function notifyRagSources(hits: RagSearchHit[]): void {
   if (hits.length === 0) return;
   const names = Array.from(new Set(hits.map((h) => baseName(h.sourcePath))));
-  useStore.getState().notify(`Grounded from: ${names.join(", ")}`, "info");
+  useStore.getState().notify(tf("Grounded from: {names}", { names: names.join(", ") }), "info");
 }
 
 /** Endpoints served from the local machine (e.g. Ollama) don't need an API key. */
@@ -212,27 +300,49 @@ export function aiReady(): boolean {
   return s.hasApiKey || isLocalEndpoint(s.settings?.endpoint);
 }
 
-/**
- * True while `chunkId` still exists in the ACTIVE document — i.e. the user has
- * not switched tabs (or deleted the chunk) during an async AI call. Guards
- * against a result landing in the wrong tab when generation finishes late.
- */
-function chunkStillActive(chunkId: string): boolean {
-  return useStore.getState().doc.chunks.some((c) => c.id === chunkId);
+// ---- Frontend cancel (item 22) --------------------------------------------
+// Cancellation and busy/stream ownership are keyed by OP (state-async-2), not
+// by chunk id. NOTE: the HTTP request itself is NOT aborted backend-side
+// (v2.x) — the Rust command runs to completion; cancelling stops painting
+// stream deltas and discards the final result when it arrives.
+//   - `chunkOwner` maps (tab, chunk) → the opId of the NEWEST action started on
+//     that chunk. A newer action supersedes an older one: the older op is then
+//     treated as canceled (never commits, never paints).
+//   - `canceledOps` holds the opIds the user stopped. A new action never clears
+//     another op's mark, so Stop → new action can't revive the stopped result.
+//   - Only the owning op clears the chunk's busy/stream UI in its `finally`,
+//     so a late stopped op can't wipe a newer op's spinner and stream.
+const chunkOwner = new Map<string, number>();
+const canceledOps = new Set<number>();
+const ownerKey = (tabId: string, chunkId: string) => `${tabId}\u0000${chunkId}`;
+
+/** Record `op` as the newest action on `chunkId` (supersedes any older op). */
+function claimChunk(op: OpTicket, chunkId: string): void {
+  chunkOwner.set(ownerKey(op.tabId, chunkId), op.opId);
 }
 
-// ---- Frontend cancel (item 22) --------------------------------------------
-// Chunk ids whose in-flight AI action the user stopped. NOTE: the HTTP request
-// itself is NOT aborted backend-side (v2.x) — the Rust command runs to
-// completion; cancelling stops painting stream deltas and discards the final
-// result when it arrives. The id is cleared when a NEW action starts on the
-// chunk, so a cancel never suppresses a later run.
-const canceledChunks = new Set<string>();
+/** Why `op` must not commit/paint on `chunkId`: the user stopped it, or a
+ *  newer action on the same chunk superseded it. Null while it may proceed. */
+function chunkOpCanceled(op: OpTicket, chunkId: string): "canceled" | "superseded" | null {
+  if (canceledOps.has(op.opId)) return "canceled";
+  return chunkOwner.get(ownerKey(op.tabId, chunkId)) !== op.opId ? "superseded" : null;
+}
+
+/** End `op`'s claim. True when it still owned the chunk, i.e. it may clear
+ *  the chunk's busy/stream UI. */
+function releaseChunk(op: OpTicket, chunkId: string): boolean {
+  canceledOps.delete(op.opId);
+  const key = ownerKey(op.tabId, chunkId);
+  if (chunkOwner.get(key) !== op.opId) return false;
+  chunkOwner.delete(key);
+  return true;
+}
 
 /** Stop the in-flight AI action on a chunk and clear its busy/streaming UI. */
 export function cancelChunkAction(chunkId: string): void {
-  canceledChunks.add(chunkId);
   const st = useStore.getState();
+  const owner = chunkOwner.get(ownerKey(st.activeTabId, chunkId));
+  if (owner !== undefined) canceledOps.add(owner);
   // The Stop affordance only renders on the ACTIVE tab's chunk, so clearing
   // the active tab's in-flight state here is safe.
   if (st.streamingChunkId === chunkId) st.endChunkStream();
@@ -310,12 +420,15 @@ export function extractJsonObject(raw: string): unknown {
  * the same non-streaming call the per-chunk Summarize action uses (deliberately
  * NOT recursing through runChunkAction). Unchanged chunks are never touched —
  * the hash equality short-circuits them. A failed chunk keeps its stale
- * summary; one info toast covers all failures.
+ * summary; one info toast covers all failures. Stops as soon as `op` no longer
+ * owns the active load, and never stamps a summary onto text that changed
+ * while it was being summarized (BUG-001b).
  */
 async function refreshStaleSummaries(
   excludeId: string | null,
-  tab: string
+  op: OpTicket
 ): Promise<void> {
+  const tab = op.tabId;
   const st = useStore.getState();
   if (!aiReady()) return;
   const staleIds = staleSummaryChunkIds(st.doc).filter((id) => id !== excludeId);
@@ -324,11 +437,11 @@ async function refreshStaleSummaries(
   try {
     for (let i = 0; i < staleIds.length; i++) {
       const cur = useStore.getState();
-      if (cur.activeTabId !== tab) break; // switched tabs — stop refreshing
+      if (!ownsOp(op)) break; // switched tabs / reloaded — stop refreshing
       const c = cur.doc.chunks.find((x) => x.id === staleIds[i]);
       if (!c || !c.content.trim()) continue;
       cur.setGlobalBusy(
-        `Refreshing AI context (${i + 1}/${staleIds.length})…`,
+        tf("Refreshing AI context ({i}/{n})…", { i: i + 1, n: staleIds.length }),
         tab
       );
       try {
@@ -338,8 +451,10 @@ async function refreshStaleSummaries(
           outputLanguage: cur.settings?.defaultTargetLanguage,
           tone: cur.settings?.writingTone || undefined,
         });
-        if (useStore.getState().activeTabId !== tab) break;
-        // setChunkSummary re-stamps summaryHash, marking the chunk fresh.
+        if (!ownsOp(op)) break;
+        // setChunkSummary re-stamps summaryHash, marking the chunk fresh — so
+        // only for the text that was actually summarized.
+        if (chunkContent(staleIds[i]) !== c.content) continue;
         useStore.getState().setChunkSummary(staleIds[i], summary);
       } catch {
         failed = true; // continue with the stale summary
@@ -372,17 +487,24 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
     s.openSettings();
     return;
   }
-  const tab = s.activeTabId;
+  const op = captureOp();
+  const tab = op.tabId;
   const idSet = new Set(ids);
-  const texts = s.doc.chunks
-    .filter((c) => idSet.has(c.id) && c.metadata.chunkType === "text" && c.content.trim())
-    .map((c) => c.content.trim());
+  // Exactly what is sent — re-read at commit to detect edits made meanwhile.
+  const sentTexts = () =>
+    useStore
+      .getState()
+      .doc.chunks.filter((c) => idSet.has(c.id) && c.metadata.chunkType === "text" && c.content.trim())
+      .map((c) => c.content.trim());
+  const texts = sentTexts();
   if (!texts.length) {
     s.notify(tNow("Nothing to bulletize."), "info");
     return;
   }
 
-  s.setGlobalBusy("Bulletizing…", tab);
+  s.setGlobalBusy(tNow("Bulletizing…"), tab);
+  logOp(op, "start", "bulletize");
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     const result = await api.aiProcess({
       action: "custom",
@@ -394,8 +516,15 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
       outputLanguage: s.settings?.defaultTargetLanguage,
       tone: s.settings?.writingTone || undefined,
     });
-    if (useStore.getState().activeTabId !== tab) {
+    const stale = staleReason(op);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched tabs — bulletize discarded."), "info");
+      return;
+    }
+    if (sentTexts().join("\n\n") !== texts.join("\n\n")) {
+      outcome = { phase: "discard", reason: "text-changed" };
+      s.notify(tNow("The paragraph changed while AI was working — result discarded."), "info");
       return;
     }
     const lines = parseBulletLines(result);
@@ -404,10 +533,12 @@ export async function bulletizeChunks(ids: string[]): Promise<void> {
       return;
     }
     useStore.getState().replaceChunksWithTexts(ids, lines);
-    s.notify(`Bulletized into ${lines.length} points (⌘/Ctrl+Z to undo).`, "success");
+    outcome = { phase: "commit" };
+    s.notify(tf("Bulletized into {n} points (⌘/Ctrl+Z to undo).", { n: lines.length }), "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
   } finally {
+    logOp(op, outcome.phase, "bulletize", undefined, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }
@@ -434,8 +565,11 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
     s.notify(tNow("This slide has no text to summarize."), "info");
     return;
   }
-  const tab = s.activeTabId;
-  s.setGlobalBusy("Summarizing slide…", tab);
+  const op = captureOp();
+  const tab = op.tabId;
+  s.setGlobalBusy(tNow("Summarizing slide…"), tab);
+  logOp(op, "start", "summarize-slide", leadId);
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     const result = await api.aiProcess({
       action: "custom",
@@ -452,7 +586,9 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
       outputLanguage: s.settings?.defaultTargetLanguage,
       tone: s.settings?.writingTone || undefined,
     });
-    if (useStore.getState().activeTabId !== tab) {
+    const stale = staleReason(op);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched tabs — summary discarded."), "info");
       return;
     }
@@ -462,10 +598,12 @@ export async function summarizeSlide(textIds: string[], leadId: string): Promise
       return;
     }
     useStore.getState().setSlideBody(leadId, lines);
-    s.notify(`Slide summarized into ${lines.length} points — detached from the text.`, "success");
+    outcome = { phase: "commit" };
+    s.notify(tf("Slide summarized into {n} points — detached from the text.", { n: lines.length }), "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
   } finally {
+    logOp(op, outcome.phase, "summarize-slide", leadId, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }
@@ -497,8 +635,11 @@ export async function suggestSlideLayout(hostChunkId: string): Promise<void> {
     `Bullets (${bullets.length}):`,
     ...bullets.map((b) => `- ${b}`),
   ].join("\n");
-  const tab = s.activeTabId;
-  s.setGlobalBusy("Suggesting layout…", tab);
+  const op = captureOp();
+  const tab = op.tabId;
+  s.setGlobalBusy(tNow("Suggesting layout…"), tab);
+  logOp(op, "start", "suggest-layout", hostChunkId);
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     // No outputLanguage/tone: the reply must be a bare layout token, not prose.
     const result = await api.aiProcess({
@@ -509,7 +650,9 @@ export async function suggestSlideLayout(hostChunkId: string): Promise<void> {
         "(its title, image count and bullet points). Respond with exactly one token: " +
         "section | title-content | title-image | title-image-left | image-top",
     });
-    if (useStore.getState().activeTabId !== tab || !chunkStillActive(hostChunkId)) {
+    const stale = staleReason(op) ?? (chunkContent(hostChunkId) === undefined ? "chunk-missing" : null);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched away — layout suggestion discarded."), "info");
       return;
     }
@@ -538,15 +681,22 @@ export async function suggestSlideLayout(hostChunkId: string): Promise<void> {
       return;
     }
     useStore.getState().setChunkLayout(hostChunkId, layout);
-    s.notify(`Layout set to ${layout} (pick Auto to clear it).`, "success");
+    outcome = { phase: "commit" };
+    s.notify(tf("Layout set to {layout} (pick Auto to clear it).", { layout }), "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
   } finally {
+    logOp(op, outcome.phase, "suggest-layout", hostChunkId, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }
 
-/** Translate / proofread / summarize / custom on a single chunk. */
+/**
+ * Translate / proofread / summarize / custom on a single chunk. Resolves true
+ * only when the result was committed; a result is discarded (with a notice and
+ * an op-log reason) when the user stopped it, the tab or document load
+ * changed, the paragraph was deleted, or its text changed since it was sent.
+ */
 export async function runChunkAction(
   chunkId: string,
   action: AiAction,
@@ -557,33 +707,43 @@ export async function runChunkAction(
     /** Internal: editSelection refreshes context ONCE up front, not per chunk. */
     skipContextRefresh?: boolean;
   } = {}
-): Promise<void> {
+): Promise<boolean> {
   const s = useStore.getState();
-  const tab = s.activeTabId; // B3: scope live-stream mutations to the originating tab
+  // BUG-001b: the op owns this tab AND this document load; B3: busy/stream
+  // mutations are scoped to the originating tab.
+  const op = captureOp();
+  const tab = op.tabId;
   const target = s.doc.chunks.find((c) => c.id === chunkId);
-  if (!target) return;
+  if (!target) return false;
   if (!target.content.trim() && action !== "custom") {
     s.notify(tNow("This paragraph is empty."), "info");
-    return;
+    return false;
   }
   if (!aiReady()) {
     s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
-    return;
+    return false;
   }
-  canceledChunks.delete(chunkId); // a new action supersedes an earlier Stop
+  claimChunk(op, chunkId); // a new action supersedes an older in-flight one
 
   // Live context: bring out-of-date summaries up to date BEFORE building the
   // doc map, so the outline reflects the current text. The target chunk is
   // excluded (its map line is the «editing» marker, not its summary), and the
   // summarize action skips this — it's about to write the summary itself.
   if (action !== "summarize" && !opts.skipContextRefresh) {
-    await refreshStaleSummaries(chunkId, tab);
+    await refreshStaleSummaries(chunkId, op);
+  }
+  if (!ownsOp(op) || chunkOpCanceled(op, chunkId)) {
+    releaseChunk(op, chunkId); // switched away / stopped during the refresh — nothing sent
+    return false;
   }
 
   const { chunk, before, after, sectionHeading, documentMap, linkedContent } =
     gatherContext(chunkId);
-  if (!chunk) return;
+  if (!chunk) {
+    releaseChunk(op, chunkId);
+    return false;
+  }
 
   // Personal RAG (開発.txt Stage 3, item 3-1): attach the top few personal-
   // library matches as grounding context, but ONLY when the setting is on and
@@ -596,9 +756,12 @@ export async function runChunkAction(
   // which source file(s) were attached, so grounding is never silent.
   const ragSnippets = await gatherRagSnippets(chunkId, sectionHeading);
 
+  // The exact paragraph text the model rewrites; the commit requires the
+  // paragraph to still hold it (never overwrite an edit made meanwhile).
+  const sentText = chunk.content;
   const request = {
     action,
-    text: chunk.content,
+    text: sentText,
     contextBefore: before,
     contextAfter: after,
     targetLanguage: opts.targetLanguage,
@@ -620,29 +783,43 @@ export async function runChunkAction(
   const streaming = action !== "summarize";
   s.setBusyChunk(chunkId, true, tab);
   if (streaming) useStore.getState().beginChunkStream(chunkId, tab);
+  logOp(op, "start", action, chunkId);
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     const result = streaming
       ? await api.aiProcessStream(request, (text) => {
-          // Only paint while the originating tab is still active AND this is the
-          // chunk being streamed — so a backgrounded op can't hijack another
-          // tab's live streaming UI (B3) — and the user hasn't hit Stop.
+          // Only paint while this op still owns the active tab + load AND this
+          // is the chunk being streamed — so a backgrounded op can't hijack
+          // another tab's live streaming UI (B3), nor a reloaded copy's
+          // same-id chunk (BUG-001b) — and the user hasn't hit Stop.
           const st = useStore.getState();
           if (
-            st.activeTabId === tab &&
+            ownsOp(op) &&
             st.streamingChunkId === chunkId &&
-            !canceledChunks.has(chunkId)
+            !chunkOpCanceled(op, chunkId)
           ) {
             st.updateChunkStream(text);
           }
         })
       : await api.aiProcess(request);
-    if (canceledChunks.has(chunkId)) {
-      s.notify(tNow("Stopped — result discarded."), "info");
-      return;
+    const canceled = chunkOpCanceled(op, chunkId);
+    if (canceled) {
+      outcome = { phase: "discard", reason: canceled };
+      // A superseded op is silent: the newer action is the one the user wants.
+      if (canceled === "canceled") s.notify(tNow("Stopped — result discarded."), "info");
+      return false;
     }
-    if (!chunkStillActive(chunkId)) {
+    const current = chunkContent(chunkId);
+    const stale = staleReason(op) ?? (current === undefined ? "chunk-missing" : null);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched away from that paragraph — result discarded."), "info");
-      return;
+      return false;
+    }
+    if (current !== sentText) {
+      outcome = { phase: "discard", reason: "text-changed" };
+      s.notify(tNow("The paragraph changed while AI was working — result discarded."), "info");
+      return false;
     }
     if (action === "summarize") {
       useStore.getState().setChunkSummary(chunkId, result);
@@ -651,24 +828,31 @@ export async function runChunkAction(
       useStore.getState().replaceChunkContent(chunkId, result);
       s.notify(
         action === "translate"
-          ? "Translated (⌘/Ctrl+Z to undo)."
-          : "Updated (⌘/Ctrl+Z to undo).",
+          ? tNow("Translated (⌘/Ctrl+Z to undo).")
+          : tNow("Updated (⌘/Ctrl+Z to undo)."),
         "success"
       );
     }
+    outcome = { phase: "commit" };
     // Part B: name the source(s) this result was actually grounded against, so
     // personal-library grounding is never silent once folded into the prompt.
     notifyRagSources(ragSnippets);
+    return true;
   } catch (e) {
     // A stopped action's late failure isn't news the user needs.
-    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: chunkOpCanceled(op, chunkId) ?? notifyAiError(e) };
+    return false;
   } finally {
+    logOp(op, outcome.phase, action, chunkId, outcome.reason);
     // B3: clear the stream + busy state on the tab that OWNED this op, whatever
     // tab is active now — routeTabPatch updates the originating tab's snapshot
     // when it's backgrounded, so neither a stuck spinner nor a cleared
-    // foreground stream can result.
-    if (streaming) useStore.getState().endChunkStream(tab);
-    useStore.getState().setBusyChunk(chunkId, false, tab);
+    // foreground stream can result. state-async-2: only while this op still
+    // owns the chunk — a newer action's UI is never cleared by an older op.
+    if (releaseChunk(op, chunkId)) {
+      if (streaming) useStore.getState().endChunkStream(tab);
+      useStore.getState().setBusyChunk(chunkId, false, tab);
+    }
   }
 }
 
@@ -678,7 +862,8 @@ export async function generateDiagramFromChunk(
   instruction?: string
 ): Promise<void> {
   const s = useStore.getState();
-  const tab = s.activeTabId; // B3: keep the chunk's busy state on its own tab
+  const op = captureOp(); // BUG-001b: commit only into this tab + load
+  const tab = op.tabId; // B3: keep the chunk's busy state on its own tab
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
     s.notify(tNow("This paragraph is empty."), "info");
@@ -690,14 +875,16 @@ export async function generateDiagramFromChunk(
     return;
   }
 
-  canceledChunks.delete(chunkId);
+  claimChunk(op, chunkId);
   s.setBusyChunk(chunkId, true, tab);
+  logOp(op, "start", "diagram", chunkId);
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "invalid-result" };
   try {
     let code = await api.aiGenerateDiagram(chunk.content, instruction);
     // Items 27/53: validate the Mermaid BEFORE inserting; one corrective retry
     // that feeds the parse error back to the model.
     let parseError = await validateMermaid(code);
-    if (parseError && !canceledChunks.has(chunkId)) {
+    if (parseError && !chunkOpCanceled(op, chunkId)) {
       const corrective =
         `${instruction ? `${instruction}\n\n` : ""}` +
         `The previous attempt failed to parse with: ${parseError}. ` +
@@ -705,11 +892,16 @@ export async function generateDiagramFromChunk(
       code = await api.aiGenerateDiagram(chunk.content, corrective);
       parseError = await validateMermaid(code);
     }
-    if (canceledChunks.has(chunkId)) {
-      s.notify(tNow("Stopped — diagram discarded."), "info");
+    const canceled = chunkOpCanceled(op, chunkId);
+    if (canceled) {
+      outcome = { phase: "discard", reason: canceled };
+      // A superseded op is silent: the newer action is the one the user wants.
+      if (canceled === "canceled") s.notify(tNow("Stopped — diagram discarded."), "info");
       return;
     }
-    if (!chunkStillActive(chunkId)) {
+    const stale = staleReason(op) ?? (chunkContent(chunkId) === undefined ? "chunk-missing" : null);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched away from that paragraph — diagram discarded."), "info");
       return;
     }
@@ -717,22 +909,25 @@ export async function generateDiagramFromChunk(
       // Behaviour change: previously the broken code was inserted anyway and
       // could only ever render as an error box — now nothing is inserted and
       // the parse error is surfaced instead.
-      s.notify(`The generated diagram is not valid Mermaid: ${parseError}`, "error");
+      s.notify(tf("The generated diagram is not valid Mermaid: {error}", { error: parseError }), "error");
       return;
     }
     useStore.getState().insertDiagramAfter(chunkId, code);
+    outcome = { phase: "commit" };
     s.notify(tNow("Diagram generated below the paragraph."), "success");
   } catch (e) {
-    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: chunkOpCanceled(op, chunkId) ?? notifyAiError(e) };
   } finally {
-    useStore.getState().setBusyChunk(chunkId, false, tab);
+    logOp(op, outcome.phase, "diagram", chunkId, outcome.reason);
+    if (releaseChunk(op, chunkId)) useStore.getState().setBusyChunk(chunkId, false, tab);
   }
 }
 
 /** Generate an image from one paragraph and insert it as an image chunk below. */
 export async function generateImageFromChunk(chunkId: string): Promise<void> {
   const s = useStore.getState();
-  const tab = s.activeTabId; // B3: keep the chunk's busy state on its own tab
+  const op = captureOp(); // BUG-001b: commit only into this tab + load
+  const tab = op.tabId; // B3: keep the chunk's busy state on its own tab
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
     s.notify(tNow("This paragraph is empty."), "info");
@@ -743,24 +938,33 @@ export async function generateImageFromChunk(chunkId: string): Promise<void> {
     s.openSettings();
     return;
   }
-  canceledChunks.delete(chunkId);
+  claimChunk(op, chunkId);
   s.setBusyChunk(chunkId, true, tab);
+  logOp(op, "start", "image", chunkId);
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     const url = await api.aiGenerateImage(chunk.content);
-    if (canceledChunks.has(chunkId)) {
-      s.notify(tNow("Stopped — image discarded."), "info");
+    const canceled = chunkOpCanceled(op, chunkId);
+    if (canceled) {
+      outcome = { phase: "discard", reason: canceled };
+      // A superseded op is silent: the newer action is the one the user wants.
+      if (canceled === "canceled") s.notify(tNow("Stopped — image discarded."), "info");
       return;
     }
-    if (!chunkStillActive(chunkId)) {
+    const stale = staleReason(op) ?? (chunkContent(chunkId) === undefined ? "chunk-missing" : null);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched away from that paragraph — image discarded."), "info");
       return;
     }
     useStore.getState().insertImageAfter(chunkId, url, chunk.content);
+    outcome = { phase: "commit" };
     s.notify(tNow("Image generated below the paragraph."), "success");
   } catch (e) {
-    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: chunkOpCanceled(op, chunkId) ?? notifyAiError(e) };
   } finally {
-    useStore.getState().setBusyChunk(chunkId, false, tab);
+    logOp(op, outcome.phase, "image", chunkId, outcome.reason);
+    if (releaseChunk(op, chunkId)) useStore.getState().setBusyChunk(chunkId, false, tab);
   }
 }
 
@@ -788,20 +992,27 @@ export async function generateImageFromSelection(): Promise<void> {
     return;
   }
   const insertAfterId = selectedInOrder[selectedInOrder.length - 1]?.id ?? null;
-  const tab = s.activeTabId;
-  s.setGlobalBusy("Generating image…", tab);
+  const op = captureOp(); // BUG-001b: commit only into this tab + load
+  const tab = op.tabId;
+  s.setGlobalBusy(tNow("Generating image…"), tab);
+  logOp(op, "start", "image-selection");
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     const url = await api.aiGenerateImage(prompt);
-    if (useStore.getState().activeTabId !== tab) {
+    const stale = staleReason(op);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched tabs — image discarded."), "info");
       return;
     }
     useStore.getState().insertImageAfter(insertAfterId, url, prompt);
     useStore.getState().clearSelection();
+    outcome = { phase: "commit" };
     s.notify(tNow("Image generated from selection."), "success");
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
   } finally {
+    logOp(op, outcome.phase, "image-selection", undefined, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }
@@ -823,7 +1034,8 @@ function presentationPrompt(text: string): string {
  */
 export async function generatePresentationFromChunk(chunkId: string): Promise<void> {
   const s = useStore.getState();
-  const tab = s.activeTabId; // B3: keep the chunk's busy state on its own tab
+  const op = captureOp(); // BUG-001b: commit only into this tab + load
+  const tab = op.tabId; // B3: keep the chunk's busy state on its own tab
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || !chunk.content.trim()) {
     s.notify(tNow("This paragraph is empty."), "info");
@@ -835,24 +1047,33 @@ export async function generatePresentationFromChunk(chunkId: string): Promise<vo
     return;
   }
   const prompt = presentationPrompt(chunk.content);
-  canceledChunks.delete(chunkId);
+  claimChunk(op, chunkId);
   s.setBusyChunk(chunkId, true, tab);
+  logOp(op, "start", "presentation-figure", chunkId);
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     const url = await api.aiGenerateImage(prompt);
-    if (canceledChunks.has(chunkId)) {
-      s.notify(tNow("Stopped — figure discarded."), "info");
+    const canceled = chunkOpCanceled(op, chunkId);
+    if (canceled) {
+      outcome = { phase: "discard", reason: canceled };
+      // A superseded op is silent: the newer action is the one the user wants.
+      if (canceled === "canceled") s.notify(tNow("Stopped — figure discarded."), "info");
       return;
     }
-    if (!chunkStillActive(chunkId)) {
+    const stale = staleReason(op) ?? (chunkContent(chunkId) === undefined ? "chunk-missing" : null);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched away from that paragraph — figure discarded."), "info");
       return;
     }
     useStore.getState().insertImageAfter(chunkId, url, prompt);
+    outcome = { phase: "commit" };
     s.notify(tNow("Presentation figure generated below the paragraph."), "success");
   } catch (e) {
-    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: chunkOpCanceled(op, chunkId) ?? notifyAiError(e) };
   } finally {
-    useStore.getState().setBusyChunk(chunkId, false, tab);
+    logOp(op, outcome.phase, "presentation-figure", chunkId, outcome.reason);
+    if (releaseChunk(op, chunkId)) useStore.getState().setBusyChunk(chunkId, false, tab);
   }
 }
 
@@ -862,7 +1083,8 @@ export async function generatePresentationFromChunk(chunkId: string): Promise<vo
  */
 export async function regenerateImageChunk(chunkId: string): Promise<void> {
   const s = useStore.getState();
-  const tab = s.activeTabId; // B3: keep the chunk's busy state on its own tab
+  const op = captureOp(); // BUG-001b: commit only into this tab + load
+  const tab = op.tabId; // B3: keep the chunk's busy state on its own tab
   const chunk = s.doc.chunks.find((c) => c.id === chunkId);
   if (!chunk || chunk.metadata.chunkType !== "image") return;
   const prompt = chunk.metadata.imagePrompt || chunk.metadata.summary || "";
@@ -875,33 +1097,45 @@ export async function regenerateImageChunk(chunkId: string): Promise<void> {
     s.openSettings();
     return;
   }
-  canceledChunks.delete(chunkId);
+  claimChunk(op, chunkId);
   s.setBusyChunk(chunkId, true, tab);
+  logOp(op, "start", "regenerate-image", chunkId);
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
     const url = await api.aiGenerateImage(prompt);
-    if (canceledChunks.has(chunkId)) {
-      s.notify(tNow("Stopped — regenerated image discarded."), "info");
+    const canceled = chunkOpCanceled(op, chunkId);
+    if (canceled) {
+      outcome = { phase: "discard", reason: canceled };
+      // A superseded op is silent: the newer action is the one the user wants.
+      if (canceled === "canceled") s.notify(tNow("Stopped — regenerated image discarded."), "info");
       return;
     }
-    if (!chunkStillActive(chunkId)) {
+    const stale = staleReason(op) ?? (chunkContent(chunkId) === undefined ? "chunk-missing" : null);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched away — regenerated image discarded."), "info");
       return;
     }
     // replaceChunkContent stores the previous URL in history, so every
     // alternative stays selectable.
     useStore.getState().replaceChunkContent(chunkId, url);
+    outcome = { phase: "commit" };
     s.notify(tNow("New image version generated."), "success");
   } catch (e) {
-    if (!canceledChunks.has(chunkId)) s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: chunkOpCanceled(op, chunkId) ?? notifyAiError(e) };
   } finally {
-    useStore.getState().setBusyChunk(chunkId, false, tab);
+    logOp(op, outcome.phase, "regenerate-image", chunkId, outcome.reason);
+    if (releaseChunk(op, chunkId)) useStore.getState().setBusyChunk(chunkId, false, tab);
   }
 }
 
 /**
  * Apply one instruction to every selected text/heading chunk at once (multi-
  * paragraph editing). Each paragraph keeps its surrounding context and its prior
- * version in history. Runs sequentially to respect provider rate limits.
+ * version in history. Runs sequentially to respect provider rate limits. Each
+ * paragraph is its own runChunkAction op (own ownership/text check and log
+ * pair); the pass stops once its tab or document load is gone, and the final
+ * toast counts only the paragraphs actually rewritten.
  */
 export async function editSelection(instruction: string): Promise<void> {
   const s = useStore.getState();
@@ -925,25 +1159,33 @@ export async function editSelection(instruction: string): Promise<void> {
     s.notify(tNow("Select one or more non-empty text paragraphs first."), "info");
     return;
   }
-  const tab = s.activeTabId;
+  const op = captureOp(); // the pass as a whole belongs to this tab + load
+  const tab = op.tabId;
   // Live context: refresh out-of-date summaries ONCE up front (not per chunk) —
   // every paragraph edited in this pass shares the same refreshed doc map.
-  await refreshStaleSummaries(null, tab);
-  s.setGlobalBusy(`Editing ${ordered.length} paragraphs…`, tab);
-  let done = 0;
+  await refreshStaleSummaries(null, op);
+  s.setGlobalBusy(tf("Editing {n} paragraphs…", { n: ordered.length }), tab);
+  let processed = 0;
+  let edited = 0;
   try {
     for (const c of ordered) {
-      if (useStore.getState().activeTabId !== tab) break;
-      await runChunkAction(c.id, "custom", {
+      if (!ownsOp(op)) break;
+      const committed = await runChunkAction(c.id, "custom", {
         instruction: text,
         skipContextRefresh: true,
       });
-      done += 1;
-      useStore.getState().setGlobalBusy(`Editing ${done}/${ordered.length}…`, tab);
+      processed += 1;
+      if (committed) edited += 1;
+      useStore
+        .getState()
+        .setGlobalBusy(tf("Editing {done}/{n}…", { done: processed, n: ordered.length }), tab);
     }
-    if (useStore.getState().activeTabId === tab) {
+    if (ownsOp(op)) {
       useStore.getState().clearSelection();
-      s.notify(`Edited ${done} paragraph${done === 1 ? "" : "s"}.`, "success");
+      s.notify(
+        edited === 1 ? tNow("Edited 1 paragraph.") : tf("Edited {n} paragraphs.", { n: edited }),
+        edited > 0 ? "success" : "info"
+      );
     }
   } finally {
     useStore.getState().setGlobalBusy(null, tab);
@@ -1051,41 +1293,60 @@ export async function stopSpeaking(): Promise<void> {
   }
 }
 
-/** Analyze the whole document and open the relationship network panel. */
+/**
+ * Analyze the whole document and open the relationship network panel. A
+ * document with no non-blank text/heading paragraph is a no-op with an info
+ * notice (BUG-015a): no IPC call, no store change, no Settings prompt.
+ */
 export async function analyzeDocument(): Promise<void> {
   const s = useStore.getState();
   // UI2: guard against concurrent Analyze runs. This covers EVERY entry point
   // (toolbar, native menu, NetworkPanel refresh, shortcut) so rapid clicks can't
   // start parallel analyses that waste tokens and flicker the graph.
   if (s.globalBusy) return;
+  if (!hasAnalyzableContent(s.doc)) {
+    s.notify(tNow("Nothing to analyze yet — write some text first."), "info");
+    return;
+  }
   if (!aiReady()) {
     s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
     s.openSettings();
     return;
   }
-  const tab = s.activeTabId;
-  s.setGlobalBusy("Analyzing document…", tab);
+  const op = captureOp(); // BUG-001b: apply only to this tab + load
+  const tab = op.tabId;
+  s.setGlobalBusy(tNow("Analyzing document…"), tab);
+  logOp(op, "start", "analyze");
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "empty-result" };
   try {
-    const result = await api.aiAnalyzeDocument(s.doc);
-    if (useStore.getState().activeTabId !== tab) {
+    const sent = s.doc; // state-async-4: what the analysis describes
+    const result = await api.aiAnalyzeDocument(sent);
+    const stale = staleReason(op);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched tabs — analysis discarded."), "info");
       return;
     }
     // applyAnalysis persists the relationships into the document (spec §5) so
     // the graph survives a save/reopen and the document is marked dirty.
-    useStore.getState().applyAnalysis(result);
+    useStore.getState().applyAnalysis(result, sent);
     useStore.getState().toggleNetwork(true);
+    outcome = { phase: "commit" };
     if (result.nodes.length === 0) {
       s.notify(tNow("No relationships were found."), "info");
     } else {
       s.notify(
-        `Found ${result.nodes.length} nodes and ${result.edges.length} relations.`,
+        tf("Found {nodes} nodes and {edges} relations.", {
+          nodes: result.nodes.length,
+          edges: result.edges.length,
+        }),
         "success"
       );
     }
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
   } finally {
+    logOp(op, outcome.phase, "analyze", undefined, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }
@@ -1136,10 +1397,11 @@ export async function reviewDocument(): Promise<void> {
     s.openSettings();
     return;
   }
-  const tab = s.activeTabId;
+  const op = captureOp(); // BUG-001b: comments land only in this tab + load
+  const tab = op.tabId;
   // Fresh summaries first so the reviewer sees current context (T2).
-  await refreshStaleSummaries(null, tab);
-  if (useStore.getState().activeTabId !== tab) return;
+  await refreshStaleSummaries(null, op);
+  if (!ownsOp(op)) return;
 
   const { ids, listing } = reviewListing(useStore.getState().doc.chunks);
   if (!listing) {
@@ -1147,7 +1409,9 @@ export async function reviewDocument(): Promise<void> {
     return;
   }
   const language = s.settings?.defaultTargetLanguage;
-  s.setGlobalBusy("Reviewing document…", tab);
+  s.setGlobalBusy(tNow("Reviewing document…"), tab);
+  logOp(op, "start", "review");
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "invalid-result" };
   try {
     // No outputLanguage: the reply must be strict JSON, not prose — the
     // comment-text language is pinned inside the instruction instead.
@@ -1164,7 +1428,9 @@ export async function reviewDocument(): Promise<void> {
         "Copy each chunkId exactly from the [brackets]." +
         (language ? ` Write each comment's text in ${language}.` : ""),
     });
-    if (useStore.getState().activeTabId !== tab) {
+    const stale = staleReason(op);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched tabs — review discarded."), "info");
       return;
     }
@@ -1190,15 +1456,20 @@ export async function reviewDocument(): Promise<void> {
     for (const f of findings) {
       if (store.addComment(f.chunkId, f.text.trim(), "ai", "review")) added += 1;
     }
+    outcome = { phase: "commit" };
     if (added) {
       store.toggleReviewPanel(true);
-      s.notify(`AI review: ${added} comment${added === 1 ? "" : "s"}.`, "success");
+      s.notify(
+        added === 1 ? tNow("AI review: 1 comment.") : tf("AI review: {n} comments.", { n: added }),
+        "success"
+      );
     } else {
       s.notify(tNow("AI review: no issues found."), "success");
     }
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
   } finally {
+    logOp(op, outcome.phase, "review", undefined, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }
@@ -1271,7 +1542,8 @@ export async function checkIntegrity(): Promise<void> {
     );
     return;
   }
-  const tab = s.activeTabId;
+  const op = captureOp(); // BUG-001b: findings land only in this tab + load
+  const tab = op.tabId;
   const ctx = buildGraphAndParagraphContext();
   if (!ctx) {
     s.notify(tNow("Nothing to check yet — write something first."), "info");
@@ -1279,7 +1551,9 @@ export async function checkIntegrity(): Promise<void> {
   }
   const { ids, text } = ctx;
   const language = s.settings?.defaultTargetLanguage;
-  s.setGlobalBusy("Mapping logic…", tab);
+  s.setGlobalBusy(tNow("Mapping logic…"), tab);
+  logOp(op, "start", "integrity");
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "invalid-result" };
   try {
     const raw = await api.aiProcess({
       action: "custom",
@@ -1298,7 +1572,9 @@ export async function checkIntegrity(): Promise<void> {
         "the [brackets]." +
         (language ? ` Write each note in ${language}.` : ""),
     });
-    if (useStore.getState().activeTabId !== tab) {
+    const stale = staleReason(op);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched tabs — integrity check discarded."), "info");
       return;
     }
@@ -1345,18 +1621,22 @@ export async function checkIntegrity(): Promise<void> {
         : f.note.trim();
       if (store.addComment(f.chunkId, body, "ai", f.kind)) added += 1;
     }
+    outcome = { phase: "commit" };
     if (added) {
       store.toggleReviewPanel(true);
       s.notify(
-        `Map logic: ${added} finding${added === 1 ? "" : "s"} (AI opinion, not a verified audit).`,
+        added === 1
+          ? tNow("Map logic: 1 finding (AI opinion, not a verified audit).")
+          : tf("Map logic: {n} findings (AI opinion, not a verified audit).", { n: added }),
         "success"
       );
     } else {
       s.notify(tNow("Map logic: no issues found."), "success");
     }
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
   } finally {
+    logOp(op, outcome.phase, "integrity", undefined, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }
@@ -1461,7 +1741,8 @@ export async function checkAgainstCriteria(
     );
     return null;
   }
-  const tab = s.activeTabId;
+  const op = captureOp(); // BUG-001b: results belong to this tab + load
+  const tab = op.tabId;
   const ctx = buildGraphAndParagraphContext();
   if (!ctx) {
     s.notify(tNow("Nothing to check yet — write something first."), "info");
@@ -1470,7 +1751,9 @@ export async function checkAgainstCriteria(
   const { ids, text } = ctx;
   const criteriaListing = cleaned.map((c, i) => `${i + 1}. ${c}`).join("\n");
   const fullText = [text, "", "REVIEW CRITERIA:", criteriaListing].join("\n");
-  s.setGlobalBusy("Checking against review criteria…", tab);
+  s.setGlobalBusy(tNow("Checking against review criteria…"), tab);
+  logOp(op, "start", "criteria");
+  let outcome: { phase: OpPhase; reason?: string } = { phase: "discard", reason: "invalid-result" };
   try {
     const raw = await api.aiProcess({
       action: "custom",
@@ -1487,15 +1770,18 @@ export async function checkAgainstCriteria(
         'A criterion with no genuinely supporting paragraph MUST be reported as "covered":false ' +
         'with "supportingChunkIds":[].',
     });
-    if (useStore.getState().activeTabId !== tab) {
+    const stale = staleReason(op);
+    if (stale) {
+      outcome = { phase: "discard", reason: stale };
       s.notify(tNow("Switched tabs — criteria check discarded."), "info");
       return null;
     }
     const results = parseCriteriaResults(raw, cleaned, ids);
+    outcome = { phase: "commit" };
     const uncovered = results.filter((r) => !r.covered).length;
     if (uncovered) {
       s.notify(
-        `Criteria check: ${uncovered} of ${results.length} not covered.`,
+        tf("Criteria check: {n} of {total} not covered.", { n: uncovered, total: results.length }),
         "info"
       );
     } else {
@@ -1503,9 +1789,10 @@ export async function checkAgainstCriteria(
     }
     return results;
   } catch (e) {
-    s.notify(message(e), "error");
+    outcome = { phase: "discard", reason: notifyAiError(e) };
     return null;
   } finally {
+    logOp(op, outcome.phase, "criteria", undefined, outcome.reason);
     useStore.getState().setGlobalBusy(null, tab);
   }
 }

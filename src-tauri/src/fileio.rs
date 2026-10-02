@@ -3,8 +3,13 @@
 //!
 //! Supported formats: `.txt`, `.md`/`.markdown`, `.rtf` (plus export-only
 //! `.pdf` via `pdf.rs`).
-//! Import splits the text into paragraph chunks (blank-line separated) and
-//! promotes fenced ```mermaid blocks into diagram chunks. Export reverses this.
+//! Import splits the text into paragraph chunks (blank-line separated), ATX
+//! heading chunks, and code fences (backtick or tilde, CommonMark closing
+//! rule), promoting ```mermaid / ~~~mermaid fences into diagram chunks.
+//! Export reverses this. The `.md` import (`markdown_text_to_document`) is in
+//! lockstep with TS `markdownToDocument`; tests/fixtures/md_import.golden.json
+//! pins the agreed cases and lists the known divergences (frontmatter and
+//! image lines are GUI-only).
 
 use crate::error::{AppError, AppResult};
 use crate::models::{Chunk, Document, DIAGRAM_FORMAT_MERMAID, DOC_MODE_MARKDOWN};
@@ -110,36 +115,41 @@ pub fn import_from_path(path: &str) -> AppResult<Document> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let mut title = p
+    let title = p
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled Document")
         .to_string();
 
-    let mut text = match ext.as_str() {
-        "txt" | "md" | "markdown" => std::fs::read_to_string(p)?,
-        "rtf" => rtf_to_text(&std::fs::read_to_string(p)?),
-        other => return Err(AppError::UnsupportedFormat(other.to_string())),
+    match ext.as_str() {
+        "md" | "markdown" => Ok(markdown_text_to_document(&title, &std::fs::read_to_string(p)?)),
+        "txt" => Ok(text_to_document(&title, &std::fs::read_to_string(p)?)),
+        "rtf" => Ok(text_to_document(&title, &rtf_to_text(&std::fs::read_to_string(p)?))),
+        other => Err(AppError::UnsupportedFormat(other.to_string())),
+    }
+}
+
+/// Build a Markdown-mode `Document` from Markdown `source`. Pure.
+///
+/// A leading ATX H1 (see `strip_leading_h1`) becomes the title, otherwise
+/// `fallback_title` (the file stem) is kept: Markdown export writes the title
+/// as that H1, so an export→import round trip is idempotent instead of
+/// accumulating a stray title chunk each cycle. The rest is split by
+/// `text_to_document`. `markdown_source` keeps `source` byte-for-byte (the
+/// parsed chunks are a projection for the AI/slide features).
+///
+/// Rust twin of TS `markdownToDocument` (src/markdown.ts); the shared golden
+/// fixture tests/fixtures/md_import.golden.json pins the cases both must agree
+/// on, and its `_comment` lists the known divergences (frontmatter, image
+/// lines, an indented first-line H1, empty ATX headings, lone CR).
+pub fn markdown_text_to_document(fallback_title: &str, source: &str) -> Document {
+    let mut doc = match strip_leading_h1(source) {
+        Some((h1, rest)) => text_to_document(&h1, &rest),
+        None => text_to_document(fallback_title, source),
     };
-
-    // Markdown export writes the title as a leading `# Heading`. Promote it back
-    // into the document title on import so an export→import round-trip is
-    // idempotent instead of accumulating a stray title chunk each cycle.
-    if matches!(ext.as_str(), "md" | "markdown") {
-        if let Some((h1, rest)) = strip_leading_h1(&text) {
-            title = h1;
-            text = rest;
-        }
-    }
-
-    let mut doc = text_to_document(&title, &text);
-    if matches!(ext.as_str(), "md" | "markdown") {
-        // Keep the bytes the user opened as the source of truth. The parsed
-        // chunks are a projection for the app's existing AI/slide features.
-        doc.mode = DOC_MODE_MARKDOWN.to_string();
-        doc.markdown_source = Some(std::fs::read_to_string(p)?);
-    }
-    Ok(doc)
+    doc.mode = DOC_MODE_MARKDOWN.to_string();
+    doc.markdown_source = Some(source.to_string());
+    doc
 }
 
 /// Extract plain reference text from a file for use as Draft supporting
@@ -160,32 +170,92 @@ pub fn read_reference_text(path: &str) -> AppResult<String> {
     }
 }
 
-/// If the first non-blank line is an ATX H1 (`# Heading`), return its text and
-/// the remaining document. Only a level-1 heading qualifies (`## ...` is body).
+/// If the first non-blank line is an ATX H1 (`# Heading`, `#` then a space or
+/// tab; closing `#` run stripped as in `atx_heading`), return its text and the
+/// remaining document. Only a level-1 heading qualifies (`## ...` is body).
+/// Known limit: the line is `trim_start`ed first, so an indented first-line
+/// H1 becomes the title here while TS `LEADING_H1` treats it as a body
+/// heading (excluded from the import golden fixture).
 fn strip_leading_h1(text: &str) -> Option<(String, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut idx = 0;
     while idx < lines.len() && lines[idx].trim().is_empty() {
         idx += 1;
     }
-    let first = lines.get(idx)?.trim_start();
-    let heading = first.strip_prefix("# ")?.trim().to_string();
-    if heading.is_empty() {
+    let (hashes, heading) = atx_heading(lines.get(idx)?.trim_start())?;
+    if hashes != 1 {
         return None;
     }
     let remaining = lines[idx + 1..].join("\n");
     Some((heading, remaining))
 }
 
+/// What an RTF export could not carry (rust.md rule 4): every image or diagram
+/// that was written as a text placeholder / source text instead of a picture,
+/// counted per cause, plus one specific warning per non-zero count. Mirrored
+/// by TS `RtfReport` in src/types.ts (field list kept equal by
+/// src/rtfReport.test.ts); the warning texts are localized by
+/// src/exportWarnings.ts, whose test reads them from this file.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RtfReport {
+    pub warnings: Vec<String>,
+    /// Image chunks with no image bytes that are not a local file reference:
+    /// a remote URL whose fetch failed (content cleared) or wasn't attempted.
+    pub images_not_downloaded: usize,
+    /// Image chunks still holding a local file reference (relative path,
+    /// absolute path or `file:` URL — classified by pptx.rs
+    /// `looks_like_local_path`) that the caller couldn't inline.
+    pub local_images_unresolved: usize,
+    /// Image chunks with bytes RTF can't embed: anything but PNG/JPEG (GIF,
+    /// WEBP, BMP, SVG, …) or a PNG/JPEG whose size can't be read.
+    pub images_not_embeddable: usize,
+    /// Diagram chunks without an embeddable rendered snapshot, written as
+    /// their source text.
+    pub diagrams_as_source: usize,
+}
+
+/// Write a `Document` to disk in the requested format and report what the
+/// format couldn't carry: `Some(RtfReport)` for RTF, `None` for txt/md (their
+/// writers keep the text; images/diagrams stay as references/fences by
+/// design). PDF is refused (see `export_to_path`).
+pub fn export_with_report(
+    doc: &Document,
+    path: &str,
+    format: &str,
+) -> AppResult<Option<RtfReport>> {
+    if format.eq_ignore_ascii_case("rtf") {
+        let (body, report) = document_to_rtf(doc);
+        write_atomic(path, body.as_bytes())?;
+        return Ok(Some(report));
+    }
+    export_to_path(doc, path, format)?;
+    Ok(None)
+}
+
 /// Write a `Document` to disk in the requested format.
+///
+/// For RTF this `()` route discards the `RtfReport`, so no export surface
+/// calls it for RTF: the GUI (`commands::export_document`) and the headless
+/// CLI/MCP export (`cli::export_from`) both go through `export_with_report`,
+/// which returns the report.
 pub fn export_to_path(doc: &Document, path: &str, format: &str) -> AppResult<()> {
     let body = match format.to_lowercase().as_str() {
         "txt" => document_to_txt(doc),
         "md" | "markdown" => document_to_md(doc),
-        "rtf" => document_to_rtf(doc),
-        // PDF is binary and paginated — built (and written atomically) by its
-        // own module rather than as a text body.
-        "pdf" => return crate::pdf::document_to_pdf(doc, path),
+        "rtf" => document_to_rtf(doc).0,
+        // PDF is lossy and returns a `PdfReport`, which this `()` route cannot
+        // carry (rust.md rule 4). Refused here, so no caller (notably the
+        // renderer-reachable `commands::export_document`) can drop the report;
+        // PDF goes through `pdf::write_pdf` (GUI `export_pdf`, CLI/MCP
+        // `cli::export`), which returns it.
+        "pdf" => {
+            return Err(AppError::Other(
+                "PDF export reports what the PDF could not carry, so it uses its own command \
+                 (export_pdf), not the generic text export."
+                    .to_string(),
+            ))
+        }
         other => return Err(AppError::UnsupportedFormat(other.to_string())),
     };
     write_atomic(path, body.as_bytes())
@@ -215,9 +285,14 @@ pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> AppResult<()> {
 
 // ----- text <-> document ---------------------------------------------------
 
-/// Recognise an ATX Markdown heading (`#`–`######` followed by a space).
-/// Levels beyond 3 are clamped to 3. Returns `(level, heading text)`.
-fn parse_heading(line: &str) -> Option<(u8, String)> {
+/// Recognise an ATX Markdown heading: `#`–`######` followed by a space/tab.
+/// Returns `(raw hash count, heading text)`. The optional closing `#` run is
+/// stripped only when whitespace precedes it (CommonMark), so `## Using C#`
+/// keeps `C#` while `## Title ##` yields `Title`. Mirrors the TS regex
+/// `^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$` (src/markdown.ts), including that
+/// a lone run (`## #`, `## ##`) stays the text. Known limit (planned): a
+/// whitespace-only heading (`## `) is not a heading here (`None`).
+fn atx_heading(line: &str) -> Option<(usize, String)> {
     let hashes = line.chars().take_while(|&c| c == '#').count();
     if hashes == 0 || hashes > 6 {
         return None;
@@ -227,16 +302,67 @@ fn parse_heading(line: &str) -> Option<(u8, String)> {
     if !rest.starts_with(' ') && !rest.starts_with('\t') {
         return None;
     }
-    let text = rest.trim();
+    let ws: &[char] = &[' ', '\t'];
+    let body = rest.trim_start_matches(ws).trim_end_matches(ws);
+    let without_run = body.trim_end_matches('#');
+    let text = if without_run.len() < body.len() && without_run.ends_with(ws) {
+        // A closing run preceded by whitespace; `body` never starts with
+        // whitespace, so what remains is non-empty.
+        without_run.trim_end_matches(ws)
+    } else {
+        body
+    };
+    let text = text.trim();
     if text.is_empty() {
         return None;
     }
-    Some((hashes.min(3) as u8, text.to_string()))
+    Some((hashes, text.to_string()))
+}
+
+/// `atx_heading` with the level clamped to the model's 1-3. Returns
+/// `(level, heading text)`.
+fn parse_heading(line: &str) -> Option<(u8, String)> {
+    atx_heading(line).map(|(hashes, text)| (hashes.min(3) as u8, text))
+}
+
+/// An opening code fence (CommonMark): a run of at least three backticks or
+/// three tildes. A backtick fence's info string may not contain a backtick
+/// (such a line is inline code, not a fence). Returns `(marker, info)` where
+/// `marker` is the full opening run.
+fn fence_open(trimmed: &str) -> Option<(&str, &str)> {
+    let ch = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let run = trimmed.chars().take_while(|&c| c == ch).count();
+    if run < 3 {
+        return None;
+    }
+    let (marker, info) = trimmed.split_at(run);
+    if ch == '`' && info.contains('`') {
+        return None;
+    }
+    Some((marker, info))
+}
+
+/// Whether `line` closes a fence opened by `marker`: only a run of the SAME
+/// character, at least as long as the opener, with nothing but whitespace
+/// around it.
+fn fence_closes(line: &str, marker: &str) -> bool {
+    let Some(ch) = marker.chars().next() else {
+        return false;
+    };
+    let candidate = line.trim();
+    let run = candidate.chars().take_while(|&c| c == ch).count();
+    run >= marker.len() && candidate[run..].trim().is_empty()
 }
 
 /// Split plain text / markdown into chunks. Blank lines separate paragraphs;
-/// fenced ```mermaid blocks become diagram chunks; other fenced code blocks are
-/// preserved verbatim as text chunks.
+/// ATX headings (`parse_heading`) become heading chunks; fenced ```mermaid /
+/// ~~~mermaid blocks become diagram chunks; other fenced code blocks become
+/// text chunks wrapped in their own opening marker (backtick or tilde run, as
+/// long as the opener). A fence closes only on a run of the same character at
+/// least as long as the opener (`fence_closes`); an unclosed fence runs to the
+/// end and the chunk gains the closing marker. Lockstep with TS
+/// `parseMarkdownBlocks` (golden: tests/fixtures/md_import.golden.json).
+/// Known limit: image lines stay text here (TS makes image chunks).
 pub fn text_to_document(title: &str, text: &str) -> Document {
     let mut doc = Document::new(title);
     let mut order: u32 = 0;
@@ -258,19 +384,16 @@ pub fn text_to_document(title: &str, text: &str) -> Document {
         let line = lines[i];
         let trimmed = line.trim_start();
 
-        let open_fence = trimmed.chars().take_while(|&c| c == '`').count();
-        if open_fence >= 3 {
+        if let Some((marker, info)) = fence_open(trimmed) {
             // A fenced code block. Per CommonMark, the closing fence is a line
-            // that is *only* backticks (after trimming), at least as long as the
-            // opener — so an inner "```lang" with an info string does not close
-            // an outer block.
-            let lang = trimmed[open_fence..].trim().to_string();
+            // that is *only* the opener's character (after trimming), at least
+            // as long as the opener — so an inner "```lang" with an info string,
+            // or a run of the other fence character, does not close it.
+            let lang = info.trim().to_string();
             let mut code: Vec<String> = Vec::new();
             i += 1;
             while i < lines.len() {
-                let l = lines[i].trim_start();
-                let close_fence = l.chars().take_while(|&c| c == '`').count();
-                if close_fence >= open_fence && l[close_fence..].trim().is_empty() {
+                if fence_closes(lines[i], marker) {
                     break; // closing fence
                 }
                 code.push(lines[i].to_string());
@@ -286,7 +409,7 @@ pub fn text_to_document(title: &str, text: &str) -> Document {
                 doc.chunks
                     .push(Chunk::new_diagram(order, body, DIAGRAM_FORMAT_MERMAID));
             } else {
-                let fenced = format!("```{}\n{}\n```", lang, body);
+                let fenced = format!("{marker}{lang}\n{body}\n{marker}");
                 doc.chunks.push(Chunk::new_text(order, fenced));
             }
             order += 1;
@@ -344,27 +467,28 @@ fn chunk_as_markdown(chunk: &Chunk) -> String {
 }
 
 fn document_to_md(doc: &Document) -> String {
-    // `markdown_source` is only authoritative while the doc is IN the Markdown
-    // workspace: the frontend doesn't clear it on ordinary chunk edits after
-    // switching away (see `Document::markdown_source` doc comment), so once
-    // `mode` has moved on, a leftover source is stale and must be ignored in
-    // favor of deriving fresh text from `chunks`.
+    // `markdown_source` is written verbatim only in "markdown" mode (the GUI
+    // sends its TS-merged text that way). Outside it the source is only the
+    // frontend's merge baseline and Rust has no merge, so text is regenerated
+    // from `chunks` (see `Document::markdown_source` doc comment).
     if doc.mode == DOC_MODE_MARKDOWN {
         if let Some(source) = &doc.markdown_source {
             return source.clone();
         }
     }
-    let mut out = String::new();
+    // Byte-for-byte twin of the TS no-baseline serializer (markdown.ts
+    // `serializeChunks`): parts joined by a blank line, trailing whitespace
+    // trimmed, one final newline. Guarded by `md_no_baseline_golden_parity`.
+    // Known limits: JS and Rust disagree on whether U+FEFF / U+0085 count as
+    // trailing whitespace, and TS clamps heading levels to 1-6 where Rust
+    // clamps to 1-3 (normalize() and the TS parser keep levels within 1-3, so
+    // 4-6 never reach either writer); the golden fixture leaves these out.
+    let mut parts: Vec<String> = Vec::new();
     if !doc.title.trim().is_empty() {
-        out.push_str(&format!("# {}\n\n", doc.title.trim()));
+        parts.push(format!("# {}", doc.title.trim()));
     }
-    let body = doc
-        .chunks
-        .iter()
-        .map(chunk_as_markdown)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    out.push_str(&body);
+    parts.extend(doc.chunks.iter().map(chunk_as_markdown));
+    let mut out = parts.join("\n\n").trim_end().to_string();
     out.push('\n');
     out
 }
@@ -711,7 +835,10 @@ fn push_rtf_picture(out: &mut String, content: &str, caption: Option<&str>) -> b
     true
 }
 
-fn document_to_rtf(doc: &Document) -> String {
+/// The RTF body plus its lossy report: every image/diagram that falls back to
+/// a text placeholder / source text is counted by cause (see `RtfReport`).
+fn document_to_rtf(doc: &Document) -> (String, RtfReport) {
+    let mut report = RtfReport::default();
     let mut out = String::from("{\\rtf1\\ansi\\ansicpg1252\\deff0\n");
     out.push_str("{\\fonttbl{\\f0\\froman Georgia;}{\\f1\\fmodern Consolas;}}\n");
     out.push_str("\\f0\\fs24\n");
@@ -730,6 +857,14 @@ fn document_to_rtf(doc: &Document) -> String {
             // A PNG/JPEG data URL embeds as a real picture; anything else
             // (GIF/BMP/remote URL that couldn't be fetched) keeps the placeholder.
             if !push_rtf_picture(&mut out, &chunk.content, chunk.metadata.summary.as_deref()) {
+                // Same classification as the PPTX writer (pptx.rs `build_visuals`).
+                match crate::imageio::decode_image(&chunk.content) {
+                    Some(_) => report.images_not_embeddable += 1,
+                    None if crate::pptx::looks_like_local_path(&chunk.content) => {
+                        report.local_images_unresolved += 1
+                    }
+                    None => report.images_not_downloaded += 1,
+                }
                 let caption = chunk.metadata.summary.clone().unwrap_or_default();
                 out.push_str(&rtf_escape(&format!("[Image: {caption}]")));
                 out.push_str("\\par\n");
@@ -750,6 +885,7 @@ fn document_to_rtf(doc: &Document) -> String {
             // rendered as monospace text.
             let snapshot = chunk.metadata.rendered_image.as_deref().unwrap_or("");
             if !push_rtf_picture(&mut out, snapshot, chunk.metadata.summary.as_deref()) {
+                report.diagrams_as_source += 1;
                 out.push_str("{\\f1\\fs20 ");
                 out.push_str(&rtf_escape(&chunk.content));
                 out.push_str("}\\par\n");
@@ -761,7 +897,38 @@ fn document_to_rtf(doc: &Document) -> String {
     }
 
     out.push_str("}\n");
-    out
+    push_rtf_warnings(&mut report);
+    (out, report)
+}
+
+/// One specific warning per non-zero `RtfReport` count. The literals are read
+/// by src/exportWarnings.test.ts (each needs a localization rule there).
+fn push_rtf_warnings(report: &mut RtfReport) {
+    let warnings = &mut report.warnings;
+    if report.images_not_downloaded > 0 {
+        warnings.push(format!(
+            "{} image(s) couldn't be downloaded and were exported as text placeholders.",
+            report.images_not_downloaded
+        ));
+    }
+    if report.local_images_unresolved > 0 {
+        warnings.push(format!(
+            "{} local image(s) couldn't be read from the document's folder and were exported as text placeholders.",
+            report.local_images_unresolved
+        ));
+    }
+    if report.images_not_embeddable > 0 {
+        warnings.push(format!(
+            "{} image(s) couldn't be embedded in RTF (only PNG and JPEG are supported) and were exported as text placeholders.",
+            report.images_not_embeddable
+        ));
+    }
+    if report.diagrams_as_source > 0 {
+        warnings.push(format!(
+            "{} diagram(s) had no rendered snapshot and were exported as source text.",
+            report.diagrams_as_source
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -929,7 +1096,7 @@ mod tests {
             1,
             "Braces {} and a backslash \\ kept.",
         ));
-        let rtf = document_to_rtf(&doc);
+        let rtf = document_to_rtf(&doc).0;
         let text = rtf_to_text(&rtf);
         assert!(text.contains("日本語のテスト"), "got: {text:?}");
         assert!(text.contains("Hello, world!"), "got: {text:?}");
@@ -993,6 +1160,54 @@ mod tests {
         );
         // A level-2 heading is body, not a title.
         assert_eq!(strip_leading_h1("## Section\n\nBody."), None);
+    }
+
+    /// The closing-run rule must not change empty-ATX-heading behavior
+    /// (planned work): a lone `#` run after the opener stays the text, as in
+    /// TS, and a whitespace-only heading is still not a heading.
+    #[test]
+    fn closing_run_rule_leaves_lone_runs_and_empty_headings_alone() {
+        assert_eq!(parse_heading("## #"), Some((2, "#".to_string())));
+        assert_eq!(parse_heading("## ##"), Some((2, "##".to_string())));
+        assert_eq!(parse_heading("## # #"), Some((2, "#".to_string())));
+        assert_eq!(parse_heading("## "), None);
+        assert_eq!(parse_heading("##\t \t"), None);
+        // Only a run at the very end is a closing run.
+        assert_eq!(parse_heading("## a ## b"), Some((2, "a ## b".to_string())));
+        assert_eq!(parse_heading("####### seven"), None);
+        // The H1 title uses the same rule, and needs exactly one hash.
+        assert_eq!(strip_leading_h1("# C# ##\nrest"), Some(("C#".to_string(), "rest".to_string())));
+        assert_eq!(strip_leading_h1("#\tT\nrest"), Some(("T".to_string(), "rest".to_string())));
+        assert_eq!(strip_leading_h1("# \nrest"), None);
+    }
+
+    /// Round trip for a tilde fence: import → export → import → export keeps
+    /// the `~~~` marker and accumulates nothing on the second cycle.
+    #[test]
+    fn tilde_fence_round_trips_without_accumulation() {
+        // The blank line inside the fence and the inner ``` run would split
+        // or close a backtick-only parser's block.
+        let md = "# Doc\n\nIntro.\n\n~~~js\nconst a = 1;\n\n```\nconst b = 2;\n~~~\n\nAfter.";
+        let doc = markdown_text_to_document("Fallback", md);
+        assert_eq!(doc.title, "Doc");
+        assert_eq!(doc.chunks.len(), 3, "chunks: {:?}", doc.chunks);
+        assert_eq!(doc.chunks[1].content, "~~~js\nconst a = 1;\n\n```\nconst b = 2;\n~~~");
+        let mut editor = doc.clone();
+        editor.mode = "editor".to_string();
+        editor.markdown_source = None;
+        let out1 = document_to_md(&editor);
+        let mut re = markdown_text_to_document("Fallback", &out1);
+        assert_eq!(re.title, "Doc");
+        let key = |d: &Document| {
+            d.chunks
+                .iter()
+                .map(|c| (c.metadata.chunk_type.clone(), c.content.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&re), key(&doc));
+        re.mode = "editor".to_string();
+        re.markdown_source = None;
+        assert_eq!(document_to_md(&re), out1, "second export cycle changed the output");
     }
 
     #[test]
@@ -1066,7 +1281,7 @@ mod tests {
         let mut img = image_chunk(0, data_url("image/png", &png_bytes(4, 2)));
         img.metadata.summary = Some("a tiny picture".to_string());
         doc.chunks.push(img);
-        let rtf = document_to_rtf(&doc);
+        let rtf = document_to_rtf(&doc).0;
         assert!(rtf.contains("\\pict"), "no pict group: {rtf}");
         assert!(rtf.contains("\\pngblip"), "wrong blip type: {rtf}");
         // 4×2 px @96 dpi → himetric ×26.4583, twips ×15.
@@ -1086,7 +1301,7 @@ mod tests {
         // 1000 px wide → 15000 twips, beyond the 8640-twip (6 in) cap.
         doc.chunks
             .push(image_chunk(0, data_url("image/png", &png_bytes(1000, 100))));
-        let rtf = document_to_rtf(&doc);
+        let rtf = document_to_rtf(&doc).0;
         assert!(rtf.contains("\\picwgoal8640\\pichgoal864"), "not scaled: {rtf}");
     }
 
@@ -1098,7 +1313,7 @@ mod tests {
         doc.chunks.push(gif);
         doc.chunks
             .push(image_chunk(1, "https://example.com/x.png".to_string()));
-        let rtf = document_to_rtf(&doc);
+        let rtf = document_to_rtf(&doc).0;
         assert!(!rtf.contains("\\pict"), "gif/URL must not embed: {rtf}");
         assert!(rtf.contains("[Image: animated]"), "placeholder missing: {rtf}");
     }
@@ -1109,7 +1324,7 @@ mod tests {
         let mut d = Chunk::new_diagram(0, "graph TD; A-->B;", "mermaid");
         d.metadata.rendered_image = Some(data_url("image/png", &png_bytes(4, 2)));
         doc.chunks.push(d);
-        let rtf = document_to_rtf(&doc);
+        let rtf = document_to_rtf(&doc).0;
         assert!(rtf.contains("\\pict"), "snapshot not embedded: {rtf}");
         assert!(!rtf.contains("graph TD"), "source should be replaced by the picture: {rtf}");
 
@@ -1117,9 +1332,102 @@ mod tests {
         let mut doc2 = Document::new("D2");
         doc2.chunks
             .push(Chunk::new_diagram(0, "graph TD; A-->B;", "mermaid"));
-        let rtf2 = document_to_rtf(&doc2);
+        let rtf2 = document_to_rtf(&doc2).0;
         assert!(!rtf2.contains("\\pict"), "nothing to embed: {rtf2}");
         assert!(rtf2.contains("graph TD; A--"), "mono source missing: {rtf2}");
+    }
+
+    // ----- RTF lossy report (rust.md rule 4) -----
+
+    #[test]
+    fn rtf_report_counts_each_placeholder_by_cause_with_one_warning_each() {
+        let mut doc = Document::new("D");
+        // Embedded: a PNG picture and a diagram snapshot — never counted.
+        doc.chunks.push(image_chunk(0, data_url("image/png", &png_bytes(4, 2))));
+        let mut snap = Chunk::new_diagram(1, "graph TD; A-->B;", "mermaid");
+        snap.metadata.rendered_image = Some(data_url("image/png", &png_bytes(4, 2)));
+        doc.chunks.push(snap);
+        // Not embeddable: GIF, BMP, WEBP bytes.
+        doc.chunks.push(image_chunk(2, data_url("image/gif", b"GIF89a\x04\x00\x02\x00")));
+        doc.chunks.push(image_chunk(3, data_url("image/bmp", &[0x42, 0x4D, 1, 2, 3, 4])));
+        doc.chunks.push(image_chunk(
+            4,
+            data_url("image/webp", &[0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]),
+        ));
+        // Local references the caller couldn't inline (relative, absolute, file:).
+        doc.chunks.push(image_chunk(5, "figures/fig 1.png".to_string()));
+        doc.chunks.push(image_chunk(6, "/Users/me/研究/図.jpg".to_string()));
+        doc.chunks.push(image_chunk(7, "file:///tmp/x.png".to_string()));
+        // Remote: a URL left in place, and a fetch that failed (content cleared).
+        doc.chunks.push(image_chunk(8, "https://example.com/x.png".to_string()));
+        doc.chunks.push(image_chunk(9, String::new()));
+        // A diagram with no snapshot → its source text.
+        doc.chunks.push(Chunk::new_diagram(10, "graph LR; X-->Y;", "mermaid"));
+
+        let (rtf, report) = document_to_rtf(&doc);
+        assert_eq!(rtf.matches("{\\pict").count(), 2, "exactly the PNG and the snapshot embed");
+        assert_eq!(
+            report,
+            RtfReport {
+                warnings: vec![
+                    "2 image(s) couldn't be downloaded and were exported as text placeholders."
+                        .to_string(),
+                    "3 local image(s) couldn't be read from the document's folder and were \
+                     exported as text placeholders."
+                        .to_string(),
+                    "3 image(s) couldn't be embedded in RTF (only PNG and JPEG are supported) and \
+                     were exported as text placeholders."
+                        .to_string(),
+                    "1 diagram(s) had no rendered snapshot and were exported as source text."
+                        .to_string(),
+                ],
+                images_not_downloaded: 2,
+                local_images_unresolved: 3,
+                images_not_embeddable: 3,
+                diagrams_as_source: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rtf_report_is_empty_when_everything_embeds() {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_text(0, "本文 only"));
+        doc.chunks.push(image_chunk(1, data_url("image/png", &png_bytes(4, 2))));
+        doc.chunks.push(image_chunk(2, data_url("image/jpeg", &jpeg_bytes(3, 5))));
+        let (_rtf, report) = document_to_rtf(&doc);
+        assert_eq!(report, RtfReport::default());
+    }
+
+    /// Minimal JPEG: SOI + SOF0 with the frame size (enough for `image_size`).
+    fn jpeg_bytes(w: u16, h: u16) -> Vec<u8> {
+        let mut j = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        j.extend_from_slice(&h.to_be_bytes());
+        j.extend_from_slice(&w.to_be_bytes());
+        j.extend_from_slice(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        j
+    }
+
+    #[test]
+    fn export_with_report_returns_the_rtf_report_and_none_for_text_formats() {
+        let dir = preview_test_dir();
+        let mut doc = Document::new("D");
+        doc.chunks.push(image_chunk(0, "figures/missing.png".to_string()));
+
+        let rtf_path = dir.join("out.rtf");
+        let report = export_with_report(&doc, rtf_path.to_str().unwrap(), "RTF")
+            .expect("rtf export")
+            .expect("rtf carries a report");
+        assert_eq!(report.local_images_unresolved, 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(std::fs::read_to_string(&rtf_path).unwrap().contains("[Image: ]"));
+
+        for fmt in ["txt", "md"] {
+            let p = dir.join(format!("out.{fmt}"));
+            assert_eq!(export_with_report(&doc, p.to_str().unwrap(), fmt).expect(fmt), None);
+            assert!(p.exists(), "{fmt} written");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ----- atomic writes -----
@@ -1204,5 +1512,93 @@ mod tests {
             !md.contains("Old text from a past Markdown session."),
             "stale markdown_source leaked through: {md}"
         );
+    }
+
+    /// Invariant 3 contract test: the no-baseline `.md` serializer has a TS
+    /// twin (src/markdown.ts `serializeChunks`, the GUI writer). Both read
+    /// the same golden fixture; src/markdown.test.ts asserts the TS side.
+    #[test]
+    fn md_no_baseline_golden_parity() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            title: String,
+            chunks: Vec<Chunk>,
+            expected: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            cases: Vec<Case>,
+        }
+        let golden: Golden = serde_json::from_str(include_str!(
+            "../tests/fixtures/md_no_baseline.golden.json"
+        ))
+        .expect("golden fixture parses");
+        assert!(golden.cases.len() >= 7, "fixture lost its cases");
+        let mut mismatches = Vec::new();
+        for case in golden.cases {
+            let mut doc = Document::new(&case.title);
+            doc.mode = "editor".to_string();
+            doc.chunks = case.chunks;
+            assert!(doc.markdown_source.is_none());
+            let got = document_to_md(&doc);
+            if got != case.expected {
+                mismatches.push(format!("{}: got {got:?}, expected {:?}", case.name, case.expected));
+            }
+        }
+        assert!(mismatches.is_empty(), "TS/Rust .md drift:\n{}", mismatches.join("\n"));
+    }
+
+    /// Invariant 3 contract test: Markdown IMPORT has a TS twin (src/markdown.ts
+    /// `markdownToDocument`, the GUI parser). Both read the same golden
+    /// fixture; src/markdownImportParity.test.ts asserts the TS side.
+    #[test]
+    fn md_import_golden_parity() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct GoldenChunk {
+            #[serde(rename = "type")]
+            kind: String,
+            level: Option<u8>,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            md: String,
+            title: String,
+            chunks: Vec<GoldenChunk>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Golden {
+            fallback_title: String,
+            cases: Vec<Case>,
+        }
+        let golden: Golden =
+            serde_json::from_str(include_str!("../tests/fixtures/md_import.golden.json"))
+                .expect("golden fixture parses");
+        assert!(golden.cases.len() >= 15, "fixture lost its cases");
+        let mut mismatches = Vec::new();
+        for case in golden.cases {
+            let doc = markdown_text_to_document(&golden.fallback_title, &case.md);
+            assert_eq!(doc.markdown_source.as_deref(), Some(case.md.as_str()), "{}", case.name);
+            assert_eq!(doc.mode, DOC_MODE_MARKDOWN, "{}", case.name);
+            let got: Vec<GoldenChunk> = doc
+                .chunks
+                .iter()
+                .map(|c| GoldenChunk {
+                    kind: c.metadata.chunk_type.clone(),
+                    level: c.metadata.level,
+                    content: c.content.clone(),
+                })
+                .collect();
+            if doc.title != case.title || got != case.chunks {
+                mismatches.push(format!(
+                    "{}: got title {:?} chunks {got:?}, expected title {:?} chunks {:?}",
+                    case.name, doc.title, case.title, case.chunks
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "TS/Rust .md import drift:\n{}", mismatches.join("\n"));
     }
 }

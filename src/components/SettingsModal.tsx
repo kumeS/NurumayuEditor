@@ -1,48 +1,40 @@
 // Settings dialog: OpenRouter endpoint, model, default translation language,
 // temperature, and the API key (stored in the OS keychain via Rust — never
 // echoed back to the frontend).
+//
+// Model pickers: manual entry and the OpenRouter catalog both select through
+// applyModelSelection (openRouterModels.ts); nothing persists until Save.
+// Opening this dialog sends no request — the catalog loads only when the user
+// presses its Fetch button, and Fetch waits (with an inline reason) while the
+// endpoint or API key in the form is unsaved — the backend uses the SAVED
+// endpoint and key (catalogFetchBlock, security-rust-1). Saved models are never
+// removed automatically: a
+// model absent from a loaded catalog, or the one behind the last provider 404
+// (store.aiModelIssue), only gets an inline marker.
+// The one control that does not wait for Save is "Remove key": it deletes the
+// keychain entry at once, so it asks through a native dialog first.
 
-import { type ReactNode, useEffect, useState } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { type ReactNode, useEffect, useId, useState } from "react";
 import { api } from "../api";
 import { FONT_STACKS } from "../fonts";
 import { tNow, useLang, useT } from "../i18n";
+import { isImeKeyEvent } from "../modalBehavior";
+import {
+  applyModelSelection,
+  catalogFetchBlock,
+  type CatalogKind,
+  isOpenRouterEndpoint,
+  missingSavedModels,
+  modelKeysFor,
+} from "../openRouterModels";
+import { DEFAULT_SETTINGS } from "../settingsDefaults";
 import { useStore } from "../store";
 import type { Settings } from "../types";
 import { CloseIcon } from "./icons";
+import Modal from "./Modal";
+import OpenRouterModelCatalog, { useOpenRouterCatalog } from "./OpenRouterModelCatalog";
 import { openPersonalLibraryPanel } from "./PersonalLibraryPanel";
-
-const DEFAULTS: Settings = {
-  endpoint: "https://openrouter.ai/api/v1/chat/completions",
-  model: "deepseek/deepseek-v4-flash",
-  models: [
-    "deepseek/deepseek-v4-flash",
-    "qwen/qwen3.6-flash",
-    "meta-llama/llama-4-maverick",
-    "moonshotai/kimi-k2.5",
-    "google/gemma-4-31b-it:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-r1:free",
-  ],
-  imageModel: "google/gemini-2.5-flash-image",
-  imageModels: [
-    "google/gemini-2.5-flash-image",
-    "x-ai/grok-imagine-image-quality",
-    "recraft/recraft-v4-pro",
-    "openai/gpt-5.4-image-2",
-    "black-forest-labs/flux.2-klein-4b",
-    "google/gemini-3-pro-image-preview",
-  ],
-  defaultTargetLanguage: "English",
-  writingTone: "",
-  temperature: 0.3,
-  editorFontFamily: "serif",
-  editorFontSize: 17,
-  removedModels: [],
-  limitCompletionToLocalModel: false,
-  charLimitWarning: undefined,
-  personalRagEnabled: false,
-  mcpWriteEnabled: false,
-};
 
 // Common languages for the default-language picker.
 const LANGUAGES = [
@@ -73,8 +65,8 @@ const WRITING_TONES: { label: string; value: string }[] = [
 
 /** Ensure each active model always appears in its selectable list. */
 function withActiveModels(s: Settings): Settings {
-  const models = s.models?.length ? s.models : DEFAULTS.models;
-  const imageModels = s.imageModels?.length ? s.imageModels : DEFAULTS.imageModels;
+  const models = s.models?.length ? s.models : DEFAULT_SETTINGS.models;
+  const imageModels = s.imageModels?.length ? s.imageModels : DEFAULT_SETTINGS.imageModels;
   return {
     ...s,
     models: models.includes(s.model) ? models : [s.model, ...models],
@@ -87,23 +79,45 @@ function withActiveModels(s: Settings): Settings {
 export default function SettingsModal() {
   const open = useStore((s) => s.settingsOpen);
   const closeSettings = useStore((s) => s.closeSettings);
+  const settingsFocus = useStore((s) => s.settingsFocus);
   const storedSettings = useStore((s) => s.settings);
   const setSettings = useStore((s) => s.setSettings);
   const hasApiKey = useStore((s) => s.hasApiKey);
   const setHasApiKey = useStore((s) => s.setHasApiKey);
   const notify = useStore((s) => s.notify);
+  const aiModelIssue = useStore((s) => s.aiModelIssue);
 
-  const [form, setForm] = useState<Settings>(withActiveModels(storedSettings ?? DEFAULTS));
+  const [form, setForm] = useState<Settings>(withActiveModels(storedSettings ?? DEFAULT_SETTINGS));
   const [apiKey, setApiKey] = useState("");
+  // The backend gates on the SAVED endpoint and uses the SAVED key, so Fetch
+  // waits for Save while either differs from what the form shows.
+  const fetchBlock = catalogFetchBlock(form.endpoint, (storedSettings ?? DEFAULT_SETTINGS).endpoint, apiKey);
+  // Session-scoped (this component stays mounted); one fetch serves both pickers.
+  const catalog = useOpenRouterCatalog(form.endpoint, fetchBlock);
   const [newModel, setNewModel] = useState("");
   const [newImageModel, setNewImageModel] = useState("");
   const [saving, setSaving] = useState(false);
+  const titleId = useId();
+  // One id per labelled control, so each visible label is its accessible name.
+  const fid = useId();
+  const ids = {
+    lang: `${fid}-lang`,
+    apiKey: `${fid}-api-key`,
+    endpoint: `${fid}-endpoint`,
+    charLimit: `${fid}-char-limit`,
+    textModels: `${fid}-text-models`,
+    imageModels: `${fid}-image-models`,
+    font: `${fid}-font`,
+    fontSize: `${fid}-font-size`,
+    tone: `${fid}-tone`,
+    temperature: `${fid}-temperature`,
+  };
   const t = useT();
   const ja = useLang() === "ja";
 
   useEffect(() => {
     if (open) {
-      setForm(withActiveModels(storedSettings ?? DEFAULTS));
+      setForm(withActiveModels(storedSettings ?? DEFAULT_SETTINGS));
       setApiKey("");
       setNewModel("");
       setNewImageModel("");
@@ -118,17 +132,9 @@ export default function SettingsModal() {
   // Generic add/remove that works on either model list (text or image).
   type ListKey = "models" | "imageModels";
   type ActiveKey = "model" | "imageModel";
-  const addModelTo = (listKey: ListKey, activeKey: ActiveKey, raw: string) => {
-    const id = raw.trim();
-    if (!id) return;
-    setForm((f) => ({
-      ...f,
-      [listKey]: f[listKey].includes(id) ? f[listKey] : [...f[listKey], id],
-      [activeKey]: id, // select the newly added model
-      // Re-adding a model lifts its tombstone (item 69).
-      removedModels: (f.removedModels ?? []).filter((m) => m !== id),
-    }));
-  };
+  // Add + select + lift the tombstone (item 69); shared with catalog selection.
+  const addModelTo = (kind: CatalogKind, raw: string) =>
+    setForm((f) => applyModelSelection(f, kind, raw));
   const removeModelFrom = (listKey: ListKey, activeKey: ActiveKey, id: string) => {
     setForm((f) => {
       const list = f[listKey].filter((m) => m !== id);
@@ -169,60 +175,101 @@ export default function SettingsModal() {
     }
   };
 
+  // Unlike every other control here, this acts immediately (not on Save) and
+  // the keychain secret cannot be restored, so it asks first (ui.md rule 5).
+  // Success is quiet: the placeholder, hint and button flip in place.
   const clearKey = async () => {
     try {
+      const confirmed = await ask(
+        tNow(
+          "Remove the OpenRouter API key from your OS keychain? AI actions will not work until you enter a key again."
+        ),
+        {
+          title: tNow("Remove key"),
+          kind: "warning",
+          okLabel: tNow("Remove key"),
+          cancelLabel: tNow("Cancel"),
+        }
+      );
+      if (!confirmed) return;
       await api.deleteApiKey();
       setHasApiKey(false);
       setApiKey("");
-      notify(tNow("API key removed from keychain."), "success");
     } catch (e) {
       notify(typeof e === "string" ? e : String(e), "error");
     }
   };
 
-  const field = "w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-accent";
+  const field = "w-full rounded-md border border-chrome-edge px-3 py-2 text-sm outline-none focus:border-accent";
   const labelCls = "mb-1 block text-sm font-medium text-ink-soft";
 
   // Shared renderer for a selectable, editable model list (text or image).
   const renderModelList = (
-    listKey: ListKey,
-    activeKey: ActiveKey,
+    kind: CatalogKind,
     addValue: string,
     setAddValue: (v: string) => void,
     placeholder: string,
-    help: ReactNode
+    help: ReactNode,
+    labelId: string
   ) => {
+    const { listKey, activeKey } = modelKeysFor(kind);
     const list = form[listKey];
     const active = form[activeKey];
     const add = () => {
-      addModelTo(listKey, activeKey, addValue);
+      addModelTo(kind, addValue);
       setAddValue("");
     };
+    // Warn-only markers: never remove or disable a saved model. The catalog
+    // comparison applies only while the endpoint is OpenRouter.
+    const missing = new Set(
+      isOpenRouterEndpoint(form.endpoint) ? missingSavedModels(list, catalog.state) : []
+    );
     return (
       <>
-        <div className="max-h-40 space-y-0.5 overflow-auto rounded-md border border-gray-300 p-1">
+        <div
+          role="group"
+          aria-labelledby={labelId}
+          className="max-h-40 space-y-0.5 overflow-auto rounded-md border border-chrome-edge p-1"
+        >
           {list.map((m) => {
             const isActive = active === m;
+            const unavailable = aiModelIssue?.model === m;
             return (
               <div key={m} className="flex items-center gap-1">
                 <button
                   type="button"
                   onClick={() => update(activeKey, m)}
-                  className={`flex-1 truncate rounded px-2 py-1.5 text-left text-sm ${
+                  aria-pressed={isActive}
+                  className={`min-w-0 flex-1 rounded px-2 py-1.5 text-left text-sm ${
                     isActive
                       ? "bg-accent/10 font-medium text-accent"
-                      : "text-ink-soft hover:bg-gray-100"
+                      : "text-ink-soft hover:bg-chrome-hairline"
                   }`}
                   title={m}
                 >
-                  <span className="mr-1 inline-block w-3">{isActive ? "✓" : ""}</span>
-                  {m}
+                  <span className="block truncate">
+                    <span className="mr-1 inline-block w-3">{isActive ? "✓" : ""}</span>
+                    {m}
+                  </span>
+                  {unavailable && (
+                    <span
+                      className="ml-4 block text-xs font-normal text-danger"
+                      title={t("The provider could not serve this model in the last AI request. Choose another model.")}
+                    >
+                      {t("Unavailable (404)")}
+                    </span>
+                  )}
+                  {missing.has(m) && (
+                    <span className="ml-4 block text-xs font-normal text-warn-strong">
+                      {t("Not found in the current OpenRouter catalog")}
+                    </span>
+                  )}
                 </button>
                 <button
                   type="button"
                   onClick={() => removeModelFrom(listKey, activeKey, m)}
                   disabled={list.length <= 1}
-                  className="shrink-0 rounded px-1.5 text-ink-faint hover:text-red-500 disabled:opacity-30 disabled:hover:text-ink-faint"
+                  className="shrink-0 rounded px-1.5 text-ink-faint hover:text-danger disabled:opacity-30 disabled:hover:text-ink-faint"
                   title={t("Remove from list")}
                   aria-label={`${t("Remove")} ${m}`}
                 >
@@ -237,12 +284,14 @@ export default function SettingsModal() {
             value={addValue}
             onChange={(e) => setAddValue(e.target.value)}
             onKeyDown={(e) => {
+              if (isImeKeyEvent(e.nativeEvent)) return;
               if (e.key === "Enter") {
                 e.preventDefault();
                 add();
               }
             }}
             placeholder={placeholder}
+            aria-label={placeholder}
             className={field}
           />
           <button
@@ -255,24 +304,34 @@ export default function SettingsModal() {
           </button>
         </div>
         <p className="mt-1 text-xs text-ink-faint">{help}</p>
+        <OpenRouterModelCatalog
+          kind={kind}
+          catalog={catalog}
+          fetchBlock={fetchBlock}
+          activeModel={active}
+          onSelect={(id) => addModelTo(kind, id)}
+          autoOpen={settingsFocus === "model-catalog" && kind === "text"}
+        />
       </>
     );
   };
 
   return (
-    <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/30 p-4"
-      onMouseDown={closeSettings}
+    <Modal
+      name="settings"
+      onClose={closeSettings}
+      labelledBy={titleId}
+      dismissible={!saving}
+      panelClassName="flex max-h-[90vh] w-full max-w-lg flex-col rounded-xl bg-white shadow-2xl"
     >
-      <div
-        className="flex max-h-[90vh] w-full max-w-lg flex-col rounded-xl bg-white shadow-2xl"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        <div className="flex shrink-0 items-center justify-between border-b border-gray-100 px-6 pb-3 pt-6">
-          <h2 className="text-lg font-semibold text-ink">{t("Settings")}</h2>
+        <div className="flex shrink-0 items-center justify-between border-b border-chrome-hairline px-6 pb-3 pt-6">
+          <h2 id={titleId} className="text-lg font-semibold text-ink">{t("Settings")}</h2>
           <button
+            type="button"
             onClick={closeSettings}
-            className="text-ink-faint hover:text-ink"
+            disabled={saving}
+            className="text-ink-faint hover:text-ink disabled:opacity-40"
+            title={t("Close")}
             aria-label={t("Close")}
           >
             <CloseIcon />
@@ -281,8 +340,9 @@ export default function SettingsModal() {
 
         <div className="flex-1 space-y-4 overflow-y-auto px-6 py-4">
           <div className="rounded-lg border border-accent/30 bg-accent/5 p-3">
-            <label className={labelCls}>{t("Default language")}</label>
+            <label htmlFor={ids.lang} className={labelCls}>{t("Default language")}</label>
             <select
+              id={ids.lang}
               value={form.defaultTargetLanguage}
               onChange={(e) => update("defaultTargetLanguage", e.target.value)}
               className={field}
@@ -321,8 +381,9 @@ export default function SettingsModal() {
           </div>
 
           <div>
-            <label className={labelCls}>{t("OpenRouter API key")}</label>
+            <label htmlFor={ids.apiKey} className={labelCls}>{t("OpenRouter API key")}</label>
             <input
+              id={ids.apiKey}
               type="password"
               autoComplete="off"
               value={apiKey}
@@ -339,7 +400,8 @@ export default function SettingsModal() {
               {hasApiKey && (
                 <button
                   onClick={clearKey}
-                  className="text-xs text-red-500 hover:underline"
+                  type="button"
+                  className="text-xs text-danger hover:underline"
                 >
                   {t("Remove key")}
                 </button>
@@ -348,18 +410,19 @@ export default function SettingsModal() {
           </div>
 
           <div>
-            <label className={labelCls}>{t("Endpoint URL")}</label>
+            <label htmlFor={ids.endpoint} className={labelCls}>{t("Endpoint URL")}</label>
             <input
+              id={ids.endpoint}
               value={form.endpoint}
               onChange={(e) => update("endpoint", e.target.value)}
               className={field}
-              placeholder={DEFAULTS.endpoint}
+              placeholder={DEFAULT_SETTINGS.endpoint}
             />
             <p className="mt-1 text-xs text-ink-faint">
               {ja ? (
                 <>
                   <strong>推奨:</strong> OpenRouterの既定値{" "}
-                  <code>{DEFAULTS.endpoint}</code> のままご利用ください。OpenAI互換の
+                  <code>{DEFAULT_SETTINGS.endpoint}</code> のままご利用ください。OpenAI互換の
                   chat-completionsエンドポイントも利用できます — 例: ローカルのOllamaブリッジ{" "}
                   <code>http://localhost:11434/v1/chat/completions</code>
                   (ローカルの場合APIキーは空欄で構いません)。画像生成にはOpenRouterの画像モデルが必要です。
@@ -367,7 +430,7 @@ export default function SettingsModal() {
               ) : (
                 <>
                   <strong>Recommended:</strong> keep the OpenRouter default{" "}
-                  <code>{DEFAULTS.endpoint}</code>. Any OpenAI-compatible
+                  <code>{DEFAULT_SETTINGS.endpoint}</code>. Any OpenAI-compatible
                   chat-completions endpoint also works — e.g. a local Ollama bridge at{" "}
                   <code>http://localhost:11434/v1/chat/completions</code> (leave the API
                   key blank for local endpoints). Image generation requires an
@@ -409,9 +472,12 @@ export default function SettingsModal() {
           </div>
 
           <div>
-            <label className={labelCls}>{t("Paragraph character-limit warning")}</label>
+            <label htmlFor={ids.charLimit} className={labelCls}>
+              {t("Paragraph character-limit warning")}
+            </label>
             <div className="flex items-center gap-2">
               <input
+                id={ids.charLimit}
                 type="number"
                 min={1}
                 step={1}
@@ -430,7 +496,7 @@ export default function SettingsModal() {
                 type="button"
                 onClick={() => update("charLimitWarning", undefined)}
                 disabled={form.charLimitWarning === undefined}
-                className="shrink-0 rounded-md px-3 py-2 text-sm text-ink-soft hover:bg-gray-100 disabled:opacity-40"
+                className="shrink-0 rounded-md px-3 py-2 text-sm text-ink-soft hover:bg-chrome-hairline disabled:opacity-40"
               >
                 {t("Turn off")}
               </button>
@@ -458,7 +524,12 @@ export default function SettingsModal() {
                 : "Let AI actions optionally pull in relevant snippets from your own past papers/notes as grounding context. Fully on-device: embedding, indexing, and search all run locally (a one-time embedding-model download happens the first time you add a source or search, after enabling this — no other network traffic). Off by default. Manage indexed files from"}{" "}
               <button
                 type="button"
-                onClick={() => openPersonalLibraryPanel()}
+                onClick={() => {
+                  // The panel lives in the (inert while a modal is open)
+                  // background chrome, so Settings must close first (BUG-017).
+                  closeSettings();
+                  openPersonalLibraryPanel();
+                }}
                 className="text-accent underline decoration-dotted hover:text-accent-soft"
               >
                 {t("the personal library panel")}
@@ -485,10 +556,9 @@ export default function SettingsModal() {
           </div>
 
           <div>
-            <label className={labelCls}>{t("Model (text)")}</label>
+            <span id={ids.textModels} className={labelCls}>{t("Model (text)")}</span>
             {renderModelList(
-              "models",
-              "model",
+              "text",
               newModel,
               setNewModel,
               t("Add model ID, e.g. anthropic/claude-3.5-sonnet"),
@@ -505,15 +575,15 @@ export default function SettingsModal() {
                   text model — free (e.g. <code>google/gemma-4-31b-it:free</code>) or
                   paid (e.g. <code>anthropic/claude-3.5-sonnet</code>).
                 </>
-              )
+              ),
+              ids.textModels
             )}
           </div>
 
           <div>
-            <label className={labelCls}>{t("Model (image generation)")}</label>
+            <span id={ids.imageModels} className={labelCls}>{t("Model (image generation)")}</span>
             {renderModelList(
-              "imageModels",
-              "imageModel",
+              "image",
               newImageModel,
               setNewImageModel,
               t("Add image model ID, e.g. google/gemini-2.5-flash-image"),
@@ -531,14 +601,16 @@ export default function SettingsModal() {
                   Nano Banana Pro. <strong>Verify exact ids on
                   openrouter.ai/models</strong> — image model ids change often.
                 </>
-              )
+              ),
+              ids.imageModels
             )}
           </div>
 
           <div>
-            <label className={labelCls}>{t("Editor font")}</label>
+            <label htmlFor={ids.font} className={labelCls}>{t("Editor font")}</label>
             <div className="flex items-center gap-4">
               <select
+                id={ids.font}
                 value={form.editorFontFamily ?? "serif"}
                 onChange={(e) =>
                   update(
@@ -553,10 +625,11 @@ export default function SettingsModal() {
                 <option value="mono">{t("Mono")}</option>
               </select>
               <div className="w-44">
-                <label className="block text-xs text-ink-faint">
+                <label htmlFor={ids.fontSize} className="block text-xs text-ink-faint">
                   {t("Size")}: {form.editorFontSize ?? 17}px
                 </label>
                 <input
+                  id={ids.fontSize}
                   type="range"
                   min={12}
                   max={28}
@@ -568,7 +641,7 @@ export default function SettingsModal() {
               </div>
             </div>
             <p
-              className="mt-1 truncate rounded-md border border-gray-200 bg-gray-50/60 px-3 py-1.5 text-ink-soft"
+              className="mt-1 truncate rounded-md border border-chrome-line bg-chrome/60 px-3 py-1.5 text-ink-soft"
               style={{
                 fontFamily: FONT_STACKS[form.editorFontFamily ?? "serif"],
                 fontSize: `${form.editorFontSize ?? 17}px`,
@@ -578,15 +651,16 @@ export default function SettingsModal() {
             </p>
             <p className="mt-1 text-xs text-ink-faint">
               {ja
-                ? "エディタ本文の段落に適用されます。文字を大きくすると弱視の方が読みやすく、Sans/Monoはディスレクシアの方に読みやすい場合があります。"
-                : "Applies to body paragraphs in the editor (提案5 accessibility). Larger sizes help low-vision readers; Sans/Mono can be easier for dyslexic readers."}
+                ? "エディタ本文の段落に適用されます。文字を大きくすると弱視の方が読みやすく、ゴシックや等幅はディスレクシアの方に読みやすい場合があります。"
+                : "Applies to body paragraphs in the editor. Larger sizes help low-vision readers; Sans/Mono can be easier for dyslexic readers."}
             </p>
           </div>
 
           <div className="flex gap-4">
             <div className="flex-1">
-              <label className={labelCls}>{t("Writing tone")}</label>
+              <label htmlFor={ids.tone} className={labelCls}>{t("Writing tone")}</label>
               <select
+                id={ids.tone}
                 value={form.writingTone}
                 onChange={(e) => update("writingTone", e.target.value)}
                 className={field}
@@ -608,10 +682,11 @@ export default function SettingsModal() {
               </p>
             </div>
             <div className="w-40">
-              <label className={labelCls}>
+              <label htmlFor={ids.temperature} className={labelCls}>
                 {t("Temperature")}: {form.temperature.toFixed(1)}
               </label>
               <input
+                id={ids.temperature}
                 type="range"
                 min={0}
                 max={1}
@@ -624,10 +699,12 @@ export default function SettingsModal() {
           </div>
         </div>
 
-        <div className="flex shrink-0 justify-end gap-2 border-t border-gray-100 px-6 py-4">
+        <div className="flex shrink-0 justify-end gap-2 border-t border-chrome-hairline px-6 py-4">
           <button
+            type="button"
             onClick={closeSettings}
-            className="rounded-md px-4 py-2 text-sm text-ink-soft hover:bg-gray-100"
+            disabled={saving}
+            className="rounded-md px-4 py-2 text-sm text-ink-soft hover:bg-chrome-hairline disabled:opacity-40"
           >
             {t("Cancel")}
           </button>
@@ -639,7 +716,6 @@ export default function SettingsModal() {
             {saving ? t("Saving…") : t("Save")}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

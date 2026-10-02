@@ -6,8 +6,13 @@
 // paragraph — not the whole document.
 
 import { create } from "zustand";
-import { documentToMarkdown, markdownToDocument } from "./markdown";
+import { PREVIEW_ZOOM_MAX, PREVIEW_ZOOM_MIN } from "./previewViewport";
+import { documentToMarkdown, markdownToDocument, withMarkdownTitle } from "./markdown";
+import { type FindOptions, isSearchableChunk, replaceAll } from "./findReplace";
 import { groupSlides } from "./slides";
+// i18n imports this module too; tNow only reads the store when CALLED (never
+// at module init), so the cycle is safe.
+import { tNow } from "./i18n";
 import type {
   AnalysisResult,
   Chunk,
@@ -229,6 +234,131 @@ export interface Toast {
 }
 
 /**
+ * Identity of the document an async operation started on (BUG-001b). Tab ids
+ * alone are not document identity (openInTab reuses a pristine tab) and chunk
+ * ids are persisted UUIDs (a reopened .aix has the same ids), so every load
+ * gets a fresh `docNonce`. `opId` is a per-session counter for correlation
+ * logging only; ownership compares `tabId` + `docNonce`.
+ */
+export interface OpTicket {
+  opId: number;
+  tabId: string;
+  docNonce: number;
+}
+
+/**
+ * What a ghost-text suggestion was generated for (BUG-001a/d): the chunk, the
+ * exact text it continues (`prefix`), and the tab + document load. A
+ * suggestion is only stored, and only accepted, while all four still match.
+ */
+export interface GhostContext {
+  chunkId: string;
+  prefix: string;
+  tabId: string;
+  docNonce: number;
+}
+export interface GhostSuggestion extends GhostContext {
+  text: string;
+}
+
+/**
+ * One AI-operation correlation record (MISS-01). Ids and machine-readable
+ * reason codes ONLY — never document content, prompts, or keys. Kept in a
+ * bounded in-memory ring buffer (AI_OP_LOG_MAX) so it is visible in release
+ * builds; nothing persists it. Shown read-only in NetworkPanel ("Recent AI
+ * operations") with a Copy-as-JSON-lines button (aiOpLogToJsonLines).
+ */
+export type AiOpPhase = "start" | "commit" | "discard";
+export interface AiOpLogEntry {
+  ts: number;
+  opId: number;
+  phase: AiOpPhase;
+  action: string;
+  tabId: string;
+  docNonce: number;
+  chunkId?: string;
+  reason?: string;
+}
+export const AI_OP_LOG_MAX = 200;
+
+/**
+ * Idle gap (ms) after which the next keystroke in the same paragraph starts a
+ * new undo step (BUG-002). The window slides: each edit refreshes it, so
+ * continuous typing stays one step. Read via Date.now() (fake-timer friendly).
+ */
+export const UNDO_IDLE_MS = 1500;
+
+/** What the docked find bar shows (BUG-010): plain find, find + replace, or
+ *  a line-number field (Markdown source). */
+export type FindMode = "find" | "replace" | "line";
+
+/**
+ * The find bar's UI state. Ephemeral and app-level (like the panel flags): it
+ * is never persisted, not part of the document or TabSnapshot, and never
+ * dirties or adds history. `current` is the index of the selected match in
+ * the bar's live match list (-1 = none yet); `hit` is that match in Editor
+ * mode (ChunkView highlights and selects it); `focusNonce` bumps on every
+ * open so the bar re-focuses its field even when it is already open.
+ */
+/** A Settings landing spot (ux-a11y-i18n-5). */
+export type SettingsFocus = "model-catalog";
+
+export interface FindState {
+  open: boolean;
+  mode: FindMode;
+  query: string;
+  replacement: string;
+  caseSensitive: boolean;
+  wholeWord: boolean;
+  current: number;
+  hit: { chunkId: string; from: number; to: number } | null;
+  focusNonce: number;
+  /** True right after Replace / Replace All until a find field (query or
+   *  replacement) is edited, or the bar opens/closes: ⌘Z in the bar then
+   *  undoes the DOCUMENT (ux-a11y-i18n-1, see shortcuts.ts). */
+  replacePending: boolean;
+}
+
+export const FIND_INITIAL: FindState = {
+  open: false,
+  mode: "find",
+  query: "",
+  replacement: "",
+  caseSensitive: false,
+  wholeWord: false,
+  current: -1,
+  hit: null,
+  focusNonce: 0,
+  replacePending: false,
+};
+
+// Globally monotonic, never reset: a nonce is never reused across loads,
+// tabs, or a tab id that openInTab recycles.
+let docNonceCounter = 0;
+function nextDocNonce(): number {
+  docNonceCounter += 1;
+  return docNonceCounter;
+}
+let opCounter = 0;
+
+/**
+ * Whether two documents hold the same content (MISS-12: undo back to the
+ * saved state is clean). Reference equality first (the common case: undo
+ * restores the exact snapshot object), then a structural fallback that
+ * reuses unchanged chunk identity and JSON-compares the rest. Conservative:
+ * it may report "different" for equal data with reordered keys (→ dirty,
+ * safe), never "same" for different data.
+ */
+function sameDocument(a: Document, b: Document | null): boolean {
+  if (a === b) return true;
+  if (!b || a.chunks.length !== b.chunks.length) return false;
+  const { chunks: ac, ...aRest } = a;
+  const { chunks: bc, ...bRest } = b;
+  if (JSON.stringify(aRest) !== JSON.stringify(bRest)) return false;
+  return ac.every((c, i) => c === bc[i] || JSON.stringify(c) === JSON.stringify(bc[i]));
+}
+
+/**
  * Per-document state captured when a tab is backgrounded. The ACTIVE tab's
  * state lives in the top-level fields below; inactive tabs are stored as these
  * snapshots. This set must mirror EXACTLY the per-document fields (so nothing
@@ -244,12 +374,20 @@ interface TabSnapshot {
   // exposed to the UI, since loadDocument/newTab always set it in the SAME
   // action that clears dirty).
   savedDoc: Document | null;
+  // True when `savedDoc` needs no saving (on disk, or a fresh blank doc);
+  // false for AI drafts, repaired-on-load files and dirty restored tabs, so
+  // undoing back to such a baseline stays dirty (MISS-12).
+  savedDocIsClean: boolean;
+  // Document-load identity (BUG-001b) — restored, never bumped, on switch.
+  docNonce: number;
   past: Document[];
   future: Document[];
   analysis: AnalysisResult | null;
   analysisStale: boolean;
   focusedChunkId: string | null;
   lastEditChunkId: string | null;
+  // Time of the last coalesced paragraph edit (BUG-002 idle boundary).
+  lastEditAt: number;
   // In-flight operation state is PER-TAB (B3) — captured here so it doesn't leak
   // onto another tab on switch (a false "Drafting…" spinner) and a background
   // op's completion doesn't clear the foreground tab's state.
@@ -265,12 +403,15 @@ function snapshotActive(s: AppState): TabSnapshot {
     filePath: s.filePath,
     dirty: s.dirty,
     savedDoc: s.savedDoc,
+    savedDocIsClean: s.savedDocIsClean,
+    docNonce: s.docNonce,
     past: s.past,
     future: s.future,
     analysis: s.analysis,
     analysisStale: s.analysisStale,
     focusedChunkId: s.focusedChunkId,
     lastEditChunkId: s.lastEditChunkId,
+    lastEditAt: s.lastEditAt,
     globalBusy: s.globalBusy,
     streamingChunkId: s.streamingChunkId,
     streamingText: s.streamingText,
@@ -284,12 +425,15 @@ function applySnapshot(snap: TabSnapshot) {
     filePath: snap.filePath,
     dirty: snap.dirty,
     savedDoc: snap.savedDoc,
+    savedDocIsClean: snap.savedDocIsClean,
+    docNonce: snap.docNonce,
     past: snap.past,
     future: snap.future,
     analysis: snap.analysis,
     analysisStale: snap.analysisStale,
     focusedChunkId: snap.focusedChunkId,
     lastEditChunkId: snap.lastEditChunkId,
+    lastEditAt: snap.lastEditAt,
     globalBusy: snap.globalBusy,
     streamingChunkId: snap.streamingChunkId,
     streamingText: snap.streamingText,
@@ -314,10 +458,15 @@ interface AppState {
   filePath: string | null; // current native (.aix) file, if any
   dirty: boolean;
   // The document as it was at the last save/open — baseline for documentDiff()
-  // (item 1-2). Kept in lockstep with `dirty`: every action that sets
-  // dirty:false after a load/save also sets this in the SAME action, so the
-  // two can never drift apart.
+  // (item 1-2). Invariant: dirty:false implies `doc` matches `savedDoc`.
+  // Load/save/markClean set both in the SAME action; undo/redo never touch
+  // `savedDoc` and derive `dirty` from it plus `savedDocIsClean` (MISS-12).
   savedDoc: Document | null;
+  // See TabSnapshot.savedDocIsClean — undo/redo recompute `dirty` from it.
+  savedDocIsClean: boolean;
+  // Document-load identity (BUG-001b): fresh on loadDocument/newTab/
+  // hydrateSession/commitDraftToTab/last-tab replacement; restored on switch.
+  docNonce: number;
 
   // ----- tabs -----
   tabOrder: string[];
@@ -337,17 +486,27 @@ interface AppState {
   // real content is untouched until the stream finalises.
   streamingChunkId: string | null;
   streamingText: string;
-  // Ghost-text inline completion (開発.txt Stage 2, item 2-4): a transient,
-  // non-undoable overlay suggestion — NEVER written into `chunk.content` until
-  // explicitly accepted (Tab). `requestId` is a monotonic per-store counter:
-  // the component that fired the completion request captures the id it was
-  // issued and only applies a result if it still matches `ghostRequestId`,
-  // which is how a superseded (stale) in-flight request's late result is
-  // discarded (last-request-wins), mirroring the tab-race-guard pattern
-  // aiActions.ts already uses for chunk actions (`chunkStillActive` /
-  // `streamingChunkId === chunkId` checks).
-  ghostSuggestion: { chunkId: string; text: string } | null;
+  // Ghost-text inline completion (開発.txt Stage 2, item 2-4): a transient
+  // overlay suggestion — NEVER written into `chunk.content` until explicitly
+  // accepted via `acceptGhostSuggestion` (its own undo step). `requestId` is a
+  // monotonic per-store counter (never reset): the component that fired the
+  // completion request captures the id it was issued and only applies a
+  // result if it still matches `ghostRequestId`, which is how a superseded
+  // (stale) in-flight request's late result is discarded (last-request-wins).
+  // Every document transition (load/new/switch/close/hydrate/draft commit)
+  // bumps it too (BUG-001d), and the stored context (tab, load, prefix) must
+  // still match both when it is set and when it is accepted.
+  ghostSuggestion: GhostSuggestion | null;
   ghostRequestId: number;
+  // The configured text model the provider reported unusable (BUG-013c) —
+  // drives the persistent HealthBar "Model unavailable: {model}" chip with an
+  // Open Settings button (guarded by healthBarWiring.test.ts "HealthBar
+  // model-unavailable chip"). Cleared by setSettings when the active model
+  // changes.
+  aiModelIssue: { model: string } | null;
+  // AI operation correlation log (MISS-01) — see AiOpLogEntry. Global, not
+  // per-tab (each entry names its tab + load).
+  aiOpLog: AiOpLogEntry[];
   // Read-aloud (UI3): the single chunk currently being spoken, plus the backend
   // utterance id so a stale `speech-done` event can't clear a newer playback.
   speakingChunkId: string | null;
@@ -374,6 +533,10 @@ interface AppState {
   // app-level rather than per-tab, and — like the panel flags — deliberately
   // not persisted across launches.
   markdownZoom: number;
+  // Sideways shift of the preview's reading column, in screen px (0 = centred).
+  // App-level and not persisted, like the zoom. The view clamps it to keep part
+  // of the column on screen (previewViewport.ts).
+  markdownOffsetX: number;
   // Review comments panel (right dock, like networkOpen — not per-tab). The
   // target chunk is the one the panel's "add comment" composer points at (set
   // when the panel is opened from a chunk's gutter comment button).
@@ -383,17 +546,22 @@ interface AppState {
   // indicator or the command palette — not per-tab (like networkOpen), since
   // it's a transient view over whichever tab is active.
   diffPanelOpen: boolean;
-  // Fullscreen presentation overlay (item 1-3): ephemeral, UI-only state — NOT
+  // Window-filling presentation overlay (item 1-3; native full screen is
+  // planned): ephemeral, UI-only state — NOT
   // a third `doc.mode` value (that's persisted editor/slide document state).
   // Not per-tab (like networkOpen/diffPanelOpen): it's a transient view over
   // whichever tab is active, opened from the Slide editor's Present button or
   // the command palette.
   presentationOpen: boolean;
   settingsOpen: boolean;
+  /** Where an open Settings dialog should land (ux-a11y-i18n-5). */
+  settingsFocus: SettingsFocus | null;
   draftOpen: boolean;
   helpOpen: boolean;
   // Command palette (提案1 — ⌘K).
   paletteOpen: boolean;
+  // Docked find bar (BUG-010) — see FindState.
+  find: FindState;
   // The most recent export's warning report (提案2): exports used to surface
   // warnings only as a 3.5s toast; the health bar keeps them reviewable.
   lastExportReport: { format: string; warnings: string[]; at: number } | null;
@@ -404,6 +572,8 @@ interface AppState {
   past: Document[];
   future: Document[];
   lastEditChunkId: string | null;
+  // Time (Date.now) of the last coalesced paragraph edit — UNDO_IDLE_MS rule.
+  lastEditAt: number;
   // The chunk most recently replaced by an AI action — drives the transient
   // "what changed" diff highlight after proofread/translate/etc.
   lastAiEditChunkId: string | null;
@@ -416,15 +586,36 @@ interface AppActions {
     opts?: { dirty?: boolean }
   ) => void;
   setStreamingDocument: (doc: Document) => void;
+  /** Route a finished Draft document to the tab that started it, active or
+   *  background (BUG-005b): doc + baseline replaced, dirty, fresh history,
+   *  new docNonce. Returns false (no-op) when that tab was closed or another
+   *  document was loaded into it since `docNonce` was captured. */
+  commitDraftToTab: (tabId: string, docNonce: number, document: Document) => boolean;
   newTab: (mode?: DocMode) => void;
   switchTab: (id: string) => void;
+  /** Closing the LAST tab replaces it with a fresh untitled tab under a new
+   *  id (BUG-018), so late ops addressed to the old id become no-ops. */
   closeTab: (id: string) => void;
   hydrateSession: (tabs: PersistedTab[], activeTabId: string) => void;
+  /** Snapshot the active tab + document load an async op starts on. */
+  captureOp: () => OpTicket;
+  /** True while that same tab is active AND still shows that same load. */
+  ownsOp: (op: OpTicket) => boolean;
   setTitle: (title: string) => void;
   setMode: (mode: DocMode) => void;
-  setMarkdownSource: (source: string) => void;
+  /** `newUndoStep`: start a fresh undo step (a preview edit/split) instead of
+   *  merging into the current Markdown typing session. */
+  setMarkdownSource: (source: string, options?: { newUndoStep?: boolean }) => void;
 
-  updateChunkContent: (id: string, content: string) => void;
+  /** Live typing. Coalesces into the current undo step unless `newUndoStep`,
+   *  a different chunk, or an idle gap > UNDO_IDLE_MS since the last edit.
+   *  `composing` marks an IME composition continuation: the idle rule is
+   *  skipped for it (a pause while choosing a candidate never splits). */
+  updateChunkContent: (
+    id: string,
+    content: string,
+    options?: { newUndoStep?: boolean; composing?: boolean }
+  ) => void;
   replaceChunkContent: (id: string, content: string) => void; // undoable (AI results)
   selectChunkVersion: (id: string, value: string) => void; // swap to a saved version
   dismissAiEdit: () => void; // clear the transient diff highlight
@@ -481,7 +672,15 @@ interface AppActions {
   // returns the new request id BEFORE any async call is made, so the caller
   // can guard its own `on_delta`/resolution against being superseded.
   startGhostRequest: () => number;
-  setGhostSuggestion: (chunkId: string, text: string, requestId: number) => void;
+  /** Store a suggestion for `ctx`. Ignored unless `requestId` is current, the
+   *  context's tab + load are active, and the chunk's text still equals
+   *  `ctx.prefix`. The legacy chunk-id form records the CURRENT tab, load and
+   *  chunk text as the context. */
+  setGhostSuggestion: (ctx: GhostContext | string, text: string, requestId: number) => void;
+  /** Commit the visible suggestion into `chunkId` as its own undo step.
+   *  Returns false (and clears it) unless chunk, tab, load and prefix all
+   *  still match — the caller then lets the key fall through. */
+  acceptGhostSuggestion: (chunkId: string) => boolean;
   clearGhostSuggestion: () => void;
   // Read-aloud lifecycle (UI3).
   beginSpeaking: (chunkId: string, utterance: number) => void;
@@ -492,7 +691,12 @@ interface AppActions {
   setSpeechQueue: (ids: string[]) => void;
   shiftSpeechQueue: () => string | null;
 
+  /** Also clears `aiModelIssue` when `settings.model` changes. */
   setSettings: (settings: Settings) => void;
+  setAiModelIssue: (issue: { model: string } | null) => void;
+  /** Append to the bounded AI op log. Only the whitelisted AiOpLogEntry
+   *  fields are copied (never spread), and `ts` is stamped here. */
+  logAiOp: (entry: Omit<AiOpLogEntry, "ts">) => void;
   // Blindspot QA v1 (project.md Q13): on the very first launch (settings say
   // the example hasn't been shown yet, AND the active tab is still the
   // pristine blank doc — a real user hasn't typed a title or made a tab dirty
@@ -503,21 +707,45 @@ interface AppActions {
   // failed, in which case the caller must leave settings untouched.
   loadWelcomeExampleIfFirstRun: (settings: Settings) => boolean;
   setHasApiKey: (has: boolean) => void;
-  openSettings: () => void;
+  /** Open Settings; "model-catalog" also opens the text-model catalog and
+   *  focuses its Fetch button (palette "Browse OpenRouter models…"). Any
+   *  other argument (e.g. a click event from onClick={openSettings}) is a
+   *  plain open. */
+  openSettings: (focus?: SettingsFocus | unknown) => void;
   closeSettings: () => void;
   openDraft: () => void;
   closeDraft: () => void;
   openHelp: () => void;
   closeHelp: () => void;
   togglePalette: (open?: boolean) => void;
+  /** Open the find bar in `mode`; a non-null `seed` (the editor selection)
+   *  replaces the query. Resets `current` and bumps `focusNonce`. */
+  openFind: (mode: FindMode, seed?: string | null) => void;
+  closeFind: () => void;
+  setFind: (patch: Partial<Omit<FindState, "open" | "mode" | "focusNonce">>) => void;
+  /** Replace every match in the text/heading chunks as ONE undo step (marks
+   *  the graph stale). Returns the count; 0 = nothing changed, no step. */
+  replaceAllInChunks: (query: string, replacement: string, opts: FindOptions) => number;
+  /** Replace [from, to) of one text/heading chunk as its own undo step.
+   *  False (no change) for an unknown chunk or an out-of-range span. */
+  replaceMatchInChunk: (chunkId: string, from: number, to: number, replacement: string) => boolean;
+  /** Markdown mode: Replace All on the source as its own undo step, through
+   *  setMarkdownSource(…, {newUndoStep}) so the merge baseline is kept.
+   *  Used when the CodeMirror source view is not mounted. Returns the count. */
+  replaceAllInMarkdown: (query: string, replacement: string, opts: FindOptions) => number;
   setLastExportReport: (format: string, warnings: string[]) => void;
 
-  applyAnalysis: (result: AnalysisResult) => void;
+  /** Persist an analysis. `sent` is the document the analysis was computed
+   *  from (state-async-4): summaries are hashed against the text actually
+   *  analyzed, and the graph stays stale if the text moved on meanwhile.
+   *  Omitted → the current document (no async gap). */
+  applyAnalysis: (result: AnalysisResult, sent?: Document) => void;
   toggleNetwork: (open?: boolean) => void;
   toggleReviewPanel: (open?: boolean) => void;
   toggleFolderTree: (open?: boolean) => void;
   setFolderRoot: (path: string | null) => void;
   setMarkdownZoom: (zoom: number) => void;
+  setMarkdownOffsetX: (offset: number) => void;
   setReviewTarget: (id: string | null) => void;
   toggleDiffPanel: (open?: boolean) => void;
   openPresentation: () => void;
@@ -550,8 +778,28 @@ interface AppActions {
   // silently promote that unsaved keystroke into the baseline (dirty:false
   // AND savedDoc pointing past what's actually on disk — the two are supposed
   // to be inseparable, item 1-2). Defaults to the current doc ONLY for callers
-  // with no async gap between capturing and calling (e.g. tests).
+  // with no async gap between capturing and calling (e.g. tests). It also
+  // marks the baseline as saved (`savedDocIsClean`) and ends the current
+  // typing session, so undo can land exactly on the saved state (MISS-12).
+  // This is the synchronous, active-tab form (no async gap; used by tests). The
+  // save paths (saveNative/saveNativeAs) route through `markTabClean` instead,
+  // which pins the mark to the tab + load the save started on and keeps
+  // `dirty` true when the live doc moved past what was written.
   markClean: (filePath?: string | null, savedDocument?: Document) => void;
+  /**
+   * The routed form of markClean for an async save (state-async-3): marks the
+   * tab `tabId` — active or backgrounded — clean against `savedDocument`, but
+   * only while that tab still holds the load `docNonce` the save started on.
+   * `dirty` stays true when the live doc moved past what was written (a
+   * keystroke during the write). `filePath` undefined keeps the tab's path.
+   * Returns false (and changes nothing) when the tab is gone or reloaded.
+   */
+  markTabClean: (
+    tabId: string,
+    docNonce: number,
+    filePath: string | undefined,
+    savedDocument: Document
+  ) => boolean;
 }
 
 const MAX_HISTORY = 100;
@@ -570,6 +818,51 @@ function makeInitialDoc(mode: DocMode = "editor"): Document {
     chunks: [emptyChunk(0, mode === "slide" ? "heading" : "text")],
     markdownSource: mode === "markdown" ? "" : undefined,
   };
+}
+
+/**
+ * The full per-view state of a brand-new blank tab — shared by newTab and
+ * the last-tab replacement in closeTab (BUG-018) so the two can't drift.
+ * Excludes tab bookkeeping (tabOrder/activeTabId/inactiveTabs) and the ghost
+ * reset, which needs the current ghostRequestId (see `ghostReset`).
+ */
+function freshTabFields(mode: DocMode): Partial<AppState> {
+  const fresh = makeInitialDoc(mode);
+  return {
+    doc: fresh,
+    filePath: null,
+    dirty: false,
+    // A fresh blank tab's baseline is itself (item 1-2) and needs no saving.
+    savedDoc: fresh,
+    savedDocIsClean: true,
+    docNonce: nextDocNonce(),
+    past: [],
+    future: [],
+    analysis: null,
+    analysisStale: false,
+    focusedChunkId: fresh.chunks[0]?.id ?? null,
+    lastEditChunkId: null,
+    lastEditAt: 0,
+    lastAiEditChunkId: null,
+    flashChunkId: null,
+    flashChunkIds: [],
+    speechQueue: [],
+    selectedChunkIds: [],
+    // A fresh tab starts with no in-flight operations (B3).
+    globalBusy: null,
+    streamingChunkId: null,
+    streamingText: "",
+    busyChunks: {},
+  };
+}
+
+/**
+ * Invalidate any visible or in-flight ghost suggestion (BUG-001d): null it AND
+ * bump the request id, so a late delta from before a document transition
+ * can't resurrect a suggestion — reopened files share chunk ids.
+ */
+function ghostReset(s: AppState): Pick<AppState, "ghostSuggestion" | "ghostRequestId"> {
+  return { ghostSuggestion: null, ghostRequestId: s.ghostRequestId + 1 };
 }
 
 // A tiny inline chart, encoded as an SVG data URL — no bundled asset file, no
@@ -704,13 +997,17 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       return { inactiveTabs: { ...s.inactiveTabs, [tabId]: { ...snap, ...patch } } };
     });
 
-  const mapChunks = (doc: Document, fn: (chunks: Chunk[]) => Chunk[]): Document => ({
-    ...doc,
-    // A chunk-side edit supersedes any previously captured raw Markdown. The
-    // next Markdown view regenerates from the now-current chunk projection.
-    markdownSource: undefined,
-    chunks: fn(doc.chunks),
-  });
+  const mapChunks = (doc: Document, fn: (chunks: Chunk[]) => Chunk[]): Document => {
+    // markdownSource stays as the merge baseline (BUG-019b): documentToMarkdown
+    // re-serializes only the chunks whose type/level/content changed, so
+    // metadata-only commits (notes, layout, ...) never touch the Markdown.
+    const next = { ...doc, chunks: fn(doc.chunks) };
+    // Markdown mode reads markdownSource verbatim, so fold the edit in now.
+    if (doc.mode === "markdown" && doc.markdownSource !== undefined) {
+      next.markdownSource = documentToMarkdown({ ...next, mode: "editor" });
+    }
+    return next;
+  };
 
   const initialDoc = makeInitialDoc();
   return {
@@ -719,6 +1016,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     dirty: false,
     // A brand-new blank tab's baseline is itself — no changes yet (item 1-2).
     savedDoc: initialDoc,
+    savedDocIsClean: true,
+    docNonce: nextDocNonce(),
     tabOrder: [INITIAL_TAB_ID],
     activeTabId: INITIAL_TAB_ID,
     inactiveTabs: {},
@@ -734,6 +1033,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     streamingText: "",
     ghostSuggestion: null,
     ghostRequestId: 0,
+    aiModelIssue: null,
+    aiOpLog: [],
     speakingChunkId: null,
     speakingUtterance: null,
     speechQueue: [],
@@ -743,23 +1044,27 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     folderTreeOpen: true,
     folderRoot: null,
     markdownZoom: 1,
+    markdownOffsetX: 0,
     reviewPanelOpen: false,
     reviewTargetChunkId: null,
     diffPanelOpen: false,
     presentationOpen: false,
     settingsOpen: false,
+    settingsFocus: null,
     draftOpen: false,
     helpOpen: false,
     paletteOpen: false,
+    find: { ...FIND_INITIAL },
     lastExportReport: null,
     toasts: [],
     past: [],
     future: [],
     lastEditChunkId: null,
+    lastEditAt: 0,
     lastAiEditChunkId: null,
 
     loadDocument: (doc, filePath = null, opts) =>
-      set({
+      set((s) => ({
         doc,
         filePath,
         // B2: drafted/imported docs have no backing file and are unsaved, so they
@@ -771,6 +1076,10 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         // backing file yet) — "since last save" reads as "since this doc showed
         // up", not "since an unreachable on-disk state".
         savedDoc: doc,
+        // …but only a clean load is a baseline that needs no saving (MISS-12).
+        savedDocIsClean: !(opts?.dirty ?? false),
+        // A new document identity, even in the same tab (BUG-001b).
+        docNonce: nextDocNonce(),
         past: [],
         future: [],
         // Prefer the persisted full graph (paragraph + sentence nodes); fall back
@@ -779,47 +1088,57 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         analysisStale: false,
         focusedChunkId: doc.chunks[0]?.id ?? null,
         lastEditChunkId: null,
+        lastEditAt: 0,
         lastAiEditChunkId: null,
         selectedChunkIds: [],
-        ghostSuggestion: null,
-      }),
+        ...ghostReset(s),
+      })),
 
     // Live streaming snapshot (Draft): replace the document only — no history,
-    // no dirty/focus churn. Chunks carry stable position ids so React reconciles
-    // in place. loadDocument() finalises the stream.
-    setStreamingDocument: (doc) => set({ doc }),
+    // no focus churn. Chunks carry stable position ids so React reconciles in
+    // place. A streamed partial draft is irreproducible AI output, so the tab
+    // is dirty from the first update (BUG-005b) — a failed/abandoned stream
+    // still triggers the discard guard. loadDocument()/commitDraftToTab()
+    // finalise the stream.
+    setStreamingDocument: (doc) => set({ doc, dirty: true }),
+
+    commitDraftToTab: (tabId, docNonce, document) => {
+      const s = get();
+      const fields = {
+        doc: document,
+        savedDoc: document,
+        savedDocIsClean: false, // B2: an AI draft has no backing file
+        dirty: true,
+        docNonce: nextDocNonce(),
+        past: [] as Document[],
+        future: [] as Document[],
+        analysis: document.analysis ?? rebuildAnalysis(document),
+        analysisStale: false,
+        focusedChunkId: document.chunks[0]?.id ?? null,
+        lastEditChunkId: null,
+        lastEditAt: 0,
+      };
+      if (tabId === s.activeTabId) {
+        if (s.docNonce !== docNonce) return false;
+        set({ ...fields, lastAiEditChunkId: null, selectedChunkIds: [], ...ghostReset(s) });
+        return true;
+      }
+      const snap = s.inactiveTabs[tabId];
+      if (!snap || snap.docNonce !== docNonce) return false;
+      set({ inactiveTabs: { ...s.inactiveTabs, [tabId]: { ...snap, ...fields } } });
+      return true;
+    },
 
     // ----- tabs: active tab lives in top-level fields; others as snapshots -----
     newTab: (mode = "editor") =>
       set((s) => {
         const id = localId();
-        const fresh = makeInitialDoc(mode);
         return {
           inactiveTabs: { ...s.inactiveTabs, [s.activeTabId]: snapshotActive(s) },
           tabOrder: [...s.tabOrder, id],
           activeTabId: id,
-          doc: fresh,
-          filePath: null,
-          dirty: false,
-          // A fresh blank tab's baseline is itself (item 1-2).
-          savedDoc: fresh,
-          past: [],
-          future: [],
-          analysis: null,
-          analysisStale: false,
-          focusedChunkId: fresh.chunks[0]?.id ?? null,
-          lastEditChunkId: null,
-          lastAiEditChunkId: null,
-          flashChunkId: null,
-          flashChunkIds: [],
-          speechQueue: [],
-          selectedChunkIds: [],
-          ghostSuggestion: null,
-          // A fresh tab starts with no in-flight operations (B3).
-          globalBusy: null,
-          streamingChunkId: null,
-          streamingText: "",
-          busyChunks: {},
+          ...freshTabFields(mode),
+          ...ghostReset(s),
         };
       }),
 
@@ -833,12 +1152,25 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           [s.activeTabId]: snapshotActive(s),
         };
         delete inactiveTabs[id];
-        return { activeTabId: id, inactiveTabs, ...applySnapshot(target) };
+        return { activeTabId: id, inactiveTabs, ...applySnapshot(target), ...ghostReset(s) };
       }),
 
     closeTab: (id) =>
       set((s) => {
-        if (s.tabOrder.length <= 1) return {}; // always keep one tab open
+        if (!s.tabOrder.includes(id)) return {};
+        if (s.tabOrder.length <= 1) {
+          // Always keep one tab open — by REPLACING the last one (BUG-018) with
+          // a fresh untitled tab under a NEW id: late ops routed to the old id
+          // (routeTabPatch) or owned by its load (ownsOp) become no-ops.
+          const newId = localId();
+          return {
+            tabOrder: [newId],
+            activeTabId: newId,
+            inactiveTabs: {},
+            ...freshTabFields("editor"),
+            ...ghostReset(s),
+          };
+        }
         const idx = s.tabOrder.indexOf(id);
         const order = s.tabOrder.filter((t) => t !== id);
         if (id !== s.activeTabId) {
@@ -855,7 +1187,11 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           tabOrder: order,
           activeTabId: neighbourId,
           inactiveTabs,
+          // applySnapshot also resets speechQueue / ghostSuggestion /
+          // lastAiEditChunkId; ghostReset additionally retires in-flight ghost
+          // requests (BUG-001d).
           ...(target ? applySnapshot(target) : {}),
+          ...ghostReset(s),
         };
       }),
 
@@ -863,7 +1199,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     // collapses to a single tab) — rebuilds the active fields + every background
     // tab's snapshot from the persisted set.
     hydrateSession: (tabs, activeTabId) =>
-      set(() => {
+      set((s) => {
         const active = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
         if (!active) return {};
         const inactiveTabs: Record<string, TabSnapshot> = {};
@@ -875,14 +1211,18 @@ export const useStore = create<AppState & AppActions>((set, get) => {
             dirty: t.dirty,
             // PersistedTab carries no baseline (item 1-2 predates session
             // persistence) — treat the restored doc as its own baseline, same
-            // as any other freshly-loaded document.
+            // as any other freshly-loaded document. A dirty restored tab's
+            // baseline is NOT on disk, so undo can't make it clean (MISS-12).
             savedDoc: t.doc,
+            savedDocIsClean: !t.dirty,
+            docNonce: nextDocNonce(),
             past: [],
             future: [],
             analysis: t.doc.analysis ?? rebuildAnalysis(t.doc),
             analysisStale: false,
             focusedChunkId: t.doc.chunks[0]?.id ?? null,
             lastEditChunkId: null,
+            lastEditAt: 0,
             globalBusy: null,
             streamingChunkId: null,
             streamingText: "",
@@ -897,12 +1237,15 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           filePath: active.filePath,
           dirty: active.dirty,
           savedDoc: active.doc,
+          savedDocIsClean: !active.dirty,
+          docNonce: nextDocNonce(),
           past: [],
           future: [],
           analysis: active.doc.analysis ?? rebuildAnalysis(active.doc),
           analysisStale: false,
           focusedChunkId: active.doc.chunks[0]?.id ?? null,
           lastEditChunkId: null,
+          lastEditAt: 0,
           lastAiEditChunkId: null,
           flashChunkId: null,
           flashChunkIds: [],
@@ -912,18 +1255,39 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           streamingChunkId: null,
           streamingText: "",
           busyChunks: {},
+          ...ghostReset(s),
         };
       }),
 
+    captureOp: () => {
+      opCounter += 1;
+      const s = get();
+      return { opId: opCounter, tabId: s.activeTabId, docNonce: s.docNonce };
+    },
+    ownsOp: (op) => {
+      const s = get();
+      return s.activeTabId === op.tabId && s.docNonce === op.docNonce;
+    },
+
+    // The Markdown baseline keeps everything but its title line (BUG-019b).
     setTitle: (title) =>
       set((s) => ({
-        doc: { ...s.doc, title, markdownSource: undefined },
+        doc: {
+          ...s.doc,
+          title,
+          markdownSource:
+            s.doc.markdownSource === undefined
+              ? undefined
+              : withMarkdownTitle(s.doc.markdownSource, title),
+        },
         dirty: true,
       })),
 
-    // Switch the current document between "editor" (prose) and "slide" (deck)
-    // views. Both render the SAME chunk model — a slide is just the chunks under
-    // a heading — so this only flips how they're presented; no content migration.
+    // Switch the current document between the "editor", "slide" and
+    // "markdown" views. All render the SAME chunk model, so this only flips
+    // how they're presented: it never sets `dirty` (BUG-019a). Entering
+    // Markdown folds any chunk edits into the source via the merge
+    // serializer, which returns the source byte-for-byte when nothing changed.
     setMode: (mode) => {
       const prevMode = get().doc.mode ?? "editor";
       if (prevMode === mode) return;
@@ -936,7 +1300,6 @@ export const useStore = create<AppState & AppActions>((set, get) => {
               ? documentToMarkdown(s.doc)
               : s.doc.markdownSource,
         },
-        dirty: true,
       }));
       // Slide→Editor didn't preserve your place (SlideEditor already derives
       // the selected slide from focusedChunkId on the way in, so Editor→Slide
@@ -950,12 +1313,12 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     // CodeMirror owns character-level history while focused; the app-level
     // history coalesces one continuous Markdown typing session into one step,
     // matching the existing per-paragraph editor behavior.
-    setMarkdownSource: (source) =>
+    setMarkdownSource: (source, options) =>
       set((state) => {
         if (documentToMarkdown(state.doc) === source) return state;
         const marker = "__markdown__";
         const startNewUndoStep =
-          state.past.length === 0 || state.lastEditChunkId !== marker;
+          options?.newUndoStep || state.past.length === 0 || state.lastEditChunkId !== marker;
         return {
           doc: markdownToDocument(state.doc, source),
           past: startNewUndoStep
@@ -963,7 +1326,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
             : state.past,
           future: [],
           dirty: true,
-          lastEditChunkId: marker,
+          lastEditChunkId: options?.newUndoStep ? "__markdown_preview__" : marker,
           lastAiEditChunkId: null,
           analysis: null,
           analysisStale: true,
@@ -972,10 +1335,20 @@ export const useStore = create<AppState & AppActions>((set, get) => {
 
     // Live typing: coalesce into one undo step per continuous edit session on a
     // chunk. Replaces only the edited chunk object (others keep identity).
-    updateChunkContent: (id, content) =>
+    // A session ends (BUG-002) on a different chunk, an explicit `newUndoStep`
+    // (selection replace / paste / discrete insert — see undoBoundary.ts), or
+    // an idle gap > UNDO_IDLE_MS; `lastEditAt` refreshes on EVERY edit so the
+    // idle window slides and continuous typing stays one step. An IME
+    // composition continuation (`composing`) never splits on idle — the
+    // unconverted kana must not become an undo state of its own.
+    updateChunkContent: (id, content, options) =>
       set((state) => {
+        const now = Date.now();
         const startNewUndoStep =
-          state.past.length === 0 || state.lastEditChunkId !== id;
+          !!options?.newUndoStep ||
+          state.past.length === 0 ||
+          state.lastEditChunkId !== id ||
+          (!options?.composing && now - state.lastEditAt > UNDO_IDLE_MS);
         const past = startNewUndoStep
           ? [...state.past, state.doc].slice(-MAX_HISTORY)
           : state.past;
@@ -987,6 +1360,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           future: [],
           dirty: true,
           lastEditChunkId: id,
+          lastEditAt: now,
           // Manual typing dismisses any pending AI-change highlight.
           lastAiEditChunkId: null,
           analysisStale: true, // edited text → graph is out of date (A3)
@@ -1481,7 +1855,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     // heading's id (null if the chunk doesn't exist).
     splitSlideBefore: (chunkId) => {
       if (!get().doc.chunks.some((c) => c.id === chunkId)) return null;
-      const heading: Chunk = { ...emptyChunk(0, "heading"), content: "New slide" };
+      // The title becomes document content, so it is written in the UI language.
+      const heading: Chunk = { ...emptyChunk(0, "heading"), content: tNow("New slide") };
       heading.metadata = { ...heading.metadata, level: 1 };
       commit((doc) =>
         mapChunks(doc, (cs) => {
@@ -1665,7 +2040,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       // focused by pointing focusedChunkId at a dead id).
       if (!get().doc.chunks.some((c) => c.id === id)) {
         get().notify(
-          "That paragraph no longer exists — re-analyze to refresh the graph.",
+          tNow("That paragraph no longer exists — re-analyze to refresh the graph."),
           "info"
         );
         return;
@@ -1682,7 +2057,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       const hits = [...new Set(ids)].filter((id) => valid.has(id));
       if (hits.length === 0) {
         get().notify(
-          "Those paragraphs no longer exist — re-analyze to refresh the graph.",
+          tNow("Those paragraphs no longer exist — re-analyze to refresh the graph."),
           "info"
         );
         return;
@@ -1721,21 +2096,88 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       }),
 
     // Ghost-text (開発.txt Stage 2, item 2-4). Not per-tab and not routed
-    // through routeTabPatch/undo history: it never touches `doc`, so a
-    // background tab has nothing to reconcile, and there's nothing to
-    // reconstruct on undo/redo either — it's pure ephemeral UI state, like
-    // `flashChunkId`.
+    // through routeTabPatch: the suggestion itself is ephemeral UI state (like
+    // `flashChunkId`) scoped to the active tab + load, and is reset on every
+    // document transition. Only `acceptGhostSuggestion` touches `doc`, as an
+    // ordinary undoable edit.
     startGhostRequest: () => {
       const next = get().ghostRequestId + 1;
       set({ ghostRequestId: next });
       return next;
     },
-    setGhostSuggestion: (chunkId, text, requestId) => {
+    setGhostSuggestion: (ctxOrChunkId, text, requestId) => {
+      const s = get();
       // Discard a result from a superseded request (last-request-wins) — the
-      // guard the spec asks for, mirroring aiActions.ts's
-      // `streamingChunkId === chunkId` / `chunkStillActive` checks.
-      if (requestId !== get().ghostRequestId) return;
-      set({ ghostSuggestion: { chunkId, text } });
+      // guard the spec asks for. Document transitions bump the id too.
+      if (requestId !== s.ghostRequestId) return;
+      const ctx: GhostContext =
+        typeof ctxOrChunkId === "string"
+          ? {
+              chunkId: ctxOrChunkId,
+              prefix: s.doc.chunks.find((c) => c.id === ctxOrChunkId)?.content ?? "",
+              tabId: s.activeTabId,
+              docNonce: s.docNonce,
+            }
+          : ctxOrChunkId;
+      // Never show a suggestion for another tab/load, or for text that has
+      // changed since the request was built (BUG-001a/d).
+      if (ctx.tabId !== s.activeTabId || ctx.docNonce !== s.docNonce) return;
+      const live = s.doc.chunks.find((c) => c.id === ctx.chunkId);
+      if (!live || live.content !== ctx.prefix) return;
+      set({
+        ghostSuggestion: {
+          chunkId: ctx.chunkId,
+          text,
+          prefix: ctx.prefix,
+          tabId: ctx.tabId,
+          docNonce: ctx.docNonce,
+        },
+      });
+    },
+    // Tab-accept (BUG-001a). Validates everything the suggestion was generated
+    // for, then commits prefix + text as a DISCRETE undo step (never merged
+    // into the typing session before or after it), marks the doc dirty and
+    // retires the request id so a late delta can't resurrect it. Logged to
+    // aiOpLog (opId = the current ghost request id).
+    acceptGhostSuggestion: (chunkId) => {
+      const s = get();
+      const g = s.ghostSuggestion;
+      if (!g) return false;
+      const live = s.doc.chunks.find((c) => c.id === chunkId);
+      const reason =
+        g.chunkId !== chunkId || !live
+          ? "chunk-mismatch"
+          : !g.text.trim()
+            ? "empty" // nothing to insert — let Tab fall through
+          : g.tabId !== s.activeTabId
+            ? "tab-changed"
+            : g.docNonce !== s.docNonce
+              ? "doc-changed"
+              : live.content !== g.prefix
+                ? "text-changed"
+                : null;
+      const log = { opId: s.ghostRequestId, action: "ghost", tabId: s.activeTabId, docNonce: s.docNonce, chunkId };
+      if (reason) {
+        set(ghostReset(s));
+        get().logAiOp({ ...log, phase: "discard", reason });
+        return false;
+      }
+      const content = g.prefix + g.text;
+      set((state) => ({
+        doc: mapChunks(state.doc, (chunks) =>
+          chunks.map((c) => (c.id === chunkId ? { ...c, content } : c))
+        ),
+        past: [...state.past, state.doc].slice(-MAX_HISTORY),
+        future: [],
+        dirty: true,
+        // Typing after the accept starts yet another step.
+        lastEditChunkId: null,
+        lastAiEditChunkId: null,
+        analysisStale: true, // edited text → graph is out of date (A3)
+        ...ghostReset(state),
+      }));
+      get().logAiOp({ ...log, phase: "commit" });
+      return true;
     },
     // Bumping `ghostRequestId` here (not just clearing the suggestion) is
     // load-bearing: the backend stream for the request that produced the
@@ -1777,7 +2219,32 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       return head;
     },
 
-    setSettings: (settings) => set({ settings }),
+    // A model issue names the model that failed; once another model is the
+    // active one the issue no longer applies (BUG-013c). Same-model saves
+    // (sidebar width, preview background…) keep it.
+    setSettings: (settings) =>
+      set((s) =>
+        settings.model !== s.settings?.model
+          ? { settings, aiModelIssue: null }
+          : { settings }
+      ),
+    setAiModelIssue: (issue) => set({ aiModelIssue: issue }),
+    logAiOp: (e) =>
+      set((s) => {
+        // Copy whitelisted fields one by one — never spread the input, so a
+        // caller can't smuggle content/keys into the log (MISS-01).
+        const entry: AiOpLogEntry = {
+          ts: Date.now(),
+          opId: e.opId,
+          phase: e.phase,
+          action: e.action,
+          tabId: e.tabId,
+          docNonce: e.docNonce,
+        };
+        if (e.chunkId !== undefined) entry.chunkId = e.chunkId;
+        if (e.reason !== undefined) entry.reason = e.reason;
+        return { aiOpLog: [...s.aiOpLog, entry].slice(-AI_OP_LOG_MAX) };
+      }),
     // See the AppActions doc comment above for the contract. Guarded the same
     // way fileActions.ts's `activeIsPristine` guards "reuse this tab or open a
     // new one" — a blank, untitled, not-yet-dirty single-paragraph editor tab
@@ -1802,19 +2269,89 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       return true;
     },
     setHasApiKey: (has) => set({ hasApiKey: has }),
-    openSettings: () => set({ settingsOpen: true }),
-    closeSettings: () => set({ settingsOpen: false }),
+    openSettings: (focus) =>
+      set({ settingsOpen: true, settingsFocus: focus === "model-catalog" ? focus : null }),
+    closeSettings: () => set({ settingsOpen: false, settingsFocus: null }),
     openDraft: () => set({ draftOpen: true }),
     closeDraft: () => set({ draftOpen: false }),
     openHelp: () => set({ helpOpen: true }),
     closeHelp: () => set({ helpOpen: false }),
     togglePalette: (open) =>
       set((s) => ({ paletteOpen: open ?? !s.paletteOpen })),
+    openFind: (mode, seed) =>
+      set((s) => ({
+        find: {
+          ...s.find,
+          open: true,
+          mode,
+          query: seed ?? s.find.query,
+          current: -1,
+          hit: null,
+          focusNonce: s.find.focusNonce + 1,
+          replacePending: false,
+        },
+      })),
+    closeFind: () => set((s) => ({ find: { ...s.find, open: false, replacePending: false } })),
+    setFind: (patch) =>
+      set((s) => {
+        // Editing a find field ends the "⌘Z undoes the replace" window.
+        const edited = patch.query !== undefined || patch.replacement !== undefined;
+        return { find: { ...s.find, ...(edited ? { replacePending: false } : {}), ...patch } };
+      }),
+    replaceAllInChunks: (query, replacement, opts) => {
+      let count = 0;
+      const results = new Map<string, string>();
+      for (const c of get().doc.chunks) {
+        if (!isSearchableChunk(c)) continue;
+        const r = replaceAll(c.content, query, replacement, opts);
+        if (r.count > 0) {
+          results.set(c.id, r.output);
+          count += r.count;
+        }
+      }
+      if (count === 0) return 0;
+      commit((doc) =>
+        mapChunks(doc, (chunks) =>
+          chunks.map((c) => {
+            const output = results.get(c.id);
+            return output === undefined ? c : { ...c, content: output };
+          })
+        )
+      );
+      return count;
+    },
+    replaceMatchInChunk: (chunkId, from, to, replacement) => {
+      const target = get().doc.chunks.find((c) => c.id === chunkId);
+      if (!target || !isSearchableChunk(target)) return false;
+      if (from < 0 || to < from || to > target.content.length) return false;
+      const content = target.content.slice(0, from) + replacement + target.content.slice(to);
+      commit((doc) =>
+        mapChunks(doc, (chunks) => chunks.map((c) => (c.id === chunkId ? { ...c, content } : c)))
+      );
+      return true;
+    },
+    replaceAllInMarkdown: (query, replacement, opts) => {
+      const r = replaceAll(documentToMarkdown(get().doc), query, replacement, opts);
+      if (r.count > 0) get().setMarkdownSource(r.output, { newUndoStep: true });
+      return r.count;
+    },
     setLastExportReport: (format, warnings) =>
       set({ lastExportReport: { format, warnings, at: Date.now() } }),
 
-    applyAnalysis: (result) =>
+    applyAnalysis: (result, sent) =>
       set((state) => {
+        // state-async-4: what the analysis actually saw. A chunk edited while
+        // Analyze ran keeps a summaryHash of the SENT text, so
+        // staleSummaryChunkIds flags it and refreshStaleSummaries repairs it.
+        const sentDoc = sent ?? state.doc;
+        const sentContent = new Map(sentDoc.chunks.map((c) => [c.id, c.content]));
+        const analyzable = (d: Document) =>
+          d.chunks.filter((c) => c.metadata.chunkType === "text" || c.metadata.chunkType === "heading");
+        const sentText = analyzable(sentDoc);
+        const liveText = analyzable(state.doc);
+        const textChanged =
+          sentText.length !== liveText.length ||
+          sentText.some((c, i) => c.id !== liveText[i].id || c.content !== liveText[i].content);
         // Stamp when this graph was computed — drives the freshness UI
         // ("analyzed 5 min ago" in ChunkAiMenu / NetworkPanel).
         const stamped: AnalysisResult = { ...result, analyzedAt: Date.now() };
@@ -1849,12 +2386,12 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           const fromAnalysis = summaryById[c.id];
           const nextSummary = fromAnalysis ?? c.metadata.summary;
           const summaryChanged = nextSummary !== c.metadata.summary;
-          // The analysis just summarized the chunk's CURRENT content, so
-          // re-stamp the freshness hash even when the summary text happens to
-          // be identical to the previous one.
+          // The analysis summarized the chunk's SENT content, so re-stamp the
+          // freshness hash from that text (even when the summary text happens
+          // to be identical to the previous one).
           const nextHash =
             fromAnalysis !== undefined
-              ? hashContent(c.content)
+              ? hashContent(sentContent.get(c.id) ?? c.content)
               : c.metadata.summaryHash;
           const hashChanged = nextHash !== c.metadata.summaryHash;
           if (!linksChanged && !summaryChanged && !hashChanged) return c;
@@ -1868,6 +2405,22 @@ export const useStore = create<AppState & AppActions>((set, get) => {
             },
           };
         });
+        // BUG-015a: an empty result on a never-analyzed doc that changed no
+        // chunk records nothing — keep it in memory only (the panel can say
+        // "no relations") without dirtying the doc or burning an undo step.
+        // A graph rebuilt from persisted links counts as a previous analysis,
+        // so clearing it stays a real, undoable change.
+        // An EMPTY graph (e.g. from a previous no-op press) is not a previous
+        // analysis, so a second press stays a no-op too.
+        const hasGraph = (a: AnalysisResult | null | undefined) =>
+          !!a && (a.nodes.length > 0 || a.edges.length > 0);
+        const nothingToRecord =
+          result.nodes.length === 0 &&
+          result.edges.length === 0 &&
+          !hasGraph(state.analysis) &&
+          !hasGraph(state.doc.analysis) &&
+          chunks.every((c, i) => c === state.doc.chunks[i]);
+        if (nothingToRecord) return { analysis: stamped, analysisStale: textChanged };
         return {
           // Persist the full graph on the document so it survives save/reopen
           // (single source of truth; also keep linkedChunks for the §5 model).
@@ -1877,8 +2430,9 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           past: [...state.past, state.doc].slice(-MAX_HISTORY),
           dirty: true,
           future: [],
-          // …and the freshly-built graph matches the document (A3).
-          analysisStale: false,
+          // …and the freshly-built graph matches the document (A3) — unless
+          // the text moved on while the analysis ran (state-async-4).
+          analysisStale: textChanged || structurallyStale({ ...state.doc, chunks, analysis: stamped }),
         };
       }),
 
@@ -1895,8 +2449,13 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     setMarkdownZoom: (zoom) =>
       set(() => {
         if (!Number.isFinite(zoom)) return {};
-        return { markdownZoom: Math.round(Math.min(2.5, Math.max(0.6, zoom)) * 100) / 100 };
+        return {
+          markdownZoom: Math.round(Math.min(PREVIEW_ZOOM_MAX, Math.max(PREVIEW_ZOOM_MIN, zoom)) * 100) / 100,
+        };
       }),
+
+    setMarkdownOffsetX: (offset) =>
+      set(() => (Number.isFinite(offset) ? { markdownOffsetX: Math.round(offset) } : {})),
 
     toggleReviewPanel: (open) =>
       set((s) => {
@@ -1913,7 +2472,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     toggleDiffPanel: (open) =>
       set((s) => ({ diffPanelOpen: open ?? !s.diffPanelOpen })),
 
-    // Fullscreen presentation overlay (item 1-3) — plain open/close (not a
+    // Window-filling presentation overlay (item 1-3) — plain open/close (not a
     // toggle) so the palette entry and the Slide editor's Present button both
     // read as an unambiguous "start"/"stop", matching openSettings/closeSettings.
     openPresentation: () => set({ presentationOpen: true }),
@@ -2056,7 +2615,9 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           doc: previous,
           past,
           future: [state.doc, ...state.future].slice(0, MAX_HISTORY),
-          dirty: true,
+          // Back at the saved state → clean again (MISS-12); an unsaved
+          // baseline (AI draft, repaired file) stays dirty.
+          dirty: !(state.savedDocIsClean && sameDocument(previous, state.savedDoc)),
           lastEditChunkId: null,
           // Re-derive the graph for the restored doc so NetworkPanel + the saved
           // .aix don't keep showing the pre-undo relationships (B4); recompute the
@@ -2074,7 +2635,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           doc: next,
           past: [...state.past, state.doc].slice(-MAX_HISTORY),
           future: rest,
-          dirty: true,
+          dirty: !(state.savedDocIsClean && sameDocument(next, state.savedDoc)),
           lastEditChunkId: null,
           analysis: next.analysis ?? rebuildAnalysis(next),
           analysisStale: structurallyStale(next),
@@ -2085,12 +2646,45 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       set((s) => ({
         dirty: false,
         filePath: filePath === undefined ? s.filePath : filePath,
-        // The just-saved document IS the new baseline (item 1-2). Both
-        // saveNative and saveNativeAs pass the EXACT doc they wrote (captured
-        // before the async IPC call) so a keystroke landing during the write
-        // can never be silently promoted into the baseline — see the
-        // `savedDocument` param doc for why `s.doc` here would be unsafe.
+        // The just-saved document IS the new baseline (item 1-2). Callers pass
+        // the EXACT doc they wrote so a keystroke can never be silently
+        // promoted into the baseline — see the `savedDocument` param doc. (The
+        // async save paths use markTabClean, state-async-3.)
         savedDoc: savedDocument ?? s.doc,
+        savedDocIsClean: true,
+        // A save ends the typing session, so undo can land exactly on the
+        // saved state (MISS-12) instead of jumping past it.
+        lastEditChunkId: null,
       })),
+
+    markTabClean: (tabId, docNonce, filePath, savedDocument) => {
+      const s = get();
+      const patchFor = (live: Document, path: string | null) => ({
+        dirty: !sameDocument(live, savedDocument),
+        filePath: filePath === undefined ? path : filePath,
+        savedDoc: savedDocument,
+        savedDocIsClean: true,
+        lastEditChunkId: null,
+      });
+      if (tabId === s.activeTabId) {
+        if (s.docNonce !== docNonce) return false;
+        set(patchFor(s.doc, s.filePath));
+        return true;
+      }
+      const snap = s.inactiveTabs[tabId];
+      if (!snap || snap.docNonce !== docNonce) return false;
+      set({ inactiveTabs: { ...s.inactiveTabs, [tabId]: { ...snap, ...patchFor(snap.doc, snap.filePath) } } });
+      return true;
+    },
   };
 });
+
+/** Module-level form of `captureOp` for aiActions/fileActions (BUG-001b). */
+export function captureOp(): OpTicket {
+  return useStore.getState().captureOp();
+}
+
+/** Module-level form of `ownsOp`: same tab active AND same document load. */
+export function ownsOp(op: OpTicket): boolean {
+  return useStore.getState().ownsOp(op);
+}

@@ -6,10 +6,25 @@
 //! slide-master placeholder inheritance — the simplest robust path, and the
 //! text stays editable. Geometry is computed in code (EMU); the layout template
 //! is chosen upstream in `deck::document_to_deck`.
+//!
+//! Slide BODY text (prose chunks, detached `slideBody` lines, and the section
+//! layout's subtitle fallback) is converted from Markdown by `slidetext` (the
+//! golden-locked twin of the preview's `slideText.ts`): list items become
+//! separate paragraphs (level → `lvl`/indent, numbered label as text), fences
+//! become monospace lines without a bullet, inline bold/italic/code become run
+//! properties, and soft breaks become `<a:br/>`. http(s)/mailto links get a
+//! per-slide external hyperlink relationship (`rIdL1`, `rIdL2`, … — a separate
+//! id namespace from the layout/image/notes `rIdN` ids); any other link target
+//! is exported as plain text and counted in a warning. Slide titles and
+//! explicit subtitle chunks are still written verbatim (Markdown there is
+//! planned).
 
 use crate::error::{AppError, AppResult};
 use crate::imageio::{decode_image, fit, image_ext};
 use crate::models::{Chunk, Deck, Slide, CHUNK_TYPE_TEXT};
+use crate::slidetext::{
+    chunk_to_paragraphs, is_clickable_href, paragraph_lines, visible_text, ParaKind, Run, SlidePara,
+};
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -118,7 +133,7 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
 
     let mut media_counter = 0usize;
     for (i, slide) in deck.slides.iter().enumerate() {
-        let (sp_tree, images) = build_slide(slide, &mut media_counter, &mut stats);
+        let (sp_tree, images, links) = build_slide(slide, &mut media_counter, &mut stats);
         let n1 = i + 1;
         let has_notes = !slide.notes.trim().is_empty();
         add(
@@ -129,7 +144,7 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
         add(
             &mut zip,
             &format!("ppt/slides/_rels/slide{n1}.xml.rels"),
-            slide_rels(&images, has_notes.then_some(n1)).as_bytes(),
+            slide_rels(&images, has_notes.then_some(n1), &links.targets).as_bytes(),
         )?;
         for img in &images {
             add(&mut zip, &format!("ppt/media/{}", img.file), &img.bytes)?;
@@ -158,6 +173,12 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
             stats.fetch_failed
         ));
     }
+    if stats.local_unresolved > 0 {
+        warnings.push(format!(
+            "{} local image(s) couldn't be read from the document's folder and were left out.",
+            stats.local_unresolved
+        ));
+    }
     if stats.unsupported_format > 0 {
         warnings.push(format!(
             "{} image(s) use a format PowerPoint can't embed (e.g. WEBP or SVG) and were left out.",
@@ -180,6 +201,12 @@ pub fn deck_to_pptx(deck: &Deck) -> AppResult<(Vec<u8>, Vec<String>)> {
         warnings.push(format!(
             "{} slide(s) have more text than fits and may be cut off — consider splitting them.",
             stats.overflow_slides
+        ));
+    }
+    if stats.unlinked_links > 0 {
+        warnings.push(format!(
+            "{} link(s) don't point to a web or mail address and were exported as plain text.",
+            stats.unlinked_links
         ));
     }
     if diagrams > 0 {
@@ -205,6 +232,11 @@ struct ExportStats {
     /// Image chunks whose bytes couldn't be decoded (e.g. a remote fetch failed
     /// and the content was cleared).
     fetch_failed: usize,
+    /// Image chunks still holding a local file reference (a document-relative
+    /// path or `file:` URL) — the GUI inlines readable ones before export
+    /// (fileActions `withEmbeddedLocalImages`), the CLI via
+    /// `imageio::embed_local_images`; the MCP export resolves none (planned).
+    local_unresolved: usize,
     /// Image chunks in a format PowerPoint can't embed (WEBP/SVG/unknown).
     unsupported_format: usize,
     /// Visuals dropped because the slide already showed `MAX_VISUALS` of them.
@@ -213,6 +245,55 @@ struct ExportStats {
     layout_dropped: usize,
     /// Slides whose estimated bullet text likely overflows the body box.
     overflow_slides: usize,
+    /// Markdown links whose target isn't http(s)/mailto, written as plain text.
+    unlinked_links: usize,
+}
+
+/// A slide's external hyperlink targets, in first-use order; target `k`
+/// (0-based) is relationship `rIdL{k+1}` in the slide's .rels.
+#[derive(Default)]
+struct SlideLinks {
+    targets: Vec<String>,
+}
+
+impl SlideLinks {
+    fn rid_for(&mut self, href: &str) -> String {
+        let k = match self.targets.iter().position(|t| t == href) {
+            Some(k) => k,
+            None => {
+                self.targets.push(href.to_string());
+                self.targets.len() - 1
+            }
+        };
+        format!("rIdL{}", k + 1)
+    }
+}
+
+/// An undecodable image payload that is a local file reference rather than
+/// inline data or a remote URL. Mirrors `resolveImageSource` in
+/// src/localImages.ts: a `file:` URL is local; any OTHER explicit scheme
+/// (`http:`, `https:`, `data:`, ...) is not. A scheme-less payload is local
+/// when it has no `base64,` marker and contains a `.` (never in base64 — a
+/// file extension) or a `\`. `/` alone is NOT a signal: bare base64 has it.
+pub(crate) fn looks_like_local_path(payload: &str) -> bool {
+    let p = payload.trim();
+    if p.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("file:")) {
+        return true;
+    }
+    if has_url_scheme(p) {
+        return false;
+    }
+    !p.contains("base64,") && (p.contains('.') || p.contains('\\'))
+}
+
+/// `^[a-z][a-z0-9+.-]*:` (case-insensitive) — an explicit URL scheme.
+fn has_url_scheme(s: &str) -> bool {
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    let mut chars = s[..colon].chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
 }
 
 fn is_text(c: &Chunk) -> bool {
@@ -227,13 +308,45 @@ fn has_rendered_image(c: &Chunk) -> bool {
         .is_some_and(|r| !r.trim().is_empty())
 }
 
+/// The slide's lead chunk: its heading, else its first chunk. Rust twin of TS
+/// `slideLead` (src/slides.ts) — where slide-level overrides live.
+fn slide_lead(slide: &Slide) -> Option<&Chunk> {
+    slide.chunks.iter().find(|c| c.is_heading()).or_else(|| slide.chunks.first())
+}
+
+/// The slide body as converted paragraphs (BUG-020). Mirrors TS
+/// `slideParagraphs` / `slideBullets` (src/slides.ts): the LEAD chunk's
+/// `slideBody` lines when it has them (a detached slide; read from `slide_lead`
+/// only, like TS `slideLead`, so a stray `slide_body` on any other chunk is
+/// ignored — independent of deck.rs's normalisation), else every non-subtitle
+/// text chunk — each trimmed, blanks skipped — through `chunk_to_paragraphs`.
+fn body_paragraphs(slide: &Slide) -> Vec<SlidePara> {
+    // Req 2: a "detached" slide renders its own `slideBody` lines (a summary /
+    // custom content) instead of the linked editor paragraphs.
+    let sources: Vec<&str> = match slide_lead(slide).and_then(|c| c.metadata.slide_body.as_ref()) {
+        Some(body) => body.iter().map(|b| b.trim()).collect(),
+        None => slide
+            .chunks
+            .iter()
+            .filter(|c| is_text(c) && !c.is_subtitle())
+            .map(|c| c.content.trim())
+            .collect(),
+    };
+    sources
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .flat_map(chunk_to_paragraphs)
+        .collect()
+}
+
 fn build_slide(
     slide: &Slide,
     media_counter: &mut usize,
     stats: &mut ExportStats,
-) -> (String, Vec<SlideImage>) {
+) -> (String, Vec<SlideImage>, SlideLinks) {
     let mut shapes = String::new();
     let mut images = Vec::new();
+    let mut links = SlideLinks::default();
     let mut sid: u32 = 2; // shape id 1 is the group
 
     let heading = slide
@@ -247,19 +360,7 @@ fn build_slide(
         .iter()
         .find(|c| c.is_subtitle())
         .map(|c| c.content.clone());
-    // Req 2: a "detached" slide renders its own `slideBody` lines (a summary /
-    // custom content) instead of the linked editor paragraphs.
-    let slide_body: Option<Vec<String>> =
-        slide.chunks.iter().find_map(|c| c.metadata.slide_body.clone());
-    let bullet_texts: Vec<String> = match &slide_body {
-        Some(body) => body.clone(),
-        None => slide
-            .chunks
-            .iter()
-            .filter(|c| is_text(c) && !c.is_subtitle())
-            .map(|c| c.content.clone())
-            .collect(),
-    };
+    let paras = body_paragraphs(slide);
     // The slide's "visuals": image chunks with non-empty content, plus diagram
     // chunks carrying a rendered snapshot (`renderedImage`, injected by the
     // frontend at export time), ordered by (slot ?? MAX) then document order
@@ -319,29 +420,26 @@ fn build_slide(
         // bullets a line of THEIR box; it costs them a share of the height.
         let base_avail = SLIDE_H - BODY_Y - MARGIN;
         let max_lines = ((base_max_lines as i64) * content_avail_h / base_avail).max(1) as usize;
-        let lines: usize = bullet_texts
-            .iter()
-            .map(|t| {
-                let n = t.trim().chars().count();
-                if n == 0 {
-                    1
-                } else {
-                    n.div_ceil(cpl)
-                }
-            })
-            .sum();
-        if lines > max_lines {
+        // Visible text of the converted paragraphs (markers and link URLs
+        // never count) — the same `paragraph_lines` the rail badge uses.
+        if paragraph_lines(&paras, cpl) > max_lines {
             stats.overflow_slides += 1;
         }
     }
 
-    let bullets_only: String = bullet_texts.iter().map(|t| bullet_para(t)).collect();
+    // Section slides have no Body shape: only their subtitle fallback is
+    // written, so the body must not register links or count warnings here.
+    let bullets_only: String = if slide.layout == "section" {
+        String::new()
+    } else {
+        paras.iter().map(|p| para_xml(p, &mut links, stats)).collect()
+    };
 
     match slide.layout.as_str() {
         "section" => {
             let title = heading
                 .clone()
-                .unwrap_or_else(|| bullet_texts.first().cloned().unwrap_or_default());
+                .unwrap_or_else(|| paras.first().map(visible_text).unwrap_or_default());
             shapes.push_str(&text_box(
                 sid,
                 "Title",
@@ -352,8 +450,13 @@ fn build_slide(
                 &title_para(&title),
             ));
             sid += 1;
-            // Explicit subtitle wins; else the first bullet (positional fallback).
-            let sub = subtitle_text.clone().or_else(|| bullet_texts.first().cloned());
+            // Explicit subtitle wins; else the first body paragraph
+            // (positional fallback), converted like the preview renders it.
+            let sub = match (&subtitle_text, paras.first()) {
+                (Some(text), _) => Some(subtitle_para(text)),
+                (None, Some(first)) => Some(subtitle_runs_para(first, &mut links, stats)),
+                (None, None) => None,
+            };
             if let Some(sub) = sub {
                 shapes.push_str(&text_box(
                     sid,
@@ -362,7 +465,7 @@ fn build_slide(
                     SLIDE_H / 2 + 50_000,
                     SLIDE_W - 2 * MARGIN,
                     900_000,
-                    &subtitle_para(&sub),
+                    &sub,
                 ));
             }
         }
@@ -490,7 +593,7 @@ fn build_slide(
     let sp_tree = format!(
         r#"<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>{shapes}"#
     );
-    (sp_tree, images)
+    (sp_tree, images, links)
 }
 
 /// An EMU box (position + size) — groups the 4 geometry args that every
@@ -567,7 +670,11 @@ fn embed_visuals(
     let mut images: Vec<SlideImage> = Vec::new();
     for (idx, (_chunk, payload)) in visuals.iter().take(MAX_VISUALS).enumerate() {
         let Some(bytes) = decode_image(payload) else {
-            stats.fetch_failed += 1;
+            if looks_like_local_path(payload) {
+                stats.local_unresolved += 1;
+            } else {
+                stats.fetch_failed += 1;
+            }
             continue;
         };
         let Some((ext, _kind)) = image_ext(&bytes) else {
@@ -651,16 +758,126 @@ fn subtitle_para(text: &str) -> String {
     )
 }
 
-fn bullet_para(text: &str) -> String {
-    // Blank paragraphs render as an empty bullet; collapse to a spacer instead.
-    let t = text.trim();
-    if t.is_empty() {
-        return r#"<a:p><a:pPr/><a:endParaRPr lang="en-US"/></a:p>"#.to_string();
+/// Extra left margin per list/quote nesting level (there is no master list
+/// style, so `lvl` alone wouldn't indent).
+const LEVEL_INDENT: i64 = 457_200;
+/// Monospace face for code paragraphs and code runs.
+const CODE_FONT: &str = "Menlo";
+
+/// How a paragraph's runs are drawn, on top of each run's own flags.
+#[derive(Clone, Copy)]
+struct RunStyle {
+    sz: u32,
+    mono: bool,
+    italic: bool,
+    /// A theme color for non-link text (`tx2` for quotes and subtitles).
+    color: Option<&'static str>,
+}
+
+/// One `SlidePara` → one `<a:p>`. Bullets keep the `•` glyph; numbered items
+/// show their label as text (no auto-numbering); code/plain have no bullet and
+/// no indent; quotes are indented, italic and `tx2`. Empty paragraphs (a blank
+/// code line) keep their line via `endParaRPr`.
+fn para_xml(p: &SlidePara, links: &mut SlideLinks, stats: &mut ExportStats) -> String {
+    let level = p.level as i64;
+    let lvl = if p.level > 0 { format!(r#" lvl="{}""#, p.level) } else { String::new() };
+    let mar_l = 285_750 + level * LEVEL_INDENT;
+    let (ppr, style) = match p.kind {
+        ParaKind::Bullet => (
+            format!(r#"<a:pPr marL="{mar_l}"{lvl} indent="-285750"><a:buFont typeface="Arial"/><a:buChar char="&#8226;"/></a:pPr>"#),
+            RunStyle { sz: 1800, mono: false, italic: false, color: None },
+        ),
+        ParaKind::Numbered => (
+            format!(r#"<a:pPr marL="{mar_l}"{lvl} indent="-285750"><a:buNone/></a:pPr>"#),
+            RunStyle { sz: 1800, mono: false, italic: false, color: None },
+        ),
+        ParaKind::Quote => (
+            format!(r#"<a:pPr marL="{mar_l}"{lvl} indent="0"><a:buNone/></a:pPr>"#),
+            RunStyle { sz: 1800, mono: false, italic: true, color: Some("tx2") },
+        ),
+        ParaKind::Code => (
+            r#"<a:pPr marL="0" indent="0"><a:buNone/></a:pPr>"#.to_string(),
+            RunStyle { sz: 1600, mono: true, italic: false, color: None },
+        ),
+        ParaKind::Plain => (
+            r#"<a:pPr marL="0" indent="0"><a:buNone/></a:pPr>"#.to_string(),
+            RunStyle { sz: 1800, mono: false, italic: false, color: None },
+        ),
+    };
+    let mut body = String::new();
+    if let Some(label) = &p.label {
+        let label_run = Run { text: format!("{label} "), bold: false, italic: false, code: false, href: None };
+        body.push_str(&runs_xml(std::slice::from_ref(&label_run), style, links, stats));
     }
-    format!(
-        r#"<a:p><a:pPr marL="285750" indent="-285750"><a:buFont typeface="Arial"/><a:buChar char="&#8226;"/></a:pPr><a:r><a:rPr lang="en-US" sz="1800" dirty="0"/><a:t>{}</a:t></a:r></a:p>"#,
-        esc(t)
-    )
+    body.push_str(&runs_xml(&p.runs, style, links, stats));
+    if body.is_empty() {
+        return format!(r#"<a:p>{ppr}<a:endParaRPr lang="en-US" sz="{}"/></a:p>"#, style.sz);
+    }
+    format!("<a:p>{ppr}{body}</a:p>")
+}
+
+/// The section layout's subtitle fallback: the first body paragraph's runs in
+/// subtitle styling (no bullet).
+fn subtitle_runs_para(p: &SlidePara, links: &mut SlideLinks, stats: &mut ExportStats) -> String {
+    let style = RunStyle { sz: 2000, mono: p.kind == ParaKind::Code, italic: false, color: Some("tx2") };
+    format!("<a:p><a:pPr/>{}</a:p>", runs_xml(&p.runs, style, links, stats))
+}
+
+/// Runs → `<a:r>` elements. A `\n` inside run text becomes `<a:br/>`. Child
+/// order inside `<a:rPr>` is schema-enforced: solidFill, latin, hlinkClick.
+fn runs_xml(runs: &[Run], style: RunStyle, links: &mut SlideLinks, stats: &mut ExportStats) -> String {
+    let mut out = String::new();
+    let mut prev_href: Option<&str> = None;
+    for run in runs {
+        let rid = match run.href.as_deref() {
+            Some(href) if is_clickable_href(href) => Some(links.rid_for(&href.replace(' ', "%20"))),
+            Some(href) => {
+                // Count each unclickable link once, not once per styled run.
+                if prev_href != Some(href) {
+                    stats.unlinked_links += 1;
+                }
+                None
+            }
+            None => None,
+        };
+        prev_href = run.href.as_deref();
+        let mut attrs = format!(r#" lang="en-US" sz="{}""#, style.sz);
+        if run.bold {
+            attrs.push_str(r#" b="1""#);
+        }
+        if run.italic || style.italic {
+            attrs.push_str(r#" i="1""#);
+        }
+        if rid.is_some() {
+            attrs.push_str(r#" u="sng""#);
+        }
+        let mut children = String::new();
+        if rid.is_some() {
+            children.push_str(r#"<a:solidFill><a:schemeClr val="hlink"/></a:solidFill>"#);
+        } else if let Some(color) = style.color {
+            children.push_str(&format!(r#"<a:solidFill><a:schemeClr val="{color}"/></a:solidFill>"#));
+        }
+        if run.code || style.mono {
+            children.push_str(&format!(r#"<a:latin typeface="{CODE_FONT}"/>"#));
+        }
+        if let Some(rid) = &rid {
+            children.push_str(&format!(r#"<a:hlinkClick r:id="{rid}"/>"#));
+        }
+        let rpr = if children.is_empty() {
+            format!(r#"<a:rPr{attrs} dirty="0"/>"#)
+        } else {
+            format!(r#"<a:rPr{attrs} dirty="0">{children}</a:rPr>"#)
+        };
+        for (k, seg) in run.text.split('\n').enumerate() {
+            if k > 0 {
+                out.push_str("<a:br/>");
+            }
+            if !seg.is_empty() {
+                out.push_str(&format!("<a:r>{rpr}<a:t>{}</a:t></a:r>", esc(seg)));
+            }
+        }
+    }
+    out
 }
 
 fn title_box(id: u32, text: &str) -> String {
@@ -706,7 +923,9 @@ fn slide_xml(sp_tree: &str) -> String {
 /// `notes_slide_num`: `Some(n1)` when this slide has a `ppt/notesSlides/notesSlideN1.xml`
 /// part to link to (its own 1-based slide number — notesSlides are numbered to
 /// match their owning slide, so N1 == the slide's own number), `None` when it has none.
-fn slide_rels(images: &[SlideImage], notes_slide_num: Option<usize>) -> String {
+/// `links`: external hyperlink targets; target `k` becomes `rIdL{k+1}` (see
+/// `SlideLinks`), a namespace that can't collide with the layout/image/notes ids.
+fn slide_rels(images: &[SlideImage], notes_slide_num: Option<usize>, links: &[String]) -> String {
     let mut rels = String::from(
         r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>"#,
     );
@@ -723,6 +942,13 @@ fn slide_rels(images: &[SlideImage], notes_slide_num: Option<usize>) -> String {
         let rid = format!("rId{}", 2 + images.len());
         rels.push_str(&format!(
             r#"<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/>"#
+        ));
+    }
+    for (k, target) in links.iter().enumerate() {
+        rels.push_str(&format!(
+            r#"<Relationship Id="rIdL{n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{target}" TargetMode="External"/>"#,
+            n = k + 1,
+            target = esc(target)
         ));
     }
     format!(
@@ -995,6 +1221,81 @@ mod tests {
     }
 
     #[test]
+    fn relative_path_image_reports_local_not_download() {
+        // G11: an unresolved document-relative figure (what the CLI sees, or
+        // the GUI when the file couldn't be read) is a LOCAL image that
+        // couldn't be read — never a failed download.
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Pic"));
+        doc.chunks.push(Chunk::new_text(1, "a bullet"));
+        doc.chunks.push(image_chunk(2, "figures/x.png".to_string()));
+        doc.chunks.push(Chunk::new_heading(3, 1, "Pic 2"));
+        doc.chunks.push(image_chunk(4, "file:///Users/me/fig%201.jpg".to_string()));
+        let deck = document_to_deck(&doc);
+        assert_eq!(deck.slides[0].layout, "title-image");
+        let (_bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        let local: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.starts_with("2 local image(s)"))
+            .collect();
+        assert_eq!(
+            local,
+            vec!["2 local image(s) couldn't be read from the document's folder and were left out."],
+            "warnings: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("couldn't be downloaded")),
+            "a local path is not a download: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_remote_or_scheme_payloads_are_not_local_images() {
+        // A remote URL that reached the writer unresolved (deck_to_pptx called
+        // without resolve_remote_images, or an upper-case scheme the resolver
+        // skips) and a non-base64 data: URL contain '.', but are not local
+        // files — only a `file:` scheme or a scheme-less path is.
+        for payload in [
+            "https://e.x/i.png",
+            "HTTPS://e.x/i.png",
+            "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>",
+        ] {
+            let mut doc = Document::new("D");
+            doc.chunks.push(Chunk::new_heading(0, 1, "Pic"));
+            doc.chunks.push(image_chunk(1, payload.to_string()));
+            let deck = document_to_deck(&doc);
+            let (_bytes, warnings) = deck_to_pptx(&deck).expect("build");
+            assert!(
+                !warnings.iter().any(|w| w.contains("local image")),
+                "{payload}: {warnings:?}"
+            );
+            assert!(
+                warnings.iter().any(|w| w.starts_with("1 image(s) couldn't be downloaded")),
+                "{payload}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_inline_image_still_reports_a_failed_image_not_a_local_one() {
+        // Bare base64 also contains '/', so '/' alone must not classify a
+        // payload as a local path.
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "Pic"));
+        doc.chunks.push(image_chunk(1, "ab/c=*not-base64".to_string()));
+        let deck = document_to_deck(&doc);
+        let (_bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert!(
+            !warnings.iter().any(|w| w.contains("local image")),
+            "warnings: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("1 image(s) couldn't be downloaded")),
+            "warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn webp_image_warns_and_is_not_embedded() {
         let webp = [0x52u8, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50, 0, 0];
         let mut doc = Document::new("D");
@@ -1209,6 +1510,49 @@ mod tests {
         let xml = slide1_xml(&doc);
         assert!(xml.contains("Summary one") && xml.contains("Summary two"), "slideBody missing: {xml}");
         assert!(!xml.contains("original prose"), "prose should be ignored when detached: {xml}");
+    }
+
+    /// The plain text of each body paragraph (runs concatenated).
+    fn body_texts(slide: &Slide) -> Vec<String> {
+        body_paragraphs(slide)
+            .iter()
+            .map(|p| p.runs.iter().map(|r| r.text.as_str()).collect())
+            .collect()
+    }
+
+    // TS `slideBullets` reads `slideBody` from `slideLead` (heading, else the
+    // first chunk) only. Slides are built directly here, bypassing
+    // deck::document_to_deck's normalisation, so a stray `slide_body` on a
+    // non-lead chunk is actually present.
+    #[test]
+    fn body_paragraphs_reads_slide_body_from_the_lead_chunk_only() {
+        // Heading without slide_body + a text chunk carrying a stray one → prose.
+        let mut s = Slide::new(0, "title-content");
+        s.chunks.push(Chunk::new_heading(0, 1, "Topic"));
+        let mut t = Chunk::new_text(1, "linked prose");
+        t.metadata.slide_body = Some(vec!["stray body".into()]);
+        s.chunks.push(t);
+        assert_eq!(body_texts(&s), vec!["linked prose"]);
+
+        // The heading is the lead even when it isn't the first chunk.
+        let mut s = Slide::new(0, "title-content");
+        let mut t = Chunk::new_text(0, "prose");
+        t.metadata.slide_body = Some(vec!["stray".into()]);
+        s.chunks.push(t);
+        let mut h = Chunk::new_heading(1, 1, "Topic");
+        h.metadata.slide_body = Some(vec!["  Lead body  ".into(), "  ".into()]);
+        s.chunks.push(h);
+        assert_eq!(body_texts(&s), vec!["Lead body"]);
+
+        // A heading-less slide: its first chunk is the lead.
+        let mut s = Slide::new(0, "title-content");
+        let mut first = Chunk::new_text(0, "first");
+        first.metadata.slide_body = Some(vec!["要約 1".into()]);
+        s.chunks.push(first);
+        let mut second = Chunk::new_text(1, "second");
+        second.metadata.slide_body = Some(vec!["ignored".into()]);
+        s.chunks.push(second);
+        assert_eq!(body_texts(&s), vec!["要約 1"]);
     }
 
     #[test]
@@ -1430,6 +1774,42 @@ mod tests {
 
     // ----- speaker notes: notesSlide export -----
 
+    /// The `<a:t>` texts inside the notes part's "Notes Placeholder" `<p:sp>`
+    /// only (scoped extraction, not a whole-part contains()).
+    fn notes_placeholder_texts(notes_xml: &str) -> Vec<String> {
+        let sp = notes_xml
+            .split("<p:sp>")
+            .skip(1)
+            .find(|sp| sp.contains(r#"name="Notes Placeholder""#))
+            .and_then(|sp| sp.split("</p:sp>").next())
+            .expect("a Notes Placeholder shape");
+        sp.split("<a:t>")
+            .skip(1)
+            .filter_map(|s| s.split("</a:t>").next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn leading_slide_notes_emit_notes_slide() {
+        // BUG-007: the doc-title-derived first slide (no heading chunk) carries
+        // the notes set on its lead chunk into notesSlide1.
+        let mut doc = Document::new("連動テスト文書");
+        let mut t = Chunk::new_text(0, "本文");
+        t.metadata.notes = Some("N".to_string());
+        doc.chunks.push(t);
+        let deck = document_to_deck(&doc);
+        let (bytes, _warnings) = deck_to_pptx(&deck).expect("build");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        use std::io::Read as _;
+        let mut notes_xml = String::new();
+        zip.by_name("ppt/notesSlides/notesSlide1.xml")
+            .expect("notesSlide1.xml part")
+            .read_to_string(&mut notes_xml)
+            .unwrap();
+        assert_eq!(notes_placeholder_texts(&notes_xml), vec!["N".to_string()]);
+    }
+
     #[test]
     fn slide_with_notes_gets_a_notes_slide_part_containing_its_text() {
         let mut doc = Document::new("D");
@@ -1588,5 +1968,226 @@ mod tests {
             .collect();
         assert!(!names.iter().any(|n| n == "ppt/notesSlides/notesSlide1.xml"));
         assert!(names.iter().any(|n| n == "ppt/notesSlides/notesSlide2.xml"));
+    }
+
+    // ----- BUG-020: Markdown in slide bodies becomes paragraphs and runs -----
+    // Every assertion is scoped to ONE shape's <a:p> elements (testing rule 2):
+    // the Title/Subtitle boxes can never satisfy a Body assertion.
+
+    /// The `<a:p>…</a:p>` elements of the shape named `name`, in order.
+    fn shape_paras(xml: &str, name: &str) -> Vec<String> {
+        shape_xml(xml, name)
+            .split("<a:p>")
+            .skip(1)
+            .map(|p| p.split("</a:p>").next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The `<a:t>` texts of one paragraph.
+    fn para_texts(p: &str) -> Vec<String> {
+        p.split("<a:t>")
+            .skip(1)
+            .filter_map(|s| s.split("</a:t>").next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The `<a:r>` element whose `<a:t>` is exactly `text`.
+    fn run_with_text<'a>(p: &'a str, text: &str) -> &'a str {
+        p.split("<a:r>")
+            .skip(1)
+            .map(|r| r.split("</a:r>").next().unwrap_or_default())
+            .find(|r| r.contains(&format!("<a:t>{text}</a:t>")))
+            .unwrap_or_else(|| panic!("no run with text {text:?} in {p}"))
+    }
+
+    fn deck_parts(doc: &Document) -> (String, String, Vec<String>) {
+        use std::io::Read;
+        let deck = document_to_deck(doc);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let mut xml = String::new();
+        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        let mut rels = String::new();
+        zip.by_name("ppt/slides/_rels/slide1.xml.rels").unwrap().read_to_string(&mut rels).unwrap();
+        (xml, rels, warnings)
+    }
+
+    fn one_text_slide(text: &str) -> Document {
+        let mut doc = Document::new("D");
+        doc.chunks.push(Chunk::new_heading(0, 1, "第1節"));
+        doc.chunks.push(Chunk::new_text(1, text));
+        doc
+    }
+
+    #[test]
+    fn markdown_bullets_become_runs() {
+        let (xml, _rels, _w) =
+            deck_parts(&one_text_slide("最初の段落。**太字**と[リンク](https://example.com)。"));
+        let paras = shape_paras(&xml, "Body");
+        assert_eq!(paras.len(), 1, "one prose paragraph: {paras:?}");
+        assert_eq!(para_texts(&paras[0]), vec!["最初の段落。", "太字", "と", "リンク", "。"]);
+        let bold = run_with_text(&paras[0], "太字");
+        assert!(bold.contains(r#" b="1""#), "bold run lacks b=1: {bold}");
+        let plain = run_with_text(&paras[0], "と");
+        assert!(!plain.contains(r#" b="1""#), "neighbour must not be bold: {plain}");
+        for t in para_texts(&paras[0]) {
+            assert!(!t.contains("**") && !t.contains("]("), "raw Markdown leaked: {t}");
+        }
+    }
+
+    #[test]
+    fn list_chunk_splits_into_paragraphs() {
+        let (xml, _rels, _w) = deck_parts(&one_text_slide("- 項目A\n- 項目B"));
+        let paras = shape_paras(&xml, "Body");
+        assert_eq!(paras.len(), 2, "two bullets: {paras:?}");
+        for (p, want) in paras.iter().zip(["項目A", "項目B"]) {
+            assert!(p.contains(r#"<a:buChar char="&#8226;"/>"#), "bullet glyph missing: {p}");
+            assert_eq!(para_texts(p), vec![want.to_string()]);
+        }
+    }
+
+    #[test]
+    fn nested_and_numbered_items_keep_level_and_label() {
+        let (xml, _rels, _w) = deck_parts(&one_text_slide("1. 一\n   - 子"));
+        let paras = shape_paras(&xml, "Body");
+        assert_eq!(paras.len(), 2, "{paras:?}");
+        assert!(paras[0].contains("<a:buNone/>"), "numbered uses its label, not a glyph: {}", paras[0]);
+        assert_eq!(para_texts(&paras[0]), vec!["1. ", "一"]);
+        assert!(paras[1].contains(r#" lvl="1""#), "nested item keeps its level: {}", paras[1]);
+    }
+
+    #[test]
+    fn fenced_code_is_monospace_without_fences() {
+        let (xml, _rels, _w) = deck_parts(&one_text_slide("```text\nコード行\n```"));
+        let paras = shape_paras(&xml, "Body");
+        assert_eq!(paras.len(), 1, "{paras:?}");
+        assert!(paras[0].contains("<a:buNone/>"), "code has no bullet: {}", paras[0]);
+        let run = run_with_text(&paras[0], "コード行");
+        assert!(run.contains(r#"<a:latin typeface="Menlo"/>"#), "code run not monospace: {run}");
+        for t in para_texts(&paras[0]) {
+            assert!(!t.starts_with("```"), "fence leaked: {t}");
+        }
+    }
+
+    // para_xml doc: an empty paragraph (a blank line inside a fence) keeps its
+    // line via `endParaRPr` at the code size, instead of vanishing.
+    #[test]
+    fn blank_code_line_keeps_its_paragraph() {
+        let (xml, _rels, _w) = deck_parts(&one_text_slide("```text\n一行目\n\n三行目\n```"));
+        let paras = shape_paras(&xml, "Body");
+        assert_eq!(paras.len(), 3, "{paras:?}");
+        assert_eq!(
+            paras[1],
+            r#"<a:pPr marL="0" indent="0"><a:buNone/></a:pPr><a:endParaRPr lang="en-US" sz="1600"/>"#
+        );
+        assert_eq!(para_texts(&paras[0]), vec!["一行目"]);
+        assert_eq!(para_texts(&paras[2]), vec!["三行目"]);
+    }
+
+    #[test]
+    fn soft_break_becomes_a_line_break_inside_one_paragraph() {
+        let (xml, _rels, _w) = deck_parts(&one_text_slide("一行目\n二行目"));
+        let paras = shape_paras(&xml, "Body");
+        assert_eq!(paras.len(), 1, "{paras:?}");
+        assert_eq!(para_texts(&paras[0]), vec!["一行目", "二行目"]);
+        let first = paras[0].find("一行目").unwrap();
+        let second = paras[0].find("二行目").unwrap();
+        assert!(paras[0][first..second].contains("<a:br/>"), "no <a:br/> between lines: {}", paras[0]);
+        for t in para_texts(&paras[0]) {
+            assert!(!t.contains('\n'), "newline inside <a:t>: {t:?}");
+        }
+    }
+
+    #[test]
+    fn hyperlink_gets_an_external_slide_rel_after_images_and_notes() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Links");
+        h.metadata.notes = Some("speaker".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "[リンク](https://example.com/?a=1&b=2) と [別](https://example.com/?a=1&b=2)"));
+        doc.chunks.push(image_chunk(2, data_url("image/png", b"\x89PNG\r\n\x1a\n")));
+        let (xml, rels, warnings) = deck_parts(&doc);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let paras = shape_paras(&xml, "Body");
+        let link = run_with_text(&paras[0], "リンク");
+        assert!(link.contains(r#"<a:hlinkClick r:id="rIdL1"/>"#), "no click target: {link}");
+        assert!(link.contains(r#" u="sng""#), "link not underlined: {link}");
+        // The same URL reuses its relationship.
+        assert!(run_with_text(&paras[0], "別").contains(r#"r:id="rIdL1""#));
+        // rId1 layout, rId2 image, rId3 notes, rIdL1 link: all distinct.
+        let ids: Vec<&str> = rels
+            .split(r#"Id=""#)
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .collect();
+        assert_eq!(ids, vec!["rId1", "rId2", "rId3", "rIdL1"], "rels: {rels}");
+        let link_rel = rels
+            .split("<Relationship ")
+            .find(|r| r.contains(r#"Id="rIdL1""#))
+            .expect("hyperlink rel");
+        assert!(link_rel.contains("relationships/hyperlink"), "{link_rel}");
+        assert!(link_rel.contains(r#"Target="https://example.com/?a=1&amp;b=2""#), "{link_rel}");
+        assert!(link_rel.contains(r#"TargetMode="External""#), "{link_rel}");
+    }
+
+    #[test]
+    fn non_web_link_is_plain_text_and_warned() {
+        let (xml, rels, warnings) = deck_parts(&one_text_slide("[x](javascript:alert(1)) [y](notes.md)"));
+        let paras = shape_paras(&xml, "Body");
+        assert!(!paras[0].contains("hlinkClick"), "unsafe link must not be clickable: {}", paras[0]);
+        assert!(!rels.contains("relationships/hyperlink"), "{rels}");
+        assert_eq!(
+            warnings,
+            vec!["2 link(s) don't point to a web or mail address and were exported as plain text."]
+        );
+    }
+
+    #[test]
+    fn section_subtitle_fallback_is_converted() {
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Cover");
+        h.metadata.layout = Some("section".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "**副題**です"));
+        let (xml, _rels, _w) = deck_parts(&doc);
+        let paras = shape_paras(&xml, "Subtitle");
+        assert_eq!(paras.len(), 1, "{paras:?}");
+        assert_eq!(para_texts(&paras[0]), vec!["副題", "です"]);
+        assert!(run_with_text(&paras[0], "副題").contains(r#" b="1""#), "{}", paras[0]);
+    }
+
+    #[test]
+    fn section_slide_only_processes_its_subtitle_fallback() {
+        // A section slide writes no Body shape, so paragraphs after the
+        // subtitle fallback must not register links or count warnings.
+        let mut doc = Document::new("D");
+        let mut h = Chunk::new_heading(0, 1, "Cover");
+        h.metadata.layout = Some("section".to_string());
+        doc.chunks.push(h);
+        doc.chunks.push(Chunk::new_text(1, "[x](notes.md)"));
+        doc.chunks.push(Chunk::new_text(2, "[y](https://e.x)"));
+        let (_xml, rels, warnings) = deck_parts(&doc);
+        assert_eq!(
+            warnings,
+            vec!["1 link(s) don't point to a web or mail address and were exported as plain text."]
+        );
+        assert!(!rels.contains("relationships/hyperlink"), "unreferenced link rel: {rels}");
+    }
+
+    #[test]
+    fn link_url_never_counts_toward_overflow() {
+        // Mirrors slides.test.ts "overflow counts visible text".
+        let url = format!("https://example.com/{}", "x".repeat(120 * 20));
+        let (_xml, _rels, warnings) = deck_parts(&one_text_slide(&format!("[リンク]({url})")));
+        assert!(!warnings.iter().any(|w| w.contains("cut off")), "{warnings:?}");
+    }
+
+    #[test]
+    fn list_items_each_count_toward_overflow() {
+        // Mirrors slides.test.ts "overflow counts each list item as its own line".
+        let items: Vec<String> = (0..15).map(|i| format!("- item {i}")).collect();
+        let (_xml, _rels, warnings) = deck_parts(&one_text_slide(&items.join("\n")));
+        assert!(warnings.iter().any(|w| w.contains("cut off")), "{warnings:?}");
     }
 }

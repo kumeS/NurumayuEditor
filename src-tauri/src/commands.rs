@@ -12,12 +12,14 @@ use crate::error::{AppError, AppResult};
 use crate::fileio;
 use crate::imageio;
 use crate::models::{AnalysisResult, Document};
+use crate::pdf;
 use crate::pptx;
 use crate::rag;
 use crate::settings::{self, Settings};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -27,20 +29,27 @@ fn config_dir(app: &AppHandle) -> AppResult<PathBuf> {
         .map_err(|e| AppError::Config(format!("Could not resolve config directory: {e}")))
 }
 
-/// Reject a write target whose extension is present but isn't one we expect
-/// (A6 defence-in-depth: a compromised renderer can't coax a command into
-/// writing an executable `.command`/`.sh` somewhere). A missing extension is
-/// allowed — the OS save dialog appends one — so normal flows are unaffected.
+/// Fail-closed extension allowlist for caller-supplied write paths (A6
+/// defence-in-depth, rust.md rule 7): the path must END in one of `allowed`
+/// (ASCII case-insensitive). A missing extension, a non-UTF-8 one, or a
+/// leading-dot name such as `~/.zshrc` (where `Path::extension()` is None) is
+/// refused, so a compromised renderer can't coax a command into overwriting a
+/// dotfile or writing an executable `.command`/`.sh`. Normal flows are
+/// unaffected: every save dialog passes an extension filter, and plain Save
+/// reuses a path that was opened as .aix/.md.
 fn check_ext(path: &str, allowed: &[&str]) -> AppResult<()> {
-    if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
-        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
-            return Err(AppError::Other(format!(
-                "Refusing to write '{path}': expected a .{} file.",
-                allowed.join("/.")
-            )));
-        }
+    let ok = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| allowed.iter().any(|a| a.eq_ignore_ascii_case(ext)));
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "Refusing to write '{path}': expected a .{} file.",
+            allowed.join("/.")
+        )))
     }
-    Ok(())
 }
 
 /// True for endpoints served from the local machine (e.g. an Ollama bridge),
@@ -68,7 +77,7 @@ fn api_key_for(endpoint: &str) -> AppResult<String> {
 }
 
 fn load_llm_config(app: &AppHandle) -> AppResult<LlmConfig> {
-    let settings = Settings::load(&config_dir(app)?);
+    let settings = load_settings_in(&config_dir(app)?);
     let api_key = api_key_for(&settings.endpoint)?;
     // The keychain is the source of truth; if the cached existence flag
     // disagrees with what we just read, correct it rather than let the UI keep
@@ -86,7 +95,7 @@ fn load_llm_config(app: &AppHandle) -> AppResult<LlmConfig> {
 
 /// Like `load_llm_config` but uses the configured IMAGE model.
 fn load_image_llm_config(app: &AppHandle) -> AppResult<LlmConfig> {
-    let settings = Settings::load(&config_dir(app)?);
+    let settings = load_settings_in(&config_dir(app)?);
     let api_key = api_key_for(&settings.endpoint)?;
     Ok(LlmConfig {
         endpoint: settings.endpoint,
@@ -96,17 +105,75 @@ fn load_image_llm_config(app: &AppHandle) -> AppResult<LlmConfig> {
     })
 }
 
+// ----- main-thread policy ----------------------------------------------------
+//
+// Tauri 2 runs a sync `#[tauri::command] pub fn` on the main thread, where
+// AppKit also serves accessibility queries (BUG-006). Commands that touch
+// disk, the network or the local embedding model are therefore `async`; the
+// few that stay sync are listed, with reasons, in
+// `tests::MAIN_THREAD_COMMANDS`. Async commands run concurrently, so commands
+// that read-modify-write one shared file hold that file's lock below for their
+// whole body. A lock stops two writes from interleaving; it cannot restore
+// the order the calls were sent in, because that order is lost when Tauri
+// spawns each call.
+
+/// Session file (`session.json`): save, load and clear.
+static SESSION_IO: Mutex<()> = Mutex::new(());
+/// Personal RAG index (sqlite + embedding model).
+static RAG_IO: Mutex<()> = Mutex::new(());
+/// Per-document citation sidecars.
+static CITATIONS_IO: Mutex<()> = Mutex::new(());
+/// `settings.json`, including the backend-owned `api_key_present` flag. Held
+/// only inside `load_settings_in` / `save_settings_in` /
+/// `record_api_key_presence_in` (never around a call to one, because the lock
+/// is not re-entrant); every settings read and write in this file goes
+/// through them (guarded by a test). Not covered: the one startup read in
+/// lib.rs `setup`, which runs before any command, and the separate CLI/MCP
+/// process, which reads the file without this lock.
+static SETTINGS_IO: Mutex<()> = Mutex::new(());
+
+/// Take a unit lock. A panic in an earlier holder poisons the lock but leaves
+/// no half-updated data behind (the files are written atomically), so the
+/// poison is ignored.
+fn hold(lock: &'static Mutex<()>) -> MutexGuard<'static, ()> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run blocking work (model load/download, embedding, sqlite) on the blocking
+/// pool, so it pins neither the main thread nor an async worker that AI
+/// streaming also uses.
+async fn run_blocking<T, F>(work: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|_| {
+        AppError::Other("The background task stopped unexpectedly. Try again.".to_string())
+    })?
+}
+
 // ----- document lifecycle --------------------------------------------------
 
 #[tauri::command]
-pub fn import_document(path: String) -> AppResult<Document> {
+pub async fn import_document(path: String) -> AppResult<Document> {
     let mut doc = fileio::import_from_path(&path)?;
     doc.normalize(); // enforce invariants on imported text too (A1)
     Ok(doc)
 }
 
+/// Generic text export (`txt` / `md` / `rtf`). Returns the `RtfReport` (what
+/// the RTF couldn't embed, counted per cause) for `rtf`, and `None` for
+/// txt/md. `pdf` is refused by `fileio::export_to_path` because this route
+/// cannot return the `PdfReport`; PDF uses `export_pdf`. GUI .md payload
+/// contract: the frontend sends `mode: "markdown"` with the TS-merged
+/// `markdown_source` (fileActions `markdownSavePayload`), which
+/// `document_to_md` writes verbatim.
 #[tauri::command]
-pub async fn export_document(mut document: Document, path: String, format: String) -> AppResult<()> {
+pub async fn export_document(
+    mut document: Document,
+    path: String,
+    format: String,
+) -> AppResult<Option<fileio::RtfReport>> {
     if format.eq_ignore_ascii_case("md") || format.eq_ignore_ascii_case("markdown") {
         check_ext(&path, &["md", "markdown"])?;
     } else {
@@ -117,7 +184,7 @@ pub async fn export_document(mut document: Document, path: String, format: Strin
         // embed them; a failed fetch falls back to the text placeholder.
         imageio::resolve_remote_images(document.chunks.iter_mut()).await;
     }
-    fileio::export_to_path(&document, &path, &format)
+    fileio::export_with_report(&document, &path, &format)
 }
 
 /// Export the document as a PowerPoint deck: derive slides from the document
@@ -136,10 +203,20 @@ pub async fn export_pptx(document: Document, path: String) -> AppResult<pptx::Pp
     })
 }
 
+/// Export the document as an A4 PDF at `path` (chosen in the native save
+/// dialog) and report what the PDF could not carry (images, diagrams,
+/// literal Markdown). `async` so rendering and font embedding run off the
+/// main thread. No new capability: the dialog picks, Rust writes.
+#[tauri::command]
+pub async fn export_pdf(document: Document, path: String) -> AppResult<pdf::PdfReport> {
+    check_ext(&path, &["pdf"])?;
+    pdf::write_pdf(&document, &path)
+}
+
 /// Save/open the native `.aix` document format (the chunk JSON from spec §5).
 /// Written atomically so a crash mid-save can't truncate the user's document.
 #[tauri::command]
-pub fn save_document_json(document: Document, path: String) -> AppResult<()> {
+pub async fn save_document_json(document: Document, path: String) -> AppResult<()> {
     check_ext(&path, &["aix"])?;
     fileio::write_atomic(&path, serde_json::to_string_pretty(&document)?.as_bytes())
 }
@@ -154,7 +231,7 @@ pub struct OpenedDocument {
 }
 
 #[tauri::command]
-pub fn open_document_json(path: String) -> AppResult<OpenedDocument> {
+pub async fn open_document_json(path: String) -> AppResult<OpenedDocument> {
     let s = std::fs::read_to_string(path)?;
     let mut document: Document = serde_json::from_str(&s)?;
     // Enforce the editor's invariants at the load boundary — a malformed or
@@ -168,7 +245,7 @@ pub fn open_document_json(path: String) -> AppResult<OpenedDocument> {
 /// canonicalizes both paths, enforces root containment, and caps returned
 /// entries; it does not filter by extension (see `DirectoryEntry::is_openable`).
 #[tauri::command]
-pub fn list_directory(root: String, path: String) -> AppResult<Vec<fileio::DirectoryEntry>> {
+pub async fn list_directory(root: String, path: String) -> AppResult<Vec<fileio::DirectoryEntry>> {
     fileio::list_directory(&root, &path)
 }
 
@@ -188,13 +265,33 @@ pub fn set_menu_language(app: AppHandle, language: String) -> AppResult<()> {
 // ----- settings & secret storage ------------------------------------------
 
 #[tauri::command]
-pub fn get_settings(app: AppHandle) -> AppResult<Settings> {
-    Ok(Settings::load(&config_dir(&app)?))
+pub async fn get_settings(app: AppHandle) -> AppResult<Settings> {
+    let dir = config_dir(&app)?;
+    run_blocking(move || Ok(load_settings_in(&dir))).await
 }
 
+/// Whole-object save from the UI. The backend-owned fields are re-read from
+/// disk under `SETTINGS_IO`, so a concurrent `record_api_key_presence` can't
+/// be undone by a stale UI copy. Saves complete in lock order, not in the
+/// order the UI sent them (see the main-thread policy above).
 #[tauri::command]
-pub fn save_settings(app: AppHandle, settings: Settings) -> AppResult<()> {
-    settings.save(&config_dir(&app)?)
+pub async fn save_settings(app: AppHandle, settings: Settings) -> AppResult<()> {
+    let dir = config_dir(&app)?;
+    run_blocking(move || save_settings_in(&dir, settings)).await
+}
+
+/// `Settings::load` under `SETTINGS_IO` (a corrupt file is renamed to
+/// `.bak` by the load, so even a read can write).
+fn load_settings_in(dir: &Path) -> Settings {
+    let _io = hold(&SETTINGS_IO);
+    Settings::load(dir)
+}
+
+fn save_settings_in(dir: &Path, settings: Settings) -> AppResult<()> {
+    let _io = hold(&SETTINGS_IO);
+    settings
+        .with_backend_owned_fields_from(&Settings::load(dir))
+        .save(dir)
 }
 
 /// Persist the non-secret "a key exists" flag so `has_api_key` never has to
@@ -203,26 +300,39 @@ pub fn save_settings(app: AppHandle, settings: Settings) -> AppResult<()> {
 /// keychain, not this flag, remains the source of truth.
 fn record_api_key_presence(app: &AppHandle, present: bool) {
     if let Ok(dir) = config_dir(app) {
-        // Never materialise a settings file from defaults just to store this
-        // flag: on a corrupt/missing file `Settings::load` returns defaults, and
-        // writing those back would overwrite the user's real configuration.
-        if !dir.join("settings.json").exists() {
-            return;
-        }
-        let mut settings = Settings::load(&dir);
-        if settings.api_key_present != Some(present) {
-            settings.api_key_present = Some(present);
-            let _ = settings.save(&dir);
-        }
+        record_api_key_presence_in(&dir, present);
     }
 }
 
+fn record_api_key_presence_in(dir: &Path, present: bool) {
+    let _io = hold(&SETTINGS_IO);
+    // Never materialise a settings file from defaults just to store this
+    // flag: on a corrupt/missing file `Settings::load` returns defaults, and
+    // writing those back would overwrite the user's real configuration.
+    if !dir.join("settings.json").exists() {
+        return;
+    }
+    let mut settings = Settings::load(dir);
+    if settings.api_key_present != Some(present) {
+        settings.api_key_present = Some(present);
+        let _ = settings.save(dir);
+    }
+}
+
+/// Keychain work runs on the blocking pool: a macOS SecurityAgent prompt can
+/// wait on the user for as long as it likes without pinning a worker.
 #[tauri::command]
-pub fn set_api_key(app: AppHandle, key: String) -> AppResult<()> {
-    settings::set_api_key(&key)?;
-    // An empty value deletes the entry (see settings::set_api_key).
-    record_api_key_presence(&app, !key.trim().is_empty());
-    Ok(())
+pub async fn set_api_key(app: AppHandle, key: String) -> AppResult<()> {
+    let dir = config_dir(&app).ok();
+    run_blocking(move || {
+        settings::set_api_key(&key)?;
+        // An empty value deletes the entry (see settings::set_api_key).
+        if let Some(dir) = dir {
+            record_api_key_presence_in(&dir, !key.trim().is_empty());
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Does the user have an API key configured? Answered from the saved existence
@@ -230,29 +340,67 @@ pub fn set_api_key(app: AppHandle, key: String) -> AppResult<()> {
 /// predating the flag (`None`) falls back to a single real read, whose answer is
 /// then persisted — so an upgrading user is asked at most once.
 #[tauri::command]
-pub fn has_api_key(app: AppHandle) -> bool {
-    if let Ok(dir) = config_dir(&app) {
-        if let Some(present) = Settings::load(&dir).api_key_present {
+pub async fn has_api_key(app: AppHandle) -> bool {
+    let dir = config_dir(&app).ok();
+    run_blocking(move || Ok(has_api_key_in(dir.as_deref())))
+        .await
+        .unwrap_or(false)
+}
+
+fn has_api_key_in(dir: Option<&Path>) -> bool {
+    if let Some(dir) = dir {
+        if let Some(present) = load_settings_in(dir).api_key_present {
             return present;
         }
     }
     let present = matches!(settings::get_api_key(), Ok(Some(_)));
-    record_api_key_presence(&app, present);
+    if let Some(dir) = dir {
+        record_api_key_presence_in(dir, present);
+    }
     present
 }
 
 #[tauri::command]
-pub fn delete_api_key(app: AppHandle) -> AppResult<()> {
-    settings::delete_api_key()?;
-    record_api_key_presence(&app, false);
-    Ok(())
+pub async fn delete_api_key(app: AppHandle) -> AppResult<()> {
+    let dir = config_dir(&app).ok();
+    run_blocking(move || {
+        settings::delete_api_key()?;
+        if let Some(dir) = dir {
+            record_api_key_presence_in(&dir, false);
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// OpenRouter model catalog for the Settings picker. Callers pass the
+/// endpoint currently shown in the Settings form (possibly unsaved) as
+/// `endpoint`. It only gates the request, together with the PERSISTED
+/// endpoint loaded here: the keychain holds one key, the one the saved
+/// endpoint uses, so the key is read only when BOTH are OpenRouter — an
+/// unsaved switch from another provider never sends that provider's key to
+/// openrouter.ai (security-rust-1). The URL fetched is always the fixed
+/// `openrouter_models::OPENROUTER_MODELS_URL`. The key is read here and never
+/// returned. Counted as a fetch in `get_network_stats`, not as an AI call.
+///
+/// Known limit: one keychain slot is shared by every provider, so saving a new
+/// endpoint without replacing the key still pairs the old key with it
+/// (planned: a key slot per provider, or the key's origin stored beside it).
+#[tauri::command]
+pub async fn list_openrouter_models(
+    app: AppHandle,
+    endpoint: String,
+) -> AppResult<crate::openrouter_models::OpenRouterCatalog> {
+    let saved = load_settings_in(&config_dir(&app)?).endpoint;
+    crate::openrouter_models::list_catalog(&endpoint, &saved, api_key_for).await
 }
 
 /// "Zero external transmission" visibility (開発.txt Stage 2, item 2-2):
 /// combines the two independent counter pairs — LLM calls (`ai::ai_call_stats`)
-/// and reference/image fetches (`net::stats`) — into one snapshot the health
-/// bar can poll. See the NOTE in `net.rs` and `ai.rs` for why these are two
-/// separate chokepoints rather than one.
+/// and fetches through net.rs (`net::stats`: reference/image/citation lookups
+/// and the OpenRouter model list) — into one snapshot the health bar can poll.
+/// See the NOTE in `net.rs` and `ai.rs` for why these are two separate
+/// chokepoints rather than one.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkStats {
@@ -313,7 +461,7 @@ pub async fn ai_ghost_complete_stream(
     context_hint: String,
     on_delta: Channel<String>,
 ) -> AppResult<String> {
-    let settings = Settings::load(&config_dir(&app)?);
+    let settings = load_settings_in(&config_dir(&app)?);
     if settings.limit_completion_to_local_model && !is_local_endpoint(&settings.endpoint) {
         return Err(AppError::Other(
             "Ghost-text is limited to a local model in Settings, but the configured endpoint \
@@ -357,7 +505,7 @@ pub async fn ai_draft_stream(
     on_event: Channel<DraftEvent>,
 ) -> AppResult<()> {
     let config = load_llm_config(&app)?;
-    let settings = Settings::load(&config_dir(&app)?);
+    let settings = load_settings_in(&config_dir(&app)?);
     let title = draft_title(&theme);
 
     let language = Some(settings.default_target_language.clone());
@@ -395,13 +543,19 @@ pub async fn ai_generate_image(app: AppHandle, prompt: String) -> AppResult<Stri
     ai::generate_image(&config, &prompt).await
 }
 
-/// Read a local image file (chosen via the file-picker dialog — the webview
-/// never reads disk directly) and return it as an inline data URL, so the
-/// frontend can insert the user's own picture as an image chunk (v1 "No.1"
-/// priority feature — previously image chunks could only come from AI
-/// generation). Extension allowlist + size cap enforced in `imageio`.
+/// Read a local image file and return it as an inline data URL (the webview
+/// never reads disk directly). Paths come from the image picker dialog AND
+/// from documents: the preview and the PPTX and RTF exports (fileActions
+/// `withEmbeddedLocalImages`) resolve a figure reference (`figures/x.png`, an
+/// absolute path or `file:` URL) against the document's folder and read it
+/// here. Hostile-argument contract (`imageio::read_local_image_file`): the
+/// path must be a regular file, not a symlink (lstat; symlinks are refused,
+/// not resolved), with an allowlisted image extension, under the 25 MB cap,
+/// and its bytes must sniff as PNG/JPEG/GIF/WEBP/BMP; there is no directory or
+/// traversal restriction, so only files whose content is an allowlisted image
+/// format are ever exposed.
 #[tauri::command]
-pub fn read_local_image(path: String) -> AppResult<String> {
+pub async fn read_local_image(path: String) -> AppResult<String> {
     imageio::read_local_image_file(&path)
 }
 
@@ -425,7 +579,7 @@ pub async fn ai_analyze_document(app: AppHandle, document: Document) -> AppResul
 
 /// Read a local file as plain reference text for the Draft feature.
 #[tauri::command]
-pub fn read_reference_file(path: String) -> AppResult<String> {
+pub async fn read_reference_file(path: String) -> AppResult<String> {
     fileio::read_reference_text(&path)
 }
 
@@ -511,28 +665,36 @@ fn rag_disabled_error() -> AppError {
 /// chunk it into passages, embed each with the local model, and store it in
 /// the on-device vector index. Returns the number of passages indexed.
 #[tauri::command]
-pub fn rag_add_source(app: AppHandle, path: String) -> AppResult<usize> {
+pub async fn rag_add_source(app: AppHandle, path: String) -> AppResult<usize> {
     let dir = config_dir(&app)?;
-    let settings = Settings::load(&dir);
-    if !settings.personal_rag_enabled {
-        return Err(rag_disabled_error());
-    }
-    let text = fileio::read_reference_text(&path)?;
-    let mut index = rag::Index::open(&dir)?;
-    index.add_source(&path, &text)
+    run_blocking(move || {
+        let _io = hold(&RAG_IO);
+        let settings = load_settings_in(&dir);
+        if !settings.personal_rag_enabled {
+            return Err(rag_disabled_error());
+        }
+        let text = fileio::read_reference_text(&path)?;
+        let mut index = rag::Index::open(&dir)?;
+        index.add_source(&path, &text)
+    })
+    .await
 }
 
 /// Remove a previously added source's passages from the personal knowledge
 /// base. Returns the number of passages removed (0 if it wasn't indexed).
 #[tauri::command]
-pub fn rag_remove_source(app: AppHandle, path: String) -> AppResult<usize> {
+pub async fn rag_remove_source(app: AppHandle, path: String) -> AppResult<usize> {
     let dir = config_dir(&app)?;
-    let settings = Settings::load(&dir);
-    if !settings.personal_rag_enabled {
-        return Err(rag_disabled_error());
-    }
-    let mut index = rag::Index::open(&dir)?;
-    index.remove_source(&path)
+    run_blocking(move || {
+        let _io = hold(&RAG_IO);
+        let settings = load_settings_in(&dir);
+        if !settings.personal_rag_enabled {
+            return Err(rag_disabled_error());
+        }
+        let mut index = rag::Index::open(&dir)?;
+        index.remove_source(&path)
+    })
+    .await
 }
 
 /// One indexed source file's path and passage count, for the personal-library
@@ -556,21 +718,25 @@ impl From<rag::SourceInfo> for RagSourceInfo {
 /// those two cases apart, so this never needs to surface a scary error just
 /// for opening the management panel with the feature off.
 #[tauri::command]
-pub fn rag_list_sources(app: AppHandle) -> AppResult<Vec<RagSourceInfo>> {
+pub async fn rag_list_sources(app: AppHandle) -> AppResult<Vec<RagSourceInfo>> {
     let dir = config_dir(&app)?;
-    let settings = Settings::load(&dir);
-    if !settings.personal_rag_enabled {
-        return Ok(Vec::new());
-    }
-    // Nothing indexed yet: `Index::open` would otherwise still create the
-    // sqlite file merely to answer "list nothing" — check for that file's
-    // existence first so listing an empty, never-used library truly creates
-    // no on-disk artifact (item 7's spirit, applied to a read-only call too).
-    if !rag::index_exists(&dir) {
-        return Ok(Vec::new());
-    }
-    let index = rag::Index::open(&dir)?;
-    Ok(index.list_sources()?.into_iter().map(RagSourceInfo::from).collect())
+    run_blocking(move || {
+        let _io = hold(&RAG_IO);
+        let settings = load_settings_in(&dir);
+        if !settings.personal_rag_enabled {
+            return Ok(Vec::new());
+        }
+        // Nothing indexed yet: `Index::open` would otherwise still create the
+        // sqlite file merely to answer "list nothing" — check for that file's
+        // existence first so listing an empty, never-used library truly creates
+        // no on-disk artifact (item 7's spirit, applied to a read-only call too).
+        if !rag::index_exists(&dir) {
+            return Ok(Vec::new());
+        }
+        let index = rag::Index::open(&dir)?;
+        Ok(index.list_sources()?.into_iter().map(RagSourceInfo::from).collect())
+    })
+    .await
 }
 
 /// One personal-library search hit: source file + matched snippet + distance,
@@ -594,17 +760,21 @@ impl From<rag::SearchHit> for RagSearchHit {
 /// manual search/preview panel, and so this whole subsystem is independently
 /// testable end to end from the command layer down.
 #[tauri::command]
-pub fn rag_search(app: AppHandle, query: String, top_k: usize) -> AppResult<Vec<RagSearchHit>> {
+pub async fn rag_search(app: AppHandle, query: String, top_k: usize) -> AppResult<Vec<RagSearchHit>> {
     let dir = config_dir(&app)?;
-    let settings = Settings::load(&dir);
-    if !settings.personal_rag_enabled {
-        return Err(rag_disabled_error());
-    }
-    if !rag::index_exists(&dir) {
-        return Ok(Vec::new()); // nothing indexed yet — a real empty result, not an error
-    }
-    let mut index = rag::Index::open(&dir)?;
-    Ok(index.search(&query, top_k)?.into_iter().map(RagSearchHit::from).collect())
+    run_blocking(move || {
+        let _io = hold(&RAG_IO);
+        let settings = load_settings_in(&dir);
+        if !settings.personal_rag_enabled {
+            return Err(rag_disabled_error());
+        }
+        if !rag::index_exists(&dir) {
+            return Ok(Vec::new()); // nothing indexed yet — a real empty result, not an error
+        }
+        let mut index = rag::Index::open(&dir)?;
+        Ok(index.search(&query, top_k)?.into_iter().map(RagSearchHit::from).collect())
+    })
+    .await
 }
 
 /// Auto-accumulation of confirmed content (開発.txt Stage 3, item 3-1;
@@ -622,25 +792,29 @@ pub fn rag_search(app: AppHandle, query: String, top_k: usize) -> AppResult<Vec<
 /// its passages rather than accumulating duplicates (`Index::add_source`'s
 /// existing replace behavior). Returns the total passage count (re-)indexed.
 #[tauri::command]
-pub fn rag_sync_confirmed_chunks(
+pub async fn rag_sync_confirmed_chunks(
     app: AppHandle,
     doc_path: String,
     chunks: Vec<(String, String)>,
 ) -> AppResult<usize> {
     let dir = config_dir(&app)?;
-    let settings = Settings::load(&dir);
-    if !settings.personal_rag_enabled {
-        return Ok(0);
-    }
-    if chunks.is_empty() {
-        return Ok(0);
-    }
-    let pairs: Vec<(String, String)> = chunks
-        .into_iter()
-        .map(|(chunk_id, text)| (rag::confirmed_chunk_source_path(&doc_path, &chunk_id), text))
-        .collect();
-    let mut index = rag::Index::open(&dir)?;
-    index.add_confirmed_chunks(&pairs)
+    run_blocking(move || {
+        let _io = hold(&RAG_IO);
+        let settings = load_settings_in(&dir);
+        if !settings.personal_rag_enabled {
+            return Ok(0);
+        }
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        let pairs: Vec<(String, String)> = chunks
+            .into_iter()
+            .map(|(chunk_id, text)| (rag::confirmed_chunk_source_path(&doc_path, &chunk_id), text))
+            .collect();
+        let mut index = rag::Index::open(&dir)?;
+        index.add_confirmed_chunks(&pairs)
+    })
+    .await
 }
 
 // ----- Citation management (開発.txt Stage 3, item 3-2) ---------------------
@@ -672,7 +846,8 @@ pub struct BibtexImportResult {
 }
 
 #[tauri::command]
-pub fn citations_import_bibtex(document_path: String, bib_path: String) -> AppResult<BibtexImportResult> {
+pub async fn citations_import_bibtex(document_path: String, bib_path: String) -> AppResult<BibtexImportResult> {
+    let _io = hold(&CITATIONS_IO);
     let src = std::fs::read_to_string(&bib_path)?;
     let report = citations::parse_bibtex(&src)?;
 
@@ -692,7 +867,7 @@ pub fn citations_import_bibtex(document_path: String, bib_path: String) -> AppRe
 /// document with no sidecar yet (nothing imported) returns an empty list
 /// rather than an error.
 #[tauri::command]
-pub fn citations_list(document_path: String) -> AppResult<Vec<CitationEntry>> {
+pub async fn citations_list(document_path: String) -> AppResult<Vec<CitationEntry>> {
     Ok(citations::load_library(&document_path)?.entries)
 }
 
@@ -702,11 +877,18 @@ pub fn citations_list(document_path: String) -> AppResult<Vec<CitationEntry>> {
 /// result unmodified) to the library. Returns the stored entry (with its
 /// assigned id) so the caller can immediately reference it.
 #[tauri::command]
-pub fn citations_add_entry(document_path: String, entry: CitationEntry) -> AppResult<CitationEntry> {
-    let mut library = citations::load_library(&document_path)?;
+pub async fn citations_add_entry(document_path: String, entry: CitationEntry) -> AppResult<CitationEntry> {
+    let _io = hold(&CITATIONS_IO);
+    add_citation_entry(&document_path, entry)
+}
+
+/// Shared body of `citations_add_entry` / `citations_add_lookup_result`.
+/// The caller holds `CITATIONS_IO`.
+fn add_citation_entry(document_path: &str, entry: CitationEntry) -> AppResult<CitationEntry> {
+    let mut library = citations::load_library(document_path)?;
     library.entries.retain(|e| e.id != entry.id);
     library.entries.push(entry.clone());
-    citations::save_library(&document_path, &library)?;
+    citations::save_library(document_path, &library)?;
     Ok(entry)
 }
 
@@ -715,18 +897,19 @@ pub fn citations_add_entry(document_path: String, entry: CitationEntry) -> AppRe
 /// one step — the common "look up, then add as-is" path. `key` becomes the
 /// entry's display key (the DOI or arXiv id that was looked up).
 #[tauri::command]
-pub fn citations_add_lookup_result(
+pub async fn citations_add_lookup_result(
     document_path: String,
     result: citations::LookupResult,
     key: String,
 ) -> AppResult<CitationEntry> {
-    let entry = result.into_entry(&key);
-    citations_add_entry(document_path, entry)
+    let _io = hold(&CITATIONS_IO);
+    add_citation_entry(&document_path, result.into_entry(&key))
 }
 
 /// Remove one citation entry by id. Returns true if an entry was actually removed.
 #[tauri::command]
-pub fn citations_remove_entry(document_path: String, entry_id: String) -> AppResult<bool> {
+pub async fn citations_remove_entry(document_path: String, entry_id: String) -> AppResult<bool> {
+    let _io = hold(&CITATIONS_IO);
     let mut library = citations::load_library(&document_path)?;
     let before = library.entries.len();
     library.entries.retain(|e| e.id != entry_id);
@@ -808,7 +991,7 @@ pub async fn citations_lookup_arxiv(arxiv_id: String) -> AppResult<citations::Lo
 /// this entry's 1-based position in the bibliography the caller is building
 /// (IEEE's numbered-bracket style needs it; APA ignores it).
 #[tauri::command]
-pub fn citations_format(document_path: String, entry_id: String, style: String, index: usize) -> AppResult<String> {
+pub async fn citations_format(document_path: String, entry_id: String, style: String, index: usize) -> AppResult<String> {
     let style: CitationStyle = style.parse()?;
     let library = citations::load_library(&document_path)?;
     let entry = library
@@ -824,7 +1007,7 @@ pub fn citations_format(document_path: String, entry_id: String, style: String, 
 /// in the given (citation) order; APA sorts alphabetically by author surname
 /// — see `citations::format_bibliography`.
 #[tauri::command]
-pub fn citations_bibliography(document_path: String, entry_ids: Vec<String>, style: String) -> AppResult<Vec<String>> {
+pub async fn citations_bibliography(document_path: String, entry_ids: Vec<String>, style: String) -> AppResult<Vec<String>> {
     let style: CitationStyle = style.parse()?;
     let library = citations::load_library(&document_path)?;
     let cited: Vec<CitationEntry> = entry_ids
@@ -944,10 +1127,15 @@ fn session_path(app: &AppHandle) -> AppResult<PathBuf> {
 /// (A2). The frontend debounces this on dirty changes. Written atomically
 /// (`fileio::write_atomic`) so a crash mid-write can't corrupt the recovery
 /// file. The payload is an opaque JSON value — its shape is owned by the
-/// frontend.
+/// frontend. Runs off the main thread. Save, load and clear hold
+/// `SESSION_IO`, so they never interleave; they complete in lock order, which
+/// is not guaranteed to be the order the frontend sent them. The frontend
+/// therefore sends session calls one at a time (src/api.ts `enqueueSession`,
+/// guarded by src/sessionQueue.test.ts).
 #[tauri::command]
-pub fn save_session(app: AppHandle, session: serde_json::Value) -> AppResult<()> {
+pub async fn save_session(app: AppHandle, session: serde_json::Value) -> AppResult<()> {
     let path = session_path(&app)?;
+    let _io = hold(&SESSION_IO);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -958,8 +1146,9 @@ pub fn save_session(app: AppHandle, session: serde_json::Value) -> AppResult<()>
 /// A corrupt/unparseable file is treated as "no session" and deleted, so a bad
 /// write can't make recovery error out on every launch.
 #[tauri::command]
-pub fn load_session(app: AppHandle) -> AppResult<Option<serde_json::Value>> {
+pub async fn load_session(app: AppHandle) -> AppResult<Option<serde_json::Value>> {
     let path = session_path(&app)?;
+    let _io = hold(&SESSION_IO);
     if !path.exists() {
         return Ok(None);
     }
@@ -976,8 +1165,9 @@ pub fn load_session(app: AppHandle) -> AppResult<Option<serde_json::Value>> {
 /// Delete the session file (after a clean quit or once the user declines to
 /// restore), so it isn't offered again.
 #[tauri::command]
-pub fn clear_session(app: AppHandle) -> AppResult<()> {
+pub async fn clear_session(app: AppHandle) -> AppResult<()> {
     let path = session_path(&app)?;
+    let _io = hold(&SESSION_IO);
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -1003,15 +1193,17 @@ mod tests {
     // value, and not a "the other field is untouched" claim, either of which
     // would be flaky depending on what else is running concurrently.
     //
-    // IMPORTANT: this must be `>=`, not `==`. `net.rs` has its own test
-    // (`safe_fetch_counts_the_call_even_when_blocked`) that increments this
-    // SAME `FETCH_CALLS` static, and `cargo test`'s default parallel runner can
-    // interleave it between our `before`/`after` reads — an exact `+1` assert
-    // was observed to fail intermittently for exactly this reason. `>=` still
+    // Kept as `>=`, not `==`. Other tests increment this SAME `FETCH_CALLS`
+    // static; the known ones hold `net::network_counter_test_guard` (as this
+    // test does), but an unguarded future one could still be interleaved by
+    // `cargo test`'s parallel runner between our `before`/`after` reads — an
+    // exact `+1` assert was observed to fail intermittently for exactly this
+    // reason before the guard existed. `>=` still
     // fails if `safe_fetch` stops incrementing the counter (the regression this
     // test exists to catch) while tolerating a concurrent test's own bump.
     #[test]
     fn get_network_stats_reflects_underlying_counters() {
+        let _g = crate::net::network_counter_test_guard();
         let before = get_network_stats();
 
         // Drive the exact counter this command reads, without a real network
@@ -1063,5 +1255,343 @@ mod tests {
         // Setting off (default) → never blocked, regardless of endpoint.
         assert!(!blocks(false, "https://openrouter.ai/api/v1/chat/completions"));
         assert!(!blocks(false, "http://localhost:11434/v1/chat/completions"));
+    }
+
+    // ----- main-thread policy (BUG-006 step 1) -----------------------------
+
+    /// Commands allowed to stay sync (Tauri 2 runs a sync command on the main
+    /// thread, where AppKit also answers accessibility queries). Everything
+    /// else that touches disk, the network or a local model must be async.
+    const MAIN_THREAD_COMMANDS: &[(&str, &str)] = &[
+        ("set_menu_language", "rebuilds the native menu, which is AppKit (main-thread) work"),
+        ("get_network_stats", "reads two atomics; no I/O"),
+        ("speak_text", "kill-then-spawn of `say` must not interleave with another read-aloud request"),
+        ("stop_speaking", "must stay ordered with speak_text"),
+        ("quit_app", "exits the app"),
+    ];
+
+    /// `(name, is_async)` for every `#[tauri::command]` in this file's
+    /// non-test source. `#[tauri::command(async)]` counts as async.
+    fn command_signatures(src: &str) -> Vec<(String, bool)> {
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut out = Vec::new();
+        let mut pending: Option<bool> = None;
+        for line in prod.lines() {
+            let l = line.trim();
+            if l.starts_with("#[tauri::command") {
+                pending = Some(l.contains("async"));
+                continue;
+            }
+            let Some(attr_async) = pending else { continue };
+            if l.starts_with("#[") || l.starts_with("//") {
+                continue;
+            }
+            let (fn_async, rest) = if let Some(r) = l.strip_prefix("pub async fn ") {
+                (true, r)
+            } else if let Some(r) = l.strip_prefix("pub fn ") {
+                (false, r)
+            } else {
+                panic!("unexpected line after #[tauri::command]: {l}");
+            };
+            let name = rest.split(['(', '<']).next().unwrap_or("").trim().to_string();
+            out.push((name, attr_async || fn_async));
+            pending = None;
+        }
+        out
+    }
+
+    /// The source of one command's function, from its `fn` line to the next
+    /// command attribute (or the end of the non-test source).
+    fn command_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let start = prod
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("no fn {name} in commands.rs"));
+        let rest = &prod[start..];
+        let end = rest.find("#[tauri::command").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn only_allowlisted_commands_run_on_the_main_thread() {
+        let src = include_str!("commands.rs");
+        let sigs = command_signatures(src);
+
+        // The parser must see exactly the registered commands, or the check
+        // below could pass by missing some.
+        let mut parsed: Vec<&str> = sigs.iter().map(|(n, _)| n.as_str()).collect();
+        let mut registered: Vec<&str> = include_str!("lib.rs")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("commands::"))
+            .filter_map(|l| l.strip_suffix(','))
+            .collect();
+        parsed.sort_unstable();
+        registered.sort_unstable();
+        assert_eq!(parsed, registered, "command parser out of sync with generate_handler!");
+
+        let mut sync: Vec<&str> =
+            sigs.iter().filter(|(_, a)| !a).map(|(n, _)| n.as_str()).collect();
+        let mut allowed: Vec<&str> = MAIN_THREAD_COMMANDS.iter().map(|(n, _)| *n).collect();
+        sync.sort_unstable();
+        allowed.sort_unstable();
+        assert_eq!(sync, allowed, "sync (main-thread) commands differ from the allowlist");
+    }
+
+    // Async removes the main thread's implicit one-at-a-time ordering, so the
+    // commands that read-modify-write one shared file take its lock.
+    #[test]
+    fn shared_file_commands_hold_their_lock() {
+        let src = include_str!("commands.rs");
+        let expectations: &[(&str, &str)] = &[
+            ("save_session", "SESSION_IO"),
+            ("load_session", "SESSION_IO"),
+            ("clear_session", "SESSION_IO"),
+            ("rag_add_source", "RAG_IO"),
+            ("rag_remove_source", "RAG_IO"),
+            ("rag_list_sources", "RAG_IO"),
+            ("rag_search", "RAG_IO"),
+            ("rag_sync_confirmed_chunks", "RAG_IO"),
+            ("citations_import_bibtex", "CITATIONS_IO"),
+            ("citations_add_entry", "CITATIONS_IO"),
+            ("citations_add_lookup_result", "CITATIONS_IO"),
+            ("citations_remove_entry", "CITATIONS_IO"),
+        ];
+        for (name, lock) in expectations {
+            assert!(
+                command_body(src, name).contains(&format!("hold(&{lock})")),
+                "{name} must hold {lock}"
+            );
+        }
+    }
+
+    // ----- SETTINGS_IO (BUG-006 follow-up) --------------------------------
+    // The settings commands are async now, so `save_settings` (a stale UI
+    // copy) and `record_api_key_presence` (reached from has/set/delete_api_key
+    // and from every AI command via `load_llm_config`) can run at the same
+    // time. Each `*_in` helper must wait for SETTINGS_IO.
+
+    fn settings_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aix-settings-io-{tag}-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut s = Settings::default();
+        s.api_key_present = Some(true); // keeps has_api_key_in off the keychain
+        s.save(&dir).expect("seed settings.json");
+        dir
+    }
+
+    #[test]
+    fn settings_helpers_wait_for_settings_io() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = settings_dir("excl");
+        type Helper = fn(PathBuf);
+        let helpers: &[(&str, Helper)] = &[
+            ("load_settings_in", |d| {
+                load_settings_in(&d);
+            }),
+            ("save_settings_in", |d| {
+                let _ = save_settings_in(&d, Settings::default());
+            }),
+            ("record_api_key_presence_in", |d| record_api_key_presence_in(&d, true)),
+            ("has_api_key_in", |d| {
+                has_api_key_in(Some(&d));
+            }),
+        ];
+        for (name, helper) in helpers {
+            let guard = hold(&SETTINGS_IO);
+            let (tx, rx) = mpsc::channel();
+            let (d, f) = (dir.clone(), *helper);
+            std::thread::spawn(move || {
+                f(d);
+                let _ = tx.send(());
+            });
+            assert_eq!(
+                rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout),
+                "{name} ran while SETTINGS_IO was held"
+            );
+            drop(guard);
+            assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok(), "{name} never finished");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Every settings read in this file goes through the locked helpers; a
+    // bare `Settings::load` elsewhere could read the file mid-rename.
+    #[test]
+    fn settings_file_is_only_touched_inside_the_locked_helpers() {
+        let src = include_str!("commands.rs");
+        let mut prod = src.split("#[cfg(test)]").next().unwrap_or(src).to_string();
+        for helper in ["fn load_settings_in(", "fn save_settings_in(", "fn record_api_key_presence_in("] {
+            let start = prod.find(helper).unwrap_or_else(|| panic!("no {helper}"));
+            let len = prod[start..].find("\n}\n").expect("fn end");
+            assert!(prod[start..start + len].contains("hold(&SETTINGS_IO)"), "{helper} must hold SETTINGS_IO");
+            prod.replace_range(start..start + len, "");
+        }
+        assert!(!prod.contains("Settings::load("), "a Settings::load outside the locked helpers");
+        assert!(!prod.contains(".save("), "a settings save outside the locked helpers");
+    }
+
+    #[test]
+    fn stale_ui_save_and_presence_record_end_the_same_in_either_order() {
+        for record_first in [true, false] {
+            let dir = settings_dir("order");
+            record_api_key_presence_in(&dir, false);
+            let mut stale = Settings::load(&dir); // the UI's copy: key absent
+            stale.temperature = 0.9;
+            stale.api_key_present = Some(false);
+            if record_first {
+                record_api_key_presence_in(&dir, true);
+                save_settings_in(&dir, stale).expect("save");
+            } else {
+                save_settings_in(&dir, stale).expect("save");
+                record_api_key_presence_in(&dir, true);
+            }
+            let on_disk = Settings::load(&dir);
+            assert_eq!(on_disk.api_key_present, Some(true), "record_first={record_first}");
+            assert_eq!(on_disk.temperature, 0.9, "record_first={record_first}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn run_blocking_passes_results_through_and_maps_a_panic_to_an_error() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        assert_eq!(rt.block_on(run_blocking(|| Ok(7))).expect("ok"), 7);
+        let err = rt
+            .block_on(run_blocking(|| -> AppResult<()> { panic!("boom") }))
+            .expect_err("a panic must become an error");
+        assert_eq!(err.to_string(), "The background task stopped unexpectedly. Try again.");
+    }
+
+    // The renderer-reachable generic export has no channel for `PdfReport`,
+    // so a PDF through it would silently drop the report (rust.md rule 4).
+    #[test]
+    fn export_document_refuses_pdf_and_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("aix-export-pdf-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("out.pdf");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let mut doc = Document::new("Report");
+        doc.chunks.push(crate::models::Chunk::new_text(0, "Body."));
+
+        let err = rt
+            .block_on(export_document(doc, path.to_string_lossy().into_owned(), "pdf".into()))
+            .expect_err("pdf must be refused by the generic export");
+
+        assert_eq!(
+            err.to_string(),
+            "PDF export reports what the PDF could not carry, so it uses its own command \
+             (export_pdf), not the generic text export."
+        );
+        assert!(!path.exists(), "nothing may be written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // check_ext fails closed: a missing extension (incl. dotfiles such as
+    // `.zshrc`, where `Path::extension()` is None) or a wrong one is refused.
+    #[test]
+    fn check_ext_refuses_missing_wrong_and_dotfile_extensions() {
+        for (path, allowed) in [
+            ("/tmp/out", &["pdf"][..]),
+            ("/Users/x/.zshrc", &["txt"][..]),
+            ("/Users/x/.zshrc", &["pdf"][..]),
+            ("/tmp/.pdf", &["pdf"][..]),
+            ("/tmp/a.sh", &["txt"][..]),
+            ("/tmp/out.", &["pdf"][..]),
+        ] {
+            let err = check_ext(path, allowed).expect_err(path).to_string();
+            assert_eq!(
+                err,
+                format!("Refusing to write '{path}': expected a .{} file.", allowed.join("/.")),
+                "{path}"
+            );
+        }
+        check_ext("/tmp/report.PDF", &["pdf"]).expect("case-insensitive match");
+        check_ext("/tmp/a.markdown", &["md", "markdown"]).expect("any listed extension");
+        check_ext("/tmp/日本語.aix", &["aix"]).expect("non-Latin stem");
+    }
+
+    // export_pdf writes only to a .pdf path (BUG-003 guard). Asserts the exact
+    // refusal, not just Err: on a font-less host write_pdf would also fail.
+    #[test]
+    fn export_pdf_refuses_a_non_pdf_path_and_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("aix-export-pdf-ext-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        for name in ["out.aix", "noext", ".zshrc"] {
+            let path = dir.join(name);
+            let p = path.to_string_lossy().into_owned();
+            let mut doc = Document::new("Report");
+            doc.chunks.push(crate::models::Chunk::new_text(0, "Body."));
+            let err = rt.block_on(export_pdf(doc, p.clone())).expect_err(name).to_string();
+            assert_eq!(err, format!("Refusing to write '{p}': expected a .pdf file."), "{name}");
+            assert!(!path.exists(), "{name}: nothing may be written");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_document_refuses_an_extensionless_path_and_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("aix-export-noext-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        for (name, format, expected) in [
+            ("noext", "txt", ".txt"),
+            (".zshrc", "txt", ".txt"),
+            (".bash_profile", "md", ".md/.markdown"),
+        ] {
+            let path = dir.join(name);
+            let p = path.to_string_lossy().into_owned();
+            let mut doc = Document::new("Report");
+            doc.chunks.push(crate::models::Chunk::new_text(0, "echo pwned"));
+            let err = rt
+                .block_on(export_document(doc, p.clone(), format.into()))
+                .expect_err(name)
+                .to_string();
+            assert_eq!(err, format!("Refusing to write '{p}': expected a {expected} file."), "{name}");
+            assert!(!path.exists(), "{name}: nothing may be written");
+        }
+        let save_path = dir.join("noext-save");
+        let err = rt
+            .block_on(save_document_json(Document::new("D"), save_path.to_string_lossy().into_owned()))
+            .expect_err("save_document_json without .aix");
+        assert!(err.to_string().starts_with("Refusing to write"), "{err}");
+        assert!(!save_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // RTF is lossy (images/diagrams → placeholders), so the GUI command must
+    // hand the report back; txt/md carry none.
+    #[test]
+    fn export_document_returns_the_rtf_report_and_none_for_txt() {
+        let dir = std::env::temp_dir().join(format!("aix-export-rtf-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let mut doc = Document::new("Report");
+        let mut fig = crate::models::Chunk::new_text(0, "figures/unread.png");
+        fig.metadata.chunk_type = crate::models::CHUNK_TYPE_IMAGE.to_string();
+        doc.chunks.push(fig);
+
+        let rtf = dir.join("out.rtf");
+        let report = rt
+            .block_on(export_document(doc.clone(), rtf.to_string_lossy().into_owned(), "rtf".into()))
+            .expect("rtf export")
+            .expect("rtf returns a report");
+        assert_eq!(report.local_images_unresolved, 1);
+        assert_eq!(
+            report.warnings,
+            vec!["1 local image(s) couldn't be read from the document's folder and were exported \
+                  as text placeholders."]
+        );
+        assert!(rtf.exists());
+
+        let txt = dir.join("out.txt");
+        let none = rt
+            .block_on(export_document(doc, txt.to_string_lossy().into_owned(), "txt".into()))
+            .expect("txt export");
+        assert_eq!(none, None);
+        assert!(txt.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

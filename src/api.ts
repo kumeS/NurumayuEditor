@@ -16,23 +16,66 @@ import type {
   ExportFormat,
   NetworkStats,
   OpenedDocument,
+  OpenRouterCatalog,
+  PdfReport,
   PptxReport,
   RagSearchHit,
   RagSourceInfo,
+  RtfReport,
   SessionData,
   Settings,
 } from "./types";
+
+// The session commands are async in Rust (off the main thread, BUG-006), and
+// Tauri spawns each call, so it no longer runs them in the order they were
+// sent: an autosave already in flight could land after a later clear and
+// leave a stale restore prompt on the next launch. Rust's SESSION_IO lock
+// prevents interleaving but not reordering, so every session call is chained
+// here: each one is sent only after the previous one settled. A failed call
+// never stalls the queue; the caller still sees its own result or error.
+// Known limit: a call that never settles would hold back every later session
+// call (including the awaited clear on quit).
+let sessionQueue: Promise<unknown> = Promise.resolve();
+function enqueueSession<T>(run: () => Promise<T>): Promise<T> {
+  const next = sessionQueue.then(run);
+  sessionQueue = next.catch(() => undefined);
+  return next;
+}
+
+// The settings/keychain writes are async in Rust too (settings-io-async), so
+// they complete in SETTINGS_IO lock order, not send order. saveSettings sends
+// the WHOLE object, and callers such as setPreviewBackground and
+// saveSidebarWidth don't chain their saves, so an older object could land
+// last. Every settings write is therefore chained here, on its own queue (a
+// stuck session call must not hold back settings, and vice versa). A failed
+// call never stalls the queue; the caller still sees its own result or error.
+// Reads (getSettings / hasApiKey) are not queued: they run at startup and no
+// caller reads back after a write. Known limit: a set_api_key waiting on a
+// keychain prompt holds back later settings saves until the prompt is answered.
+let settingsQueue: Promise<unknown> = Promise.resolve();
+function enqueueSettings<T>(run: () => Promise<T>): Promise<T> {
+  const next = settingsQueue.then(run);
+  settingsQueue = next.catch(() => undefined);
+  return next;
+}
 
 export const api = {
   importDocument: (path: string) =>
     invoke<Document>("import_document", { path }),
 
+  /** Export as txt/md/rtf. RTF returns its lossy report (images/diagrams kept
+   *  as placeholders, counted per cause); txt/md return null. */
   exportDocument: (document: Document, path: string, format: ExportFormat) =>
-    invoke<void>("export_document", { document, path, format }),
+    invoke<RtfReport | null>("export_document", { document, path, format }),
 
   /** Export the document as a PowerPoint deck (.pptx); returns a slide count + notes. */
   exportPptx: (document: Document, path: string) =>
     invoke<PptxReport>("export_pptx", { document, path }),
+
+  /** Export the document as an A4 PDF (rendered in Rust); returns the page
+   *  count + counted warnings for what the PDF could not carry. */
+  exportPdf: (document: Document, path: string) =>
+    invoke<PdfReport>("export_pdf", { document, path }),
 
   saveDocumentJson: (document: Document, path: string) =>
     invoke<void>("save_document_json", { document, path }),
@@ -52,18 +95,27 @@ export const api = {
 
   getSettings: () => invoke<Settings>("get_settings"),
 
+  // Settings writes are chained — see `enqueueSettings`.
   saveSettings: (settings: Settings) =>
-    invoke<void>("save_settings", { settings }),
+    enqueueSettings(() => invoke<void>("save_settings", { settings })),
 
-  setApiKey: (key: string) => invoke<void>("set_api_key", { key }),
+  setApiKey: (key: string) => enqueueSettings(() => invoke<void>("set_api_key", { key })),
 
   hasApiKey: () => invoke<boolean>("has_api_key"),
 
-  deleteApiKey: () => invoke<void>("delete_api_key"),
+  deleteApiKey: () => enqueueSettings(() => invoke<void>("delete_api_key")),
 
   /** "Zero external transmission" visibility (開発.txt Stage 2, item 2-2):
-   * counts of actual LLM calls and reference/image fetches this session. */
+   * counts of actual LLM calls and of net.rs fetches (reference/image/citation
+   * lookups and the OpenRouter model list) this session. */
   getNetworkStats: () => invoke<NetworkStats>("get_network_stats"),
+
+  /** OpenRouter model catalog, fetched in Rust with the keychain key (the key
+   * never crosses IPC). Pass the Settings form's endpoint as `endpoint`; it
+   * only gates the call (must be https://openrouter.ai/…); the fetched URL is fixed
+   * in Rust. Counted as a fetch, not an AI call. */
+  listOpenRouterModels: (endpoint: string) =>
+    invoke<OpenRouterCatalog>("list_openrouter_models", { endpoint }),
 
   aiProcess: (request: AiRequest) =>
     invoke<string>("ai_process", { request }),
@@ -263,10 +315,12 @@ export const api = {
 
   stopSpeaking: () => invoke<void>("stop_speaking"),
 
-  // Session autosave / crash recovery (A2).
-  saveSession: (session: SessionData) => invoke<void>("save_session", { session }),
-  loadSession: () => invoke<SessionData | null>("load_session"),
-  clearSession: () => invoke<void>("clear_session"),
+  // Session autosave / crash recovery (A2). Serialized through
+  // `enqueueSession` — see its comment.
+  saveSession: (session: SessionData) =>
+    enqueueSession(() => invoke<void>("save_session", { session })),
+  loadSession: () => enqueueSession(() => invoke<SessionData | null>("load_session")),
+  clearSession: () => enqueueSession(() => invoke<void>("clear_session")),
 
   /** Quit the whole app (Cmd+Q). Window close only hides the window (macOS). */
   quitApp: () => invoke<void>("quit_app"),

@@ -37,6 +37,12 @@ const JA: &[(&str, &str)] = &[
     ("Edit", "編集"),
     ("Undo", "元に戻す"),
     ("Redo", "やり直す"),
+    ("Find…", "検索…"),
+    ("Find and Replace…", "検索と置換…"),
+    ("Find Next", "次を検索"),
+    ("Find Previous", "前を検索"),
+    ("Go to Line…", "行へ移動…"),
+    ("Close Tab", "タブを閉じる"),
     ("Draft a document by AI…", "AIで文書を下書き…"),
     ("Analyze relationships", "関係を分析"),
     ("Window", "ウインドウ"),
@@ -96,6 +102,8 @@ pub fn build<R: Runtime, M: Manager<R>>(app: &M, language: &str) -> tauri::Resul
     let open_folder = MenuItemBuilder::with_id("open_folder", l("Open Folder…")).build(app)?;
     let save = MenuItemBuilder::with_id("save", l("Save")).build(app)?;
     let save_as = MenuItemBuilder::with_id("save_as", l("Save As…")).build(app)?;
+    // ⌘W stays a frontend shortcut (no accelerator), like every custom item.
+    let close_tab = MenuItemBuilder::with_id("close_tab", l("Close Tab")).build(app)?;
     let import = MenuItemBuilder::with_id("import", l("Import…")).build(app)?;
     let export_txt = MenuItemBuilder::with_id("export_txt", l("Export as .txt")).build(app)?;
     let export_md = MenuItemBuilder::with_id("export_md", l("Export as .md")).build(app)?;
@@ -115,6 +123,7 @@ pub fn build<R: Runtime, M: Manager<R>>(app: &M, language: &str) -> tauri::Resul
         .item(&open_folder)
         .item(&save)
         .item(&save_as)
+        .item(&close_tab)
         .separator()
         .item(&import)
         .item(&export)
@@ -123,6 +132,13 @@ pub fn build<R: Runtime, M: Manager<R>>(app: &M, language: &str) -> tauri::Resul
     // Edit — Undo/Redo are routed to the app's own history; clipboard is native.
     let undo = MenuItemBuilder::with_id("undo", l("Undo")).build(app)?;
     let redo = MenuItemBuilder::with_id("redo", l("Redo")).build(app)?;
+    // Find (BUG-010): the docked find bar. Shortcuts (⌘F, ⌥⌘F, ⌘G, ⇧⌘G, ⌘L)
+    // are frontend-owned, so these items carry no accelerators either.
+    let find = MenuItemBuilder::with_id("find", l("Find…")).build(app)?;
+    let find_replace = MenuItemBuilder::with_id("find_replace", l("Find and Replace…")).build(app)?;
+    let find_next = MenuItemBuilder::with_id("find_next", l("Find Next")).build(app)?;
+    let find_previous = MenuItemBuilder::with_id("find_previous", l("Find Previous")).build(app)?;
+    let go_to_line = MenuItemBuilder::with_id("go_to_line", l("Go to Line…")).build(app)?;
     let edit_menu = SubmenuBuilder::new(app, l("Edit"))
         .item(&undo)
         .item(&redo)
@@ -131,6 +147,12 @@ pub fn build<R: Runtime, M: Manager<R>>(app: &M, language: &str) -> tauri::Resul
         .copy()
         .paste()
         .select_all()
+        .separator()
+        .item(&find)
+        .item(&find_replace)
+        .item(&find_next)
+        .item(&find_previous)
+        .item(&go_to_line)
         .build()?;
 
     // AI
@@ -186,6 +208,35 @@ mod tests {
     fn labels_are_translated_for_japanese() {
         assert_eq!(label("日本語", "Save As…"), "別名で保存…");
         assert_eq!(label("日本語", "Open Folder…"), "フォルダを開く…");
+    }
+
+    /// BUG-010: the Edit menu's find items and File → Close Tab follow the
+    /// language setting like every other custom item.
+    #[test]
+    fn edit_menu_find_labels_are_translated() {
+        assert_eq!(label("日本語", "Find…"), "検索…");
+        assert_eq!(label("日本語", "Find and Replace…"), "検索と置換…");
+        assert_eq!(label("日本語", "Find Next"), "次を検索");
+        assert_eq!(label("日本語", "Find Previous"), "前を検索");
+        assert_eq!(label("日本語", "Go to Line…"), "行へ移動…");
+        assert_eq!(label("日本語", "Close Tab"), "タブを閉じる");
+    }
+
+    /// The find items and Close Tab are built (ids the frontend dispatches) and
+    /// carry no accelerator: ⌘F/⌘G/⌘L/⌘W belong to the frontend shortcuts, so a
+    /// menu key equivalent would fire them twice.
+    #[test]
+    fn find_items_and_close_tab_are_built_without_accelerators() {
+        let source = include_str!("menu.rs");
+        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        for id in ["find", "find_replace", "find_next", "find_previous", "go_to_line", "close_tab"] {
+            let needle = format!("with_id(\"{id}\"");
+            let at = source
+                .find(&needle)
+                .unwrap_or_else(|| panic!("menu item {id} is not built"));
+            let stmt = &source[at..at + source[at..].find(';').unwrap_or(0)];
+            assert!(!stmt.contains("accelerator"), "{id} must not carry an accelerator");
+        }
     }
 
     #[test]

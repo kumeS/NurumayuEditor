@@ -4,11 +4,20 @@
 // in Rust (root-jailed, capped, dotfile-excluded — see fileio::list_directory);
 // this component only renders what it's given and lazily fetches on expand.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { openFolder, openPath } from "../fileActions";
-import { folderDisplayName } from "../folderTree";
+import { folderDisplayName, folderToFollow } from "../folderTree";
 import { useT } from "../i18n";
+import {
+  SIDEBAR_WIDTH_DEFAULT,
+  SIDEBAR_WIDTH_MAX,
+  SIDEBAR_WIDTH_MIN,
+  SIDEBAR_WIDTH_STEP,
+  clampSidebarWidth,
+  saveSidebarWidth,
+  sidebarWidthOf,
+} from "../sidebarWidth";
 import { useStore } from "../store";
 import type { DirectoryEntry } from "../types";
 
@@ -37,6 +46,7 @@ function EntryRow({
   const [state, setState] = useState<LoadState>(INITIAL);
   const t = useT();
   const indent = 10 + depth * 14;
+  const isActive = useStore((s) => s.filePath === entry.path);
 
   const load = useCallback(async () => {
     setState({ entries: null, loading: true, error: null });
@@ -52,6 +62,7 @@ function EntryRow({
     return (
       <button
         type="button"
+        aria-current={isActive ? "page" : undefined}
         disabled={!entry.isOpenable}
         onClick={() => void openPath(entry.path)}
         title={entry.isOpenable ? entry.path : `${entry.name}: ${t("unsupported file type")}`}
@@ -60,7 +71,9 @@ function EntryRow({
             ? `${t("Open")} ${entry.name}`
             : `${entry.name}, ${t("unsupported file type")}`
         }
-        className="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-sm text-ink-soft hover:bg-accent/5 hover:text-ink disabled:cursor-not-allowed disabled:text-ink-faint disabled:hover:bg-transparent"
+        className={`flex w-full items-center gap-1.5 py-1 pr-2 text-left text-sm hover:bg-accent/5 hover:text-ink disabled:cursor-not-allowed disabled:text-ink-faint disabled:hover:bg-transparent ${
+          isActive ? "bg-accent/10 font-medium text-ink" : "text-ink-soft"
+        }`}
         style={{ paddingLeft: indent }}
       >
         <span aria-hidden="true" className="text-ink-faint">·</span>
@@ -114,9 +127,86 @@ function EntryRow({
   );
 }
 
+/**
+ * The sidebar's right edge: drag to resize (live), release to persist.
+ * Keyboard: ←/→ step, Home/End to the bounds; double-click restores the default.
+ */
+function ResizeHandle({ width, onLive }: { width: number; onLive: (w: number | null) => void }) {
+  const t = useT();
+  const drag = useRef<{ startX: number; startWidth: number; last: number } | null>(null);
+
+  const finish = (w: number) => {
+    onLive(null);
+    void saveSidebarWidth(w);
+  };
+
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={t("Resize the files sidebar")}
+      aria-valuemin={SIDEBAR_WIDTH_MIN}
+      aria-valuemax={SIDEBAR_WIDTH_MAX}
+      aria-valuenow={width}
+      tabIndex={0}
+      title={t("Drag to resize · double-click to reset")}
+      className="group absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize outline-none"
+      onPointerDown={(e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        drag.current = { startX: e.clientX, startWidth: width, last: width };
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+      }}
+      onPointerMove={(e) => {
+        const d = drag.current;
+        if (!d) return;
+        d.last = clampSidebarWidth(d.startWidth + e.clientX - d.startX, window.innerWidth);
+        onLive(d.last);
+      }}
+      onPointerUp={(e) => {
+        const d = drag.current;
+        if (!d) return;
+        drag.current = null;
+        e.currentTarget.releasePointerCapture(e.pointerId);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        finish(d.last);
+      }}
+      onPointerCancel={() => {
+        drag.current = null;
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        onLive(null);
+      }}
+      onDoubleClick={() => finish(SIDEBAR_WIDTH_DEFAULT)}
+      onKeyDown={(e) => {
+        const next =
+          e.key === "ArrowLeft" ? width - SIDEBAR_WIDTH_STEP
+          : e.key === "ArrowRight" ? width + SIDEBAR_WIDTH_STEP
+          : e.key === "Home" ? SIDEBAR_WIDTH_MIN
+          : e.key === "End" ? SIDEBAR_WIDTH_MAX
+          : null;
+        if (next === null) return;
+        e.preventDefault();
+        finish(clampSidebarWidth(next, window.innerWidth));
+      }}
+    >
+      {/* The visible line sits on the border; it highlights on hover, drag and focus. */}
+      <div className="mx-auto h-full w-0.5 bg-transparent transition-colors group-hover:bg-accent/40 group-focus-visible:bg-accent group-active:bg-accent" />
+    </div>
+  );
+}
+
 export default function FolderTree() {
   const root = useStore((s) => s.folderRoot);
+  const activeFile = useStore((s) => s.filePath);
+  const setFolderRoot = useStore((s) => s.setFolderRoot);
   const toggleFolderTree = useStore((s) => s.toggleFolderTree);
+  const savedWidth = useStore((s) => sidebarWidthOf(s.settings));
+  const [liveWidth, setLiveWidth] = useState<number | null>(null);
+  const width = liveWidth ?? savedWidth;
   const [state, setState] = useState<LoadState>(INITIAL);
   const t = useT();
 
@@ -130,6 +220,13 @@ export default function FolderTree() {
     }
   }, []);
 
+  // Follow the open file: show its folder unless it's already inside the tree.
+  // Keyed on the file only, so choosing another folder isn't undone.
+  useEffect(() => {
+    const next = folderToFollow(useStore.getState().folderRoot, activeFile);
+    if (next) setFolderRoot(next);
+  }, [activeFile, setFolderRoot]);
+
   useEffect(() => {
     if (root) void loadRoot(root);
     else setState(INITIAL);
@@ -137,9 +234,11 @@ export default function FolderTree() {
 
   return (
     <aside
-      className="flex h-full w-64 shrink-0 flex-col border-r border-gray-200 bg-white font-sans"
+      className="relative flex h-full shrink-0 flex-col border-r border-gray-200 bg-white font-sans"
+      style={{ width }}
       aria-label={t("Folder tree")}
     >
+      <ResizeHandle width={width} onLive={setLiveWidth} />
       <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-gray-200 px-2.5">
         <div className="truncate text-xs font-semibold text-ink" title={root ?? undefined}>
           {root ? folderDisplayName(root) : t("Files")}
@@ -172,7 +271,7 @@ export default function FolderTree() {
       <div className="no-scrollbar min-h-0 flex-1 overflow-y-auto py-1">
         {!root ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 px-3 text-center">
-            <div className="text-xs text-ink-faint">{t("Open a folder to browse its files.")}</div>
+            <div className="text-xs text-ink-faint">{t("Open a file or folder to browse its files.")}</div>
             <button
               type="button"
               onClick={() => void openFolder()}

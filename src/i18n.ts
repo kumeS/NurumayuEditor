@@ -23,19 +23,21 @@ export const JA: Record<string, string> = {
   Open: "開く",
   "Open File…": "ファイルを開く…",
   "Open Folder…": "フォルダを開く…",
-  "Open a file (⌘O) or a folder (⌘⇧O)": "ファイル(⌘O)またはフォルダ(⌘⇧O)を開く",
+  "Open a file (⌘O) or a folder (⇧⌘O)": "ファイル(⌘O)またはフォルダ(⇧⌘O)を開く",
   Save: "保存",
   "Save (⌘/Ctrl+S)": "保存 (⌘/Ctrl+S)",
   Files: "ファイル",
-  "Hide files": "ファイルを隠す",
-  "Show files sidebar": "ファイルサイドバーを表示",
-  "Hide files sidebar": "ファイルサイドバーを隠す",
+  "Hide files": "ファイル一覧を非表示",
+  "Show files": "ファイル一覧を表示",
+  "Show files sidebar": "ファイル一覧を表示",
+  "Hide files sidebar": "ファイル一覧を非表示",
   "Import / Export": "読み込み / 書き出し",
-  "Import or export .txt / .md / .rtf": ".txt / .md / .rtf の読み込み・書き出し",
+  "Import .txt / .md / .rtf, or export to .txt / .md / .rtf / .pptx / .pdf":
+    ".txt / .md / .rtf の読み込み、.txt / .md / .rtf / .pptx / .pdf への書き出し",
   "Import .txt / .md / .rtf…": ".txt / .md / .rtf を読み込む…",
   "Export as": "書き出し形式",
   Editor: "エディタ",
-  Markdown: "Markdown編集",
+  // "Markdown" needs no entry — the mode label is the format's name (BUG-009).
   Slides: "スライド",
   "Paragraph editor view": "段落エディタ表示",
   "Markdown source and preview": "Markdownソースとプレビュー",
@@ -44,6 +46,34 @@ export const JA: Record<string, string> = {
   Redo: "やり直す",
   "Undo (⌘/Ctrl+Z)": "元に戻す (⌘/Ctrl+Z)",
   "Redo (⌘/Ctrl+Shift+Z)": "やり直す (⌘/Ctrl+Shift+Z)",
+  // ----- Find / Replace (BUG-010) — labels match menu.rs's JA table -------
+  "Find…": "検索…",
+  "Find and Replace…": "検索と置換…",
+  "Find Next": "次を検索",
+  "Find Previous": "前を検索",
+  "Go to Line…": "行へ移動…",
+  "Find and replace": "検索と置換",
+  Find: "検索",
+  "Replace with": "置換後の文字列",
+  Replace: "置換",
+  "Replace All": "すべて置換",
+  "Match case": "大文字と小文字を区別",
+  "Whole word": "単語単位",
+  "Previous match (⇧Enter / ⇧⌘G)": "前の一致 (⇧Enter / ⇧⌘G)",
+  "Next match (Enter / ⌘G)": "次の一致 (Enter / ⌘G)",
+  "Show replace (⌥⌘F)": "置換を表示 (⌥⌘F)",
+  "Hide replace": "置換を隠す",
+  "Close find bar (Esc)": "検索バーを閉じる (Esc)",
+  "No matches": "一致なし",
+  "{n} matches": "{n} 件",
+  "Replaced {n}.": "{n} 件を置換しました",
+  "Line number": "行番号",
+  Go: "移動",
+  "Lines 1–{total}": "1–{total} 行",
+  "Find in Slides is planned — switch to Editor or Markdown to search.":
+    "スライドでの検索は今後対応予定です。検索するにはエディタまたは Markdown に切り替えてください。",
+  "Go to Line works in Markdown source — switch to Markdown to use it.":
+    "行へ移動は Markdown ソースで使えます。Markdown に切り替えてください。",
   "Draft by AI": "AIで下書き",
   "Draft a whole document by AI — set length and attach reference material":
     "AIで文書全体を下書き — 長さの指定と参考資料の添付ができます",
@@ -63,6 +93,14 @@ export const JA: Record<string, string> = {
     "段落間のロジックを整理 → 関係グラフ(任意)",
   Settings: "設定",
 
+  // ----- w1-modal: modal layer / Save As / toolbar labels (BUG-009/016) ----
+  "Save As…": "別名で保存…",
+  "More save options": "保存オプション",
+  "Command palette": "コマンドパレット",
+  "Search commands": "コマンドを検索",
+  Model: "モデル",
+  "(default)": "(既定)",
+
   // ----- Tabs ---------------------------------------------------------------
   "New tab": "新しいタブ",
   "Close tab": "タブを閉じる",
@@ -70,12 +108,23 @@ export const JA: Record<string, string> = {
 
   // ----- Folder tree sidebar ------------------------------------------------
   "Folder tree": "フォルダツリー",
-  "Open a folder to browse its files.": "フォルダを開くとファイルを一覧できます。",
+  "That file is open in another tab. Close that tab first, or save under a different name.": "そのファイルは別のタブで開いています。先にそのタブを閉じるか、別の名前で保存してください。",
+  "⌘ + scroll or pinch to zoom · swipe sideways, Shift + scroll or Option + drag to move left/right": "⌘＋スクロールまたはピンチで拡大縮小・横スワイプ、Shift＋スクロール、Option＋ドラッグで左右に移動",
+  "Move the preview back to the centre": "プレビューを中央に戻す",
+  "Re-center": "中央に戻す",
+  "Move preview left": "プレビューを左へ移動",
+  "Move preview right": "プレビューを右へ移動",
+  "Re-center preview": "プレビューを中央に戻す",
+  "Resize the files sidebar": "ファイル一覧の幅を変更",
+  "Drag to resize · double-click to reset": "ドラッグで幅を変更・ダブルクリックで元に戻す",
+  "Couldn't save the sidebar width:": "ファイル一覧の幅を保存できませんでした:",
+  "Already open — switched to its tab.": "すでに開いています。そのタブに切り替えました。",
+  "Open a file or folder to browse its files.": "ファイルかフォルダを開くと、その場所のファイルを一覧できます。",
   "Choose Folder…": "フォルダを選択…",
   "Choose a different folder": "別のフォルダを選ぶ",
   "Change…": "変更…",
   Hide: "隠す",
-  "Hide the files sidebar": "ファイルサイドバーを隠す",
+  "Hide the files sidebar": "ファイル一覧を非表示",
   "Loading…": "読み込み中…",
   "Empty folder.": "空のフォルダです。",
   "Couldn't read this folder:": "このフォルダを読み込めませんでした:",
@@ -91,8 +140,6 @@ export const JA: Record<string, string> = {
     "サブタイトルはタイトル/スライドタイトルの下に表示されます",
 
   // ----- Markdown surface ---------------------------------------------------
-  "Edit source or click rendered text to edit it directly.":
-    "ソースを編集するか、表示されたテキストを直接クリックして編集できます。",
   Edit: "編集",
   Split: "分割",
   Preview: "プレビュー",
@@ -161,7 +208,6 @@ export const JA: Record<string, string> = {
 
   // ----- Panels, modals, per-paragraph controls -----------------------------
   "A key is stored securely in your OS keychain.": "キーはOSのキーチェーンに安全に保存されています。",
-  "AI actions": "AI操作",
   "AI review": "AIレビュー",
   "AI reviews every paragraph and leaves actionable comments": "AIが各段落をレビューし、具体的なコメントを残します",
   "AI: not analyzed": "AI: 未分析",
@@ -229,10 +275,8 @@ export const JA: Record<string, string> = {
   Mono: "等幅",
   "Move down": "下へ移動",
   "Move up": "上へ移動",
-  "Network calls made this session: LLM requests (ai.rs) and reference/image fetches (net.rs's guarded safe_fetch) are counted separately. Nothing else leaves this machine.": "このセッションでの外部通信: LLMへのリクエスト(ai.rs)と、参考資料・画像の取得(net.rsのsafe_fetch)を別々に数えています。これ以外にこの端末から出るデータはありません。",
   "Next slide (→ / Space)": "次のスライド (→ / スペース)",
   "No changes since last save": "前回保存から変更なし",
-  "No changes since last save.": "前回保存から変更はありません。",
   "No supporting paragraph found.": "根拠となる段落が見つかりませんでした。",
   "Not analyzed yet — click to analyze relationships": "まだ分析していません — クリックで関係を分析",
   "Notes (N)": "ノート (N)",
@@ -248,7 +292,11 @@ export const JA: Record<string, string> = {
   "Personal knowledge base (RAG)": "パーソナルナレッジベース (RAG)",
   "Personal library": "パーソナルライブラリ",
   "Pick automatically from this slide's content: an image → an image layout, no body text → section, otherwise bullets.": "スライドの内容から自動で選びます: 画像があれば画像レイアウト、本文がなければセクション、それ以外は箇条書き。",
-  "Present full screen": "全画面で発表",
+  // p-slides polish: the overlay fills the window; native full screen is planned.
+  "Present in this window (Esc to exit)": "このウィンドウで発表 (Escで終了)",
+  Detached: "切り離し済み",
+  "Deck title": "スライド資料のタイトル",
+  "Slide bullets (one per line)": "スライドの箇条書き (1行に1項目)",
   "Preview search": "検索をプレビュー",
   "Previous slide (←)": "前のスライド (←)",
   "Re-analyze document": "ドキュメントを再分析",
@@ -264,6 +312,8 @@ export const JA: Record<string, string> = {
   "Remove from library": "ライブラリから削除",
   "Remove from list": "一覧から削除",
   "Remove key": "キーを削除",
+  "Remove the OpenRouter API key from your OS keychain? AI actions will not work until you enter a key again.":
+    "OSのキーチェーンからOpenRouterのAPIキーを削除しますか? キーを入力し直すまでAI操作は使えません。",
   Revert: "元に戻す",
   "Review criteria coverage": "審査基準のカバー状況",
   "Safe to try — shows a reviewable diff (Revert) after": "安心して試せます — 実行後に差分を確認して元に戻せます",
@@ -298,7 +348,6 @@ export const JA: Record<string, string> = {
   "Version history (swap to an earlier version)": "バージョン履歴(以前の版に戻す)",
   "Writing tone": "文体",
   folder: "フォルダ",
-  "images inserted.": "枚の画像を挿入しました。",
   "the personal library panel": "パーソナルライブラリパネル",
   "unsupported file type": "未対応のファイル形式",
   "•••••••••• (saved in keychain)": "•••••••••• (キーチェーンに保存済み)",
@@ -310,15 +359,17 @@ export const JA: Record<string, string> = {
   "Restore session": "セッションを復元",
   "Restore unsaved documents from your last session?": "前回のセッションの未保存ドキュメントを復元しますか?",
   "Unsaved changes": "未保存の変更",
-  "You have unsaved changes in one or more tabs. Quit without saving? Unsaved documents (including AI drafts) will be lost.": "保存していない変更があるタブがあります。保存せずに終了しますか? 未保存のドキュメント(AIの下書きを含む)は失われます。",
-  "Discard & quit": "破棄して終了",
-  "This tab has unsaved changes. Close it without saving? Its unsaved content will be lost.": "このタブには未保存の変更があります。保存せずに閉じますか? 未保存の内容は失われます。",
-  "Discard & close": "破棄して閉じる",
+  // w3-history (BUG-011): the three-button unsaved dialog. "Save" and "Cancel"
+  // are shared keys above; the Save / Don't Save labels must stay distinct.
+  "Don't Save": "保存しない",
+  "Do you want to save the changes to “{title}” before closing it?": "閉じる前に「{title}」の変更を保存しますか?",
+  "Do you want to save the changes to “{title}” before quitting?": "終了する前に「{title}」の変更を保存しますか?",
+  "Browse OpenRouter models…": "OpenRouterのモデル一覧から選ぶ…",
 
   // ----- AI / file action toasts ---------------------------------------------
   "AI review: no issues found.": "AIレビュー: 問題は見つかりませんでした。",
   "Add at least one review criterion first.": "まず審査基準を1つ以上追加してください。",
-  "Could not prepare the PDF view.": "PDF表示を準備できませんでした。",
+  "Exported as PDF.": "PDFとして書き出しました。",
   "Criteria check: every criterion is covered.": "基準チェック: すべての基準を満たしています。",
   "Diagram generated below the paragraph.": "段落の下に図を生成しました。",
   "Document imported.": "ドキュメントを読み込みました。",
@@ -367,7 +418,6 @@ export const JA: Record<string, string> = {
   "This paragraph is empty.": "この段落は空です。",
   "This slide has no text to summarize.": "このスライドには要約できるテキストがありません。",
   "Settings saved.": "設定を保存しました。",
-  "API key removed from keychain.": "キーチェーンからAPIキーを削除しました。",
   Subtitle: "サブタイトル",
   Heading: "見出し",
 
@@ -388,6 +438,8 @@ export const JA: Record<string, string> = {
   "Generate": "生成",
   "Generate diagram…": "図を生成…",
   "Help language": "ヘルプの言語",
+  // Help footer build identity (MISS-02): app version + git build id.
+  "Version {version} ({build})": "バージョン {version} ({build})",
   "Language": "言語",
   "Loading your citation library…": "文献ライブラリを読み込み中…",
   "Loading your library…": "ライブラリを読み込み中…",
@@ -405,6 +457,11 @@ export const JA: Record<string, string> = {
   "Revise with context": "文脈を踏まえて修正",
   "Rewrite": "書き直し",
   "Split slide here": "ここでスライドを分割",
+  "New slide": "新しいスライド",
+  "That paragraph no longer exists — re-analyze to refresh the graph.":
+    "その段落はもう存在しません — グラフを更新するには再分析してください。",
+  "Those paragraphs no longer exist — re-analyze to refresh the graph.":
+    "それらの段落はもう存在しません — グラフを更新するには再分析してください。",
   "Summarize": "要約",
   "This deck has no slides yet": "このスライドにはまだページがありません",
   "Translate…": "翻訳…",
@@ -422,6 +479,10 @@ export const JA: Record<string, string> = {
   "Auto": "自動",
   "Add speaker notes…": "発表者ノートを追加…",
   "This slide has no title yet — add one to attach speaker notes.": "このスライドにはまだタイトルがありません — タイトルを付けると発表者ノートを追加できます。",
+  // w3-slides-a (MISS-09): the slide's own Edit/Preview toggle names its scope.
+  "Edit slide": "スライドを編集",
+  "Preview slide": "スライドをプレビュー",
+  "Edit or preview this slide (the Editor / Markdown / Slides switch is in the toolbar)": "このスライドを編集またはプレビュー(エディタ/Markdown/スライドの切り替えはツールバーにあります)",
   "Section": "セクション",
   "Title + Bullets": "タイトル + 箇条書き",
   "Image right": "画像を右に",
@@ -434,8 +495,6 @@ export const JA: Record<string, string> = {
   "One image spanning the top, bullets below.": "上部に画像を1枚、その下に箇条書き。",
 
   // ----- Paragraph controls, prompts, presets ---------------------------------
-  "AI actions for this paragraph": "この段落へのAI操作",
-  "AI actions for this heading": "この見出しへのAI操作",
   "AI-generated": "AI生成",
   "Apply to all": "すべてに適用",
   "Bibliography inserted.": "参考文献リストを挿入しました。",
@@ -477,10 +536,6 @@ export const JA: Record<string, string> = {
   "Concise": "簡潔",
   "Plain": "平易",
   "Persuasive": "説得的",
-  "Short (~300 words)": "短め(約300語)",
-  "Medium (~800 words)": "標準(約800語)",
-  "Long (~1500 words)": "長め(約1500語)",
-  "Very long (~3000 words)": "非常に長い(約3000語)",
   "Duplicate slide": "スライドを複製",
   "Add a heading to duplicate this slide": "このスライドを複製するには見出しを追加してください",
   "Add a review comment": "レビューコメントを追加",
@@ -508,6 +563,366 @@ export const JA: Record<string, string> = {
   "Reset zoom to 100%": "表示倍率を100%に戻す",
   "Zoom in (Markdown preview)": "拡大(Markdownプレビュー)",
   "Zoom out (Markdown preview)": "縮小(Markdownプレビュー)",
+
+  // ----- Document images + preview background ---------------------------------
+  "Background": "背景",
+  "Preview background": "プレビューの背景",
+  "Couldn't save the preview background:": "プレビューの背景を保存できませんでした:",
+  "Loading image…": "画像を読み込み中…",
+  "White": "白",
+  "Warm gray": "ウォームグレー",
+  "Light gray": "ライトグレー",
+  "Paper": "紙色",
+  "Mint": "ミント",
+  "Light blue": "ライトブルー",
+  "The image file could not be decoded.": "画像ファイルを読み込めませんでした(形式が壊れている可能性があります)。",
+  "No image source.": "画像の参照先がありません。",
+  "Save the document to show images with relative paths.": "相対パスの画像を表示するには、ドキュメントを保存してください。",
+
+  // ----- Markdown preview editing + formulas ----------------------------------
+  "Apply": "適用",
+  "Click to edit the formula": "クリックして数式を編集",
+  "Edit formula": "数式を編集",
+  "Formula (TeX)": "数式 (TeX)",
+  "New heading": "新しい見出し",
+  "New paragraph": "新しい段落",
+  "The document changed — reopen the formula to edit it.": "ドキュメントが変更されました — もう一度数式を開いて編集してください。",
+  "This part can't be edited in Preview — use Edit or Split.": "この部分はプレビューでは編集できません — Edit または Split で編集してください。",
+  "Type a heading…": "見出しを入力…",
+  "Type a new paragraph…": "新しい段落を入力…",
+  "That edit crosses formatting (bold, italics…) and can't be applied in Preview — use Edit or Split for it.": "その編集は書式(太字・斜体など)をまたぐため、プレビューでは適用できません — Edit または Split で編集してください。",
+  "Images, formulas, links and code can only be deleted whole in Preview.": "プレビューでは、画像・数式・リンク・コードは丸ごと削除のみできます。",
+  "Line breaks aren't possible inside a table cell.": "表のセル内では改行できません。",
+  "Add paragraph (Markdown preview)": "段落を追加(Markdownプレビュー)",
+  "Add heading (Markdown preview)": "見出しを追加(Markdownプレビュー)",
+  // ----- w1-rust-a: AI / provider errors (src/aiErrors.ts, AI_ERROR_KEYS) ----
+  "The model '{model}' is not available from the provider. Choose another model in Settings.": "モデル「{model}」は提供元で利用できません。設定で別のモデルを選んでください。",
+  "Not found (404): the model '{model}' or the endpoint URL is wrong. Check both in Settings.": "見つかりません(404): モデル「{model}」またはエンドポイントURLが正しくありません。設定で両方を確認してください。",
+  "Rate limited (429). Wait a minute and retry, switch models in Settings, or add credit at openrouter.ai.": "利用制限中です(429)。少し待って再試行するか、設定でモデルを切り替えるか、openrouter.ai でクレジットを追加してください。",
+  "Authorization failed ({code}). Check your OpenRouter API key in Settings.": "認証に失敗しました({code})。設定でOpenRouter APIキーを確認してください。",
+  "The model returned an empty response. Try again, or switch models in Settings.": "モデルから空の応答が返りました。再試行するか、設定でモデルを切り替えてください。",
+  "The AI provider returned an error (HTTP {code}).": "AIプロバイダがエラーを返しました(HTTP {code})。",
+  "Provider": "提供元",
+  "Model unavailable": "モデル利用不可",
+  // ----- end w1-rust-a ----------------------------------------------------------
+  // w1-display: HealthBar length tooltip (BUG-012)
+  "Characters exclude spaces; diagrams and images are not counted.": "文字数は空白を除いて数えます。図と画像は数えません。",
+  // ----- w2-settings: OpenRouter model catalog + model markers (BUG-013) ------
+  "Browse OpenRouter models": "OpenRouterのモデル一覧から選ぶ",
+  "Fetch OpenRouter models": "OpenRouterのモデル一覧を取得",
+  "Refresh model list": "モデル一覧を再読み込み",
+  "Loading model catalog…": "モデル一覧を取得中…",
+  "Nothing is sent to OpenRouter until you fetch the list.": "一覧を取得するまで、OpenRouterへの通信は行いません。",
+  "Use manual model IDs with a custom endpoint.": "カスタムエンドポイントではモデルIDを手入力してください。",
+  // security-rust-1: the catalog uses the SAVED endpoint and key.
+  "Save the endpoint first to load the OpenRouter list.": "OpenRouterの一覧を取得するには、先にエンドポイントを保存してください。",
+  "Save the API key first to load the OpenRouter list.": "OpenRouterの一覧を取得するには、先にAPIキーを保存してください。",
+  "Model catalog could not be loaded.": "モデル一覧を取得できませんでした。",
+  "{n} catalog entries could not be read and were skipped.": "読み取れない一覧の項目が{n}件あったため、除外しました。",
+  "Search models by name or ID": "名前またはIDでモデルを検索",
+  "Free only": "無料のみ",
+  "{shown} of {total} models": "{total}件中{shown}件",
+  "No models match these filters.": "条件に一致するモデルがありません。",
+  "OpenRouter returned an empty model list.": "OpenRouterから空のモデル一覧が返されました。",
+  Free: "無料",
+  "{input} in / {output} out per 1M tokens": "100万トークンあたり 入力{input} / 出力{output}",
+  "{n} context": "コンテキスト{n}",
+  "Text output": "テキスト出力",
+  "Image output": "画像出力",
+  "Not found in the current OpenRouter catalog": "OpenRouterの現在の一覧に見つかりません",
+  "Unavailable (404)": "利用不可(404)",
+  "The provider could not serve this model in the last AI request. Choose another model.":
+    "直前のAIリクエストで、提供元がこのモデルを利用できませんでした。別のモデルを選んでください。",
+  // ----- end w2-settings --------------------------------------------------------
+  // ----- w2-ai-a: AI actions — busy labels, count toasts, discard notices ------
+  // Busy labels are stored translated in `globalBusy` (see aiActions.ts header).
+  "Analyzing document…": "ドキュメントを分析中…",
+  "Bulletizing…": "箇条書きに変換中…",
+  "Summarizing slide…": "スライドを要約中…",
+  "Suggesting layout…": "レイアウトを提案中…",
+  "Generating image…": "画像を生成中…",
+  "Reviewing document…": "ドキュメントをレビュー中…",
+  "Mapping logic…": "ロジックを可視化中…",
+  "Checking against review criteria…": "審査基準と照合中…",
+  "Refreshing AI context ({i}/{n})…": "AIコンテキストを更新中({i}/{n})…",
+  "Editing {n} paragraphs…": "{n}段落を編集中…",
+  "Editing {done}/{n}…": "編集中 {done}/{n}…",
+  "Grounded from: {names}": "参照元: {names}",
+  "Translated (⌘/Ctrl+Z to undo).": "翻訳しました(⌘/Ctrl+Zで元に戻せます)。",
+  "Updated (⌘/Ctrl+Z to undo).": "更新しました(⌘/Ctrl+Zで元に戻せます)。",
+  "Bulletized into {n} points (⌘/Ctrl+Z to undo).": "{n}項目の箇条書きにしました(⌘/Ctrl+Zで元に戻せます)。",
+  "Slide summarized into {n} points — detached from the text.": "スライドを{n}項目に要約しました — 本文との連動は解除されました。",
+  "Layout set to {layout} (pick Auto to clear it).": "レイアウトを{layout}に設定しました(Autoを選ぶと解除できます)。",
+  "The generated diagram is not valid Mermaid: {error}": "生成された図は有効なMermaidではありません: {error}",
+  "Edited 1 paragraph.": "1段落を編集しました。",
+  "Edited {n} paragraphs.": "{n}段落を編集しました。",
+  "Found {nodes} nodes and {edges} relations.": "{nodes}個のノードと{edges}件の関係が見つかりました。",
+  "AI review: 1 comment.": "AIレビュー: コメント1件。",
+  "AI review: {n} comments.": "AIレビュー: コメント{n}件。",
+  "Map logic: 1 finding (AI opinion, not a verified audit).": "ロジック可視化: 指摘1件(AIの見解であり、検証済みの監査ではありません)。",
+  "Map logic: {n} findings (AI opinion, not a verified audit).": "ロジック可視化: 指摘{n}件(AIの見解であり、検証済みの監査ではありません)。",
+  "Criteria check: {n} of {total} not covered.": "基準チェック: {total}件中{n}件が未対応です。",
+  "The paragraph changed while AI was working — result discarded.": "AIの処理中に段落が変更されたため、結果は破棄されました。",
+  "Nothing to analyze yet — write some text first.": "まだ分析する内容がありません — 先に本文を書いてください。",
+  // NetworkPanel — Recent AI operations (MISS-01)
+  "Recent AI operations": "最近のAI操作",
+  "Copy log": "ログをコピー",
+  "Copied": "コピーしました",
+  "Copy the AI operation log (ids only, no document text) as JSON lines for a QA report": "AI操作ログ(IDのみ・本文は含みません)をQA報告用にJSON Lines形式でコピーします",
+  "Couldn't copy the log to the clipboard.": "ログをクリップボードにコピーできませんでした。",
+  "No AI operations yet in this session.": "このセッションではまだAI操作はありません。",
+  "Kept in memory for this session only (last {n} operations).": "このセッション中のみメモリに保持します(直近{n}件)。",
+  "Time": "時刻",
+  "Action": "操作",
+  "Phase": "段階",
+  "Reason": "理由",
+  "IDs": "ID",
+  "Started": "開始",
+  "Applied": "反映",
+  "Discarded": "破棄",
+  // ----- end w2-ai-a ------------------------------------------------------------
+  // ----- w2-ai-b: Draft dialog / draft progress + report / ghost text ----------
+  // Length options (src/draftLength.ts): Japanese shows characters, {chars} =
+  // {words} × CJK_CHARS_PER_WORD (BUG-005a).
+  // Unit: 文字, the same word the status bar and the source chip use.
+  "Short (~{words} words)": "短め(約{chars}文字)",
+  "Medium (~{words} words)": "標準(約{chars}文字)",
+  "Long (~{words} words)": "長め(約{chars}文字)",
+  "Very long (~{words} words)": "非常に長い(約{chars}文字)",
+  "Length is approximate; the result is reported after drafting.": "長さは目安です。生成後に実際の長さを報告します。",
+  "Drafting…": "下書き中…",
+  "Drafting… {n} characters": "下書き中… {n}文字",
+  "Drafting… {n} / ~{target} characters": "下書き中… {n} / 約{target}文字",
+  "Drafting… ~{n} words": "下書き中… 約{n}語",
+  "Drafting… ~{n} / ~{target} words": "下書き中… 約{n} / 約{target}語",
+  "Draft created — {p} paragraphs, {n} characters.": "下書きを作成しました — {p}段落・{n}文字。",
+  "Draft created — {p} paragraphs, {n} characters (target ~{target}).": "下書きを作成しました — {p}段落・{n}文字(目標 約{target}文字)。",
+  "Draft created — {p} paragraphs, ~{n} words.": "下書きを作成しました — {p}段落・約{n}語。",
+  "Draft created — {p} paragraphs, ~{n} words (target ~{target}).": "下書きを作成しました — {p}段落・約{n}語(目標 約{target}語)。",
+  "The draft is {n} characters, outside ±20% of the ~{target}-character target.": "下書きは{n}文字で、目標(約{target}文字)の±20%を外れています。",
+  "The draft is ~{n} words, outside ±20% of the ~{target}-word target.": "下書きは約{n}語で、目標(約{target}語)の±20%を外れています。",
+  "A draft is already being generated.": "下書きを生成中です。",
+  "The draft stopped before it finished: {error} The partial draft is kept in its tab (unsaved).": "下書きの生成が途中で止まりました: {error} 途中までの下書きはタブに残っています(未保存)。",
+  "Generating…": "生成中…",
+  "The dialog closes as soon as the draft starts to appear.": "下書きが表示され始めると、このダイアログは閉じます。",
+  "Stop waiting (the draft result will be discarded)": "待機をやめる(下書きの結果は破棄されます)",
+  "Retry": "再試行",
+  "Select a file, then choose Open.": "ファイルを選択して「開く」",
+  "Suggestion: {text} (Tab to accept, Esc to dismiss)": "候補: {text}(Tab で確定、Esc で破棄)",
+  // ----- end w2-ai-b ------------------------------------------------------------
+  // ----- w3-healthbar: health bar labels, DiffPanel, report/catalog messages ----
+  "{n} changed since last save": "前回保存から{n}件変更",
+  "Title changed": "タイトルを変更",
+  "Order, analysis or metadata changed": "順序・分析・メタデータを変更",
+  "Unsaved (matches last save)": "未保存(保存時と同じ内容)",
+  "Draft report": "下書きのレポート",
+  "Last draft": "直近の下書き",
+  "Export ({format})": "書き出し ({format})",
+  "Last export — {format}": "直近の書き出し — {format}",
+  "Model unavailable: {model}": "モデル利用不可: {model}",
+  "Network calls this session, counted separately: LLM requests (ai.rs), and fetches through net.rs's guarded safe_fetch — reference pages, images, citation lookups and the OpenRouter model list. Not counted, for example: images shown straight from a web address, and the one-time download of the personal library's embedding model.":
+    "このセッションでの外部通信(別々に集計): LLMへのリクエスト(ai.rs)と、net.rsのsafe_fetchを通した取得(参考資料・画像・引用情報の照会・OpenRouterのモデル一覧)。集計しないものの例: Webアドレスから直接表示する画像、個人ライブラリ用の埋め込みモデルの初回ダウンロード。",
+  Title: "タイトル",
+  "Added ({n})": "追加 ({n})",
+  "Removed ({n})": "削除 ({n})",
+  "Changed ({n})": "変更 ({n})",
+  // Rust report warnings (src/exportWarnings.ts; English text comes from pdf.rs / pptx.rs / openrouter_models.rs)
+  "{n} image(s) replaced by text placeholders (image embedding in PDF is planned).": "画像{n}件をテキストの代替表示に置き換えました(PDFへの画像埋め込みは今後対応予定です)。",
+  "{n} diagram(s) exported as source text (diagram rendering in PDF is planned).": "図{n}件をソースのテキストとして書き出しました(PDFでの図の描画は今後対応予定です)。",
+  "{n} paragraph(s) contain Markdown formatting that is shown as plain text in the PDF.": "{n}段落にMarkdownの書式があり、PDFではそのまま文字として表示されます。",
+  "{n} image(s) couldn't be downloaded and were left out.": "画像{n}件をダウンロードできなかったため、省きました。",
+  "{n} local image(s) couldn't be read from the document's folder and were left out.": "ドキュメントのフォルダから読み込めなかったローカル画像{n}件を省きました。",
+  "{n} image(s) use a format PowerPoint can't embed (e.g. WEBP or SVG) and were left out.": "画像{n}件はPowerPointに埋め込めない形式(WEBPやSVGなど)のため、省きました。",
+  "{n} extra image(s) were left out — only the first 6 images per slide are exported.": "1枚のスライドに書き出せる画像は最初の6件までのため、画像{n}件を省きました。",
+  "{n} image(s) were left out — their slide's layout has no image area.": "スライドのレイアウトに画像の枠がないため、画像{n}件を省きました。",
+  "{n} slide(s) have more text than fits and may be cut off — consider splitting them.": "{n}枚のスライドは文字が収まらず、切れる可能性があります。スライドの分割を検討してください。",
+  "{n} diagram(s) had no rendered snapshot and were left out — export from the app (not the CLI) to include them.": "描画済みの画像がない図{n}件を省きました。含めるには、CLIではなくアプリから書き出してください。",
+  "{n} link(s) don't point to a web or mail address and were exported as plain text.": "リンク{n}件はWebやメールのアドレスではないため、通常のテキストとして書き出しました。",
+  "{n} image(s) couldn't be downloaded and were exported as text placeholders.": "画像{n}件をダウンロードできなかったため、テキストの代替表示として書き出しました。",
+  "{n} local image(s) couldn't be read from the document's folder and were exported as text placeholders.": "ドキュメントのフォルダから読み込めなかったローカル画像{n}件を、テキストの代替表示として書き出しました。",
+  "{n} image(s) couldn't be embedded in RTF (only PNG and JPEG are supported) and were exported as text placeholders.": "画像{n}件はRTFに埋め込めない形式のため(対応はPNGとJPEGのみ)、テキストの代替表示として書き出しました。",
+  "{n} diagram(s) had no rendered snapshot and were exported as source text.": "描画済みの画像がない図{n}件を、ソースのテキストとして書き出しました。",
+  "Skipped {n} catalog entries without a usable model id.": "使えるモデルIDのない一覧の項目{n}件を除外しました。",
+  "Skipped {n} duplicate catalog entries.": "重複した一覧の項目{n}件を除外しました。",
+  // OpenRouter model-list errors (openrouter_models.rs)
+  "The OpenRouter model list is available only with the OpenRouter endpoint.": "OpenRouterのモデル一覧は、エンドポイントがOpenRouterの場合のみ利用できます。",
+  "No API key is set. Add your OpenRouter API key in Settings to load the model list.": "APIキーが設定されていません。設定でOpenRouter APIキーを追加すると、モデル一覧を取得できます。",
+  "Could not reach openrouter.ai to load the model list. Check the connection and try again.": "モデル一覧を取得するためにopenrouter.aiへ接続できませんでした。オフラインか、DNSが応答していない可能性があります。接続を確認して、もう一度お試しください。",
+  "OpenRouter rejected the API key (HTTP {code}). Check the key in Settings.": "OpenRouterがAPIキーを拒否しました(HTTP {code})。設定でキーを確認してください。",
+  "OpenRouter is rate-limiting requests (HTTP 429). Wait a moment, then try again.": "OpenRouterが利用を制限しています(HTTP 429)。少し待ってから、もう一度お試しください。",
+  "OpenRouter is unavailable right now (HTTP {code}). Try again later.": "OpenRouterは現在利用できません(HTTP {code})。時間をおいて、もう一度お試しください。",
+  "Could not load the OpenRouter model list (HTTP {code}).": "OpenRouterのモデル一覧を取得できませんでした(HTTP {code})。",
+  "Loading the OpenRouter model list timed out after {n} s. Check the connection and try again.": "OpenRouterのモデル一覧の取得が{n}秒でタイムアウトしました。接続を確認して、もう一度お試しください。",
+  "Could not load the OpenRouter model list: {detail}": "OpenRouterのモデル一覧を取得できませんでした: {detail}",
+  "Refusing to load the model list: openrouter.ai resolved to a private or loopback address (a VPN or DNS override?).": "モデル一覧の取得を中止しました: openrouter.aiがプライベートまたはループバックのアドレスに解決されました(VPNやDNSの設定を確認してください)。",
+  "The OpenRouter model list exceeded the {n} MB limit and was not loaded.": "OpenRouterのモデル一覧が上限の{n} MBを超えたため、読み込みませんでした。",
+  "The OpenRouter model list was not valid JSON ({detail}).": "OpenRouterのモデル一覧が正しいJSONではありませんでした({detail})。",
+  "The OpenRouter model list had an unexpected shape.": "OpenRouterのモデル一覧の形式が想定と異なります。",
+  // ----- end w3-healthbar ------------------------------------------------------
+  // ----- w4-polish: relationship graph (src/networkLabels.ts) + export toast ---
+  Relationships: "関係グラフ",
+  "out of date": "最新ではありません",
+  "No relationships yet. Click “Refresh” to extract the logical structure of your document.":
+    "まだ関係はありません。「更新」をクリックすると、文書の論理構造を抽出します。",
+  "analyzed {when}": "{when}に分析",
+  "{n}s ago": "{n}秒前",
+  "{n} min ago": "{n}分前",
+  "{n}h ago": "{n}時間前",
+  "{n}d ago": "{n}日前",
+  cause: "原因",
+  effect: "結果",
+  evidence: "根拠",
+  claim: "主張",
+  elaboration: "詳述",
+  contrast: "対比",
+  condition: "条件",
+  example: "例",
+  definition: "定義",
+  sequence: "順序",
+  "Exported as {format}.": "{format}として書き出しました。",
+  // ----- end w4-polish ----------------------------------------------------------
+  // ----- w5-copy: Japanese-UI completeness pass (UX-MIXED-ENGLISH, MISS-05/07/08/10) --
+  // ChunkAiMenu (UX-AI-ACTIONS-LABEL: the ✨ trigger is named by outcome, ui.md #13)
+  "Rewrite, translate or illustrate with AI…": "AIで書き換え・翻訳・図解…",
+  "Rewrite this heading with AI…": "AIで見出しを書き換え…",
+  "e.g. English, Japanese, French": "例: 英語、日本語、フランス語",
+  "e.g. concise and formal": "例: 簡潔でフォーマルに",
+  "e.g. as a flowchart of the process": "例: 処理の流れをフローチャートで",
+  "e.g. Rewrite this for a general audience": "例: 一般読者向けに書き直す",
+  Run: "実行",
+  "graph out of date": "グラフが最新ではありません",
+  "1 context summary will refresh on run": "実行時に文脈要約を1件更新します",
+  "{n} context summaries will refresh on run": "実行時に文脈要約を{n}件更新します",
+  "Rewrites this paragraph in place as bullet points — replaces its text immediately, with no reviewable diff (⌘/Ctrl+Z to undo).":
+    "段落をその場で箇条書きに書き換えます — 差分確認なしで即時に置き換わります(⌘/Ctrl+Z で元に戻せます)。",
+  // ChunkView gutter + image chunk
+  "Set heading level {n}": "見出しレベル{n}に設定",
+  "(empty image)": "(空の画像)",
+  "AI-generated image": "AIが生成した画像",
+  "Use version {n}": "バージョン{n}を使う",
+  "Version {n}": "バージョン{n}",
+  "(empty)": "(空)",
+  "Review comments ({n} open)": "レビューコメント(未解決 {n}件)",
+  // CitationsPanel (MISS-05)
+  "Imported {n} citation(s) from {file}, {skipped} skipped — see the details below.":
+    "{file} から{n}件の文献を読み込みました({skipped}件はスキップ — 詳細は下記)。",
+  "Imported {n} citation(s) from {file}.": "{file} から{n}件の文献を読み込みました。",
+  "Removed “{title}” from the citation library.": "「{title}」を文献ライブラリから削除しました。",
+  "Added “{title}” to the citation library.": "「{title}」を文献ライブラリに追加しました。",
+  "Import your own BibTeX library (from Zotero or any reference manager), or look up a DOI/arXiv id — this is not a literature search engine, it only formats references you already have. Supported styles: APA (7th ed.) and IEEE.":
+    "手持ちのBibTeXライブラリ(Zoteroなどの文献管理ソフトから)を読み込むか、DOI/arXiv IDで検索します — 文献検索エンジンではなく、すでにお持ちの文献を整形するだけです。対応スタイル: APA(第7版)とIEEE。",
+  "Save this document first — the citation library is stored alongside the saved file.":
+    "先にこのドキュメントを保存してください — 文献ライブラリは保存したファイルと同じ場所に保存されます。",
+  "1 entry": "1件",
+  "{n} entries": "{n}件",
+  "1 entry skipped during import:": "読み込み時に1件をスキップしました:",
+  "{n} entries skipped during import:": "読み込み時に{n}件をスキップしました:",
+  "Nothing imported yet. Import a .bib file above, or look up a DOI/arXiv id.":
+    "まだ何も読み込まれていません。上で .bib ファイルを読み込むか、DOI/arXiv IDで検索してください。",
+  "cited [{n}]": "引用 [{n}]",
+  "Remove “{title}” from the citation library": "「{title}」を文献ライブラリから削除",
+  "1 cited entry this session": "このセッションで引用した文献: 1件",
+  "{n} cited entries this session": "このセッションで引用した文献: {n}件",
+  "arXiv id": "arXiv ID",
+  "Look up": "検索",
+  // DraftModal
+  "No readable text found in {source}.": "{source} から読み取れるテキストがありません。",
+  "Reference URL": "参考URL",
+  "e.g. The role of attention mechanisms in NLP": "例: 自然言語処理における注意機構の役割",
+  "(optional)": "(任意)",
+  "{n} chars": "{n}文字",
+  "Remove {name}": "{name} を削除",
+  "https://… reference URL": "https://… 参考URL",
+  "The draft is grounded in this material (it won't copy it verbatim).": "下書きはこの資料を根拠にします(そのまま転記はしません)。",
+  // Editor (MISS-10: where the document title also appears)
+  "Could not read “{name}”.": "「{name}」を読み込めませんでした。",
+  "{n} images inserted.": "{n}枚の画像を挿入しました。",
+  "Editing the title writes it as the Markdown H1; it also titles any slide content before the first heading":
+    "タイトルを編集するとMarkdownのH1として書き込まれます。スライドでは最初の見出しより前の内容のタイトルにもなります",
+  // SelectionBar
+  "Edit {n} paragraphs": "{n}段落を編集",
+  "e.g. Make each more concise and formal": "例: それぞれをより簡潔でフォーマルに",
+  "Merged {n} paragraphs.": "{n}段落を結合しました。",
+  "{n} selected": "{n}件選択中",
+  "Select 2+ adjacent text paragraphs to merge": "結合するには隣接する2つ以上の段落を選択",
+  // CriteriaPanel
+  "Type your own review criteria, one per line (e.g. from a grant's review rubric) — this app has no built-in list. The AI checks whether each one has a supporting paragraph anywhere in the document (run Analyze first).":
+    "審査基準を1行に1つずつ入力してください(例: 助成金申請の審査項目から) — このアプリには組み込みの基準リストはありません。AIが、各基準を裏付ける段落が文書内にあるかを確認します(先に「分析」を実行してください)。",
+  "One criterion per line, e.g.:": "1行に1つの基準。例:",
+  "Explains the significance of the research": "研究の意義を説明している",
+  "States a clear methodology": "明確な方法論を示している",
+  "1 criterion": "1件の基準",
+  "{n} criteria": "{n}件の基準",
+  // PersonalLibraryPanel (MISS-05)
+  "No extractable text found in {file}.": "{file} から抽出できるテキストがありません。",
+  "Added {file} (1 passage).": "{file} を追加しました(1パッセージ)。",
+  "Added {file} ({n} passages).": "{file} を追加しました({n}パッセージ)。",
+  "Removed {file} from the personal library.": "{file} を個人ライブラリから削除しました。",
+  "Add your own past papers/notes so AI actions can optionally ground writing in them — fully on-device (embedding, indexing, and search all run locally; only a one-time embedding-model download touches the network).":
+    "過去の論文やノートを追加すると、AI操作が必要に応じてそれを根拠に文章を書けるようになります — 完全に端末内で動作します(埋め込み・索引作成・検索はすべてローカルで実行され、通信は初回の埋め込みモデルのダウンロードのみです)。",
+  "Personal RAG is off. Turn on “Personal knowledge base” in Settings to add files here.":
+    "個人RAGはオフです。ここにファイルを追加するには、設定で「パーソナルナレッジベース」をオンにしてください。",
+  "1 source indexed": "1件のソースを索引済み",
+  "{n} sources indexed": "{n}件のソースを索引済み",
+  "1 passage": "1パッセージ",
+  "{n} passages": "{n}パッセージ",
+  "Remove {file} from the personal library": "{file} を個人ライブラリから削除",
+  Search: "検索",
+  // ReviewPanel
+  "(empty paragraph)": "(空の段落)",
+  You: "あなた",
+  "AI's opinion on possibly-unsupported claims and contradictions, using the relationship graph (run Analyze first) — not a verified audit":
+    "関係グラフを使った、根拠が不十分かもしれない主張や矛盾についてのAIの意見です(先に「分析」を実行してください) — 検証済みの監査ではありません",
+  // ReviewPanel empty state (continues "No comments yet. Use a paragraph's" + icon)
+  "button to add one, or run “AI review” / “Map logic” above.": "ボタンで追加するか、上の「AIレビュー」/「ロジックを可視化」を実行してください。",
+  // SlideEditor
+  "{n} diagram(s) on this slide are not yet exported to .pptx": "このスライドの{n}件の図は、まだ.pptxに書き出されません",
+  "{n} diagram(s) in the editor — not yet shown on slides or exported to .pptx.":
+    "エディタ内の{n}件の図 — スライドにはまだ表示されず、.pptxにも書き出されません。",
+  "May overflow — this slide has more text than fits the exported slide. Consider splitting it (Edit view: “Split slide here”).":
+    "はみ出す可能性があります — このスライドは書き出し先に収まらないほどテキストが多いです。分割を検討してください(編集表示の「ここでスライドを分割」)。",
+  long: "長い",
+  "Ask the AI to pick the best layout for this slide's content. The text is untouched — only the layout changes (pick Auto to clear it).":
+    "このスライドの内容に最適なレイアウトをAIに選ばせます。テキストは変更されず、レイアウトだけが変わります(「自動」を選ぶと解除)。",
+  "No slides yet — click “Add slide”.": "まだスライドがありません — 「スライドを追加」をクリックしてください。",
+  "Detached slide — shows this summary instead of the document text. Edit here (one bullet per line); click “Re-link” above to reconnect to the text.":
+    "切り離されたスライド — 文書のテキストの代わりにこの要約を表示します。ここで編集し(1行に1項目)、上の「再リンク」で本文に再接続します。",
+  "{n} more image(s) on this slide — only the first {max} are shown and exported": "このスライドにはさらに{n}枚の画像があります — 表示・書き出しされるのは最初の{max}枚だけです",
+  "+{n} more": "ほか{n}枚",
+  // Markdown toolbar (MISS-07 scope note, MISS-08 per-surface helper; src/markdownSurfaceHelp.ts)
+  "Editing Markdown source.": "Markdownソースを編集中です。",
+  "Left: source · Right: preview (click text to edit).": "左: ソース · 右: プレビュー(テキストをクリックして編集)。",
+  "Click text to edit it directly; switch to Edit for the full Markdown source.":
+    "テキストをクリックすると直接編集できます。Markdownソース全体は「編集」で編集します。",
+  "Applies to all Markdown documents": "すべてのMarkdown文書に適用",
+  // App (lazy panels)
+  "Loading graph…": "グラフを読み込み中…",
+  "Loading review…": "レビューを読み込み中…",
+  // HealthBar
+  "{n} paragraph(s) over the {limit}-character limit set in Settings — click to list them":
+    "{n}段落が設定の{limit}文字の上限を超えています — クリックで一覧表示",
+  // SettingsModal writing-tone presets (rendered as t(tone.label))
+  Default: "既定",
+  Blog: "ブログ",
+  Memo: "メモ",
+  Report: "レポート",
+  Scientific: "科学論文調",
+  "Academic paper": "学術論文",
+  // fileActions (dialog filter names, toasts)
+  "Saved, but couldn't update your personal library: {error}": "保存しましたが、個人ライブラリを更新できませんでした: {error}",
+  "Opened and repaired this file: {notes}": "このファイルを修復して開きました: {notes}",
+  "Text documents": "テキスト文書",
+  Images: "画像",
+  "NurumayuEditor documents": "NurumayuEditor 文書",
+  "NurumayuEditor Document": "NurumayuEditor 文書",
+  "Exported {n} slide(s) as PPTX.": "{n}枚のスライドをPPTXとして書き出しました。",
+  // Image read errors from Rust (src/imageErrors.ts, IMAGE_ERROR_KEYS)
+  "Can't read image “{name}”: unsupported image type. Use PNG, JPEG, GIF, WEBP, or BMP.":
+    "画像「{name}」を読み込めません: 対応していない画像形式です。PNG・JPEG・GIF・WEBP・BMPを使用してください。",
+  "Can't read image “{name}”: the file is {size} MB, over the {limit} MB limit.":
+    "画像「{name}」を読み込めません: ファイルサイズが{size} MBで、上限の{limit} MBを超えています。",
+  "Image file not found.": "画像ファイルが見つかりません。",
+  // ----- end w5-copy ------------------------------------------------------------
 };
 
 /** Translate one English UI string. Unknown keys fall back to the key itself. */
@@ -522,6 +937,34 @@ export function translate(key: string, lang: UiLang): string {
  */
 export function tNow(key: string): string {
   return translate(key, uiLangFor(useStore.getState().settings?.defaultTargetLanguage));
+}
+
+/** Values for `{name}` placeholders in a translated string. */
+export type I18nVars = Record<string, string | number>;
+
+/**
+ * Fill `{name}` placeholders. Values are inserted literally (a `$&` in a
+ * provider message stays `$&`); placeholders with no value are left as-is.
+ */
+export function interpolate(template: string, vars: I18nVars): string {
+  return template.replace(/\{(\w+)\}/g, (whole, name: string) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : whole
+  );
+}
+
+/** `translate` then `interpolate`: the key keeps its `{name}` placeholders,
+ *  and the Japanese entry must contain the same placeholders. */
+export function translateWith(key: string, lang: UiLang, vars: I18nVars): string {
+  return interpolate(translate(key, lang), vars);
+}
+
+/**
+ * `tNow` with interpolation, for strings that carry values (counts, model
+ * ids): `tf("Draft created — {n} chunks.", { n })`. Pass the key as a string
+ * literal so the dictionary-coverage test in i18n.test.ts can see it.
+ */
+export function tf(key: string, vars: I18nVars): string {
+  return interpolate(tNow(key), vars);
 }
 
 /** The active UI language — for the few strings that interpolate values and

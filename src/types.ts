@@ -40,8 +40,9 @@ export interface ChunkMetadata {
   // Optional ordering index for a slide's images (lower renders first; ties
   // broken by document order — see `slideImages` in slides.ts).
   slot?: number;
-  // Speaker notes for the slide this chunk begins (only meaningful on a
-  // heading chunk that starts a slide). Mirrors Rust's ChunkMetadata::notes.
+  // Speaker notes for the slide this chunk leads: read only from a slide's
+  // lead chunk (its heading, or the first chunk of a heading-less leading
+  // slide — see slides.ts slideNotes). Mirrors Rust's ChunkMetadata::notes.
   notes?: string;
   // Personal RAG (開発.txt Stage 3, item 3-1) auto-accumulation (Q11/Q16): the
   // user has explicitly marked this chunk's content as vetted enough to feed
@@ -76,11 +77,14 @@ export interface Document {
   mode?: DocMode; // defaults to "editor" when absent (back-compat)
   analysis?: AnalysisResult; // persisted relationship graph (spec §3.4)
   /**
-   * Exact Markdown source captured while the Markdown workspace was
-   * authoritative. May linger stale after `mode` changes away from
-   * "markdown" (ordinary chunk edits don't clear it) — every consumer
-   * (`documentToMarkdown`/`document_to_md`) MUST ignore this field unless
-   * `mode === "markdown"`, deriving fresh text from `chunks` otherwise.
+   * Canonical Markdown text of a Markdown-backed document. In "markdown"
+   * mode it is current and read verbatim. In "editor"/"slide" mode it is the
+   * merge baseline: TS `documentToMarkdown` keeps the original bytes of every
+   * block the chunks still contain and re-serializes only edited chunks
+   * (chunk edits and setMode keep it; setTitle rewrites only its H1 line).
+   * GUI .md saves send `{mode: "markdown", markdownSource: <merged text>}`,
+   * so Rust `document_to_md` writes it verbatim; Rust has no merge and
+   * ignores this field outside "markdown" mode (CLI/MCP regeneration).
    */
   markdownSource?: string;
 }
@@ -133,7 +137,7 @@ export interface Slide {
   order: number;
   layout: SlideLayout;
   chunks: Chunk[];
-  notes: string; // speaker notes, derived from the slide's heading chunk's metadata.notes
+  notes: string; // speaker notes, derived from the slide's lead chunk's metadata.notes (deck.rs)
 }
 
 export interface Deck {
@@ -148,16 +152,78 @@ export interface PptxReport {
   warnings: string[];
 }
 
+/** Result of a PDF export (mirror of Rust `pdf::PdfReport`; the field lists
+ * are kept equal by src/pdfExport.test.ts): page count plus a counted warning
+ * per lossy class — images as text placeholders, diagrams as source text, and
+ * Markdown-mode paragraphs whose markup prints literally. */
+export interface PdfReport {
+  pages: number;
+  warnings: string[];
+  imagesOmitted: number;
+  diagramsAsSource: number;
+  markdownAsPlainText: number;
+}
+
+/** Result of an RTF export (mirror of Rust `fileio::RtfReport`; the field
+ * lists are kept equal by src/rtfReport.test.ts): one counted warning per
+ * lossy class — images kept as "[Image: …]" text placeholders (not downloaded,
+ * local file unreadable, or a format RTF can't embed) and diagrams written as
+ * source text. `export_document` returns it for "rtf" and null for txt/md. */
+export interface RtfReport {
+  warnings: string[];
+  imagesNotDownloaded: number;
+  localImagesUnresolved: number;
+  imagesNotEmbeddable: number;
+  diagramsAsSource: number;
+}
+
 /** "Zero external transmission" visibility (開発.txt Stage 2, item 2-2):
  * process-wide counters mirroring `commands::NetworkStats` — LLM calls
- * (ai.rs) and reference/image fetches (net.rs's `safe_fetch`) are two
- * separate chokepoints, so they stay as two distinct pairs of numbers. */
+ * (ai.rs) and fetches through net.rs (reference/image/citation lookups and
+ * the OpenRouter model list) are two separate chokepoints, so they stay as
+ * two distinct pairs of numbers. */
 export interface NetworkStats {
   aiCalls: number;
   aiBytes: number;
   fetchCalls: number;
   fetchBytes: number;
 }
+
+/** OpenRouter prices as the API's decimal USD strings, verbatim (mirror of
+ * Rust `openrouter_models::OpenRouterPricing`; field names and nullability
+ * are contract-tested in openrouter_models.rs). `null` = absent/unusable. */
+export interface OpenRouterPricing {
+  prompt: string | null;
+  completion: string | null;
+  request: string | null;
+  image: string | null;
+  imageOutput: string | null;
+}
+
+/** One OpenRouter catalog entry (mirror of Rust
+ * `openrouter_models::OpenRouterModel`). `name` falls back to `id`. */
+export interface OpenRouterModel {
+  id: string;
+  name: string;
+  description: string;
+  contextLength: number | null;
+  inputModalities: string[];
+  outputModalities: string[];
+  supportedParameters: string[];
+  pricing: OpenRouterPricing;
+}
+
+/** Result of `list_openrouter_models` (mirror of Rust
+ * `openrouter_models::OpenRouterCatalog`): usable models plus the count of
+ * dropped rows (no id / duplicate id) and one message per dropped class. */
+export interface OpenRouterCatalog {
+  models: OpenRouterModel[];
+  skipped: number;
+  warnings: string[];
+}
+
+/** Markdown preview background tones (see previewBackground.ts). */
+export type PreviewBackground = "white" | "warm" | "gray" | "paper" | "mint" | "blue";
 
 export interface Settings {
   endpoint: string;
@@ -174,7 +240,8 @@ export interface Settings {
   // Ghost-text inline completion (開発.txt Stage 2, item 2-4): when true, only
   // fire completion requests if the configured endpoint is local (privacy
   // preference) — enforced backend-side in commands::ai_ghost_complete_stream,
-  // not just here. Default false (opt-in), mirrors Rust `Settings`.
+  // not just here. Default false: the local-only RESTRICTION is opt-in; ghost
+  // text itself is on whenever aiReady(). Mirrors Rust `Settings`.
   limitCompletionToLocalModel?: boolean;
   // Grant-application beachhead (開発.txt Stage 2, item 2-1): global
   // character-limit warning threshold — "warn me when any paragraph exceeds
@@ -210,6 +277,12 @@ export interface Settings {
    * determined" and triggers one real read on the Rust side.
    */
   apiKeyPresent?: boolean;
+  /** Markdown preview background tone; absent = "white". Mirrors Rust
+   * `Settings.preview_background` (unknown values are reset on load). */
+  previewBackground?: PreviewBackground;
+  /** Files sidebar width in px; absent = default. Mirrors Rust
+   * `Settings.sidebar_width` (clamped to its bounds on load). */
+  sidebarWidth?: number;
 }
 
 /** One indexed source file in the personal knowledge base (rag.rs). */

@@ -7,19 +7,19 @@
 #      and paste it into `sha256` below (replace :no_check).
 #   4. Host this cask in a tap, e.g.  kumeS/homebrew-tap, then:
 #         brew tap kumeS/tap
-#         brew install --cask nurumayufacet
+#         brew install --cask nurumayueditor
 #
 # NOTE: an unsigned / un-notarized .app is quarantined by Gatekeeper. Either
 # sign + notarize the build, or users must run:
 #   xattr -dr com.apple.quarantine "/Applications/NurumayuEditor.app"
-cask "nurumayufacet" do
-  version "1.3.0"
+cask "nurumayueditor" do
+  version "1.4.0"
   sha256 :no_check # replace with the real sha256 of the released .dmg
 
-  url "https://github.com/kumeS/NurumayuFacet/releases/download/v#{version}/NurumayuEditor_#{version}_aarch64.dmg"
+  url "https://github.com/kumeS/NurumayuEditor/releases/download/v#{version}/NurumayuEditor_#{version}_aarch64.dmg"
   name "NurumayuEditor"
   desc "Writing app where every document is already a slide deck"
-  homepage "https://github.com/kumeS/NurumayuFacet"
+  homepage "https://github.com/kumeS/NurumayuEditor"
 
   depends_on macos: :big_sur
 

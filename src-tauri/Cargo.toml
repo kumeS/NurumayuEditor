@@ -1,6 +1,6 @@
 [package]
 name = "nurumayueditor"
-version = "1.3.0"
+version = "1.4.0"
 description = "NurumayuEditor — local-first Markdown, document, and slide editor"
 authors = ["Satoshi Kume"]
 license = "Artistic-2.0"

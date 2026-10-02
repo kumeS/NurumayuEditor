@@ -789,6 +789,11 @@ mod tests {
         let mut idx = test_index();
         idx.add_source("/papers/a.md", "Alpha.\n\nBeta.").unwrap();
 
+        // Exact equality on process-global counters: hold the shared guard,
+        // which excludes every guarded fetch test, including openrouter_models'
+        // fetch tests and ai.rs's AI_CALLS tests (see
+        // `net::network_counter_test_guard`).
+        let _g = crate::net::network_counter_test_guard();
         let (net_calls_before, _) = crate::net::stats();
         let (ai_calls_before, _) = crate::ai::ai_call_stats();
 

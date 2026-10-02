@@ -2,6 +2,194 @@
 
 ## Unreleased
 
+_Nothing yet._
+
+## v1.4.0 — 2026-10-02
+
+Everything since v1.3.0: the QA fix pass below, plus the Markdown workspace,
+Stage 1–3 features and the rebrand, which were built after v1.3.0 and had not
+shipped under a version number. Release notes with the full **Known Issues**
+and **Future Release** lists (Japanese): `release-notes/v1.4.0.md`.
+
+### QA fix pass (QA run 20260927-computer-use-v1, 2026-10-01)
+
+Fixes for BUG-001–BUG-020 (BUG-004 was withdrawn by QA), G11 and the UX
+audit. All three suites pass: `npm test` 67 files / 1336 tests, `npm run build`,
+and `cargo test --lib` 346 tests. Tauri capabilities and the CSP are unchanged.
+Items that only a person can confirm in the installed app are listed in
+`../qa-results/20260927-computer-use-v1/retest-checklist-20261001.md`, which is outside this repository.
+
+**Data integrity**
+
+- A late AI result can no longer land in the wrong document. Every AI action
+  records the tab and the document load it started in. It commits only into
+  that same load. Reopening the same `.aix` file into the same tab counts as a
+  different load, even though the chunk ids are the same. Paragraph rewrites
+  (per-paragraph actions, bulletize, context summaries) also require the
+  paragraph to still hold the text that was sent. Discarded results change
+  nothing. (BUG-001)
+- Ghost-text suggestions are requested only after you type in a paragraph,
+  never on focus alone. Opening a file, switching tabs or switching modes makes
+  no AI call. Tab accepts a suggestion only if it was made for the current text
+  of the same paragraph in the same document load. (BUG-001)
+- The network panel has a new **Recent AI operations** log. It records the
+  start, apply or discard of each operation, with a reason code for each
+  discard. It holds ids only, never text or keys, keeps the last 200 entries
+  for this session, and has a **Copy log** button. (BUG-001 retest aid)
+- Opening a file while an AI draft or other AI work is pending never reuses that
+  busy tab. (BUG-001)
+- Switching between Markdown, Editor and Slides is now a view change only. It
+  never marks the document unsaved. An unedited round trip leaves the Markdown
+  source byte-identical: no injected file-name H1, no added trailing newline,
+  blank-line runs and h4–h6 kept, and CRLF files stay CRLF. Editing one
+  paragraph rewrites only that paragraph's bytes. Notes, layouts and title edits
+  no longer throw the source away. YAML frontmatter is kept verbatim and never
+  becomes a chunk or a slide. `.md` saves write exactly the merged Markdown that
+  the editor shows. (BUG-019)
+- Opening a Markdown file in the source editor no longer marks a CRLF file
+  unsaved or converts it to LF.
+- An unclosed code fence no longer swallows the paragraphs placed after it when
+  the Markdown is rebuilt.
+- `~~~` fences are recognised, and a heading such as `## Using C#` keeps its
+  `#`.
+- Save marks clean only the tab and the document load it actually wrote. A
+  keystroke typed during the write keeps the tab unsaved.
+- Analyze no longer stamps a summary of older text as fresh when you edit during
+  the run.
+- Undoing every tab back to its saved state now clears the crash-recovery
+  session.
+- Stopping an AI action and then starting another on the same paragraph no
+  longer lets the stopped result commit.
+
+**Editing and undo**
+
+- Undo goes back one state at a time: STATE_A → select → STATE_B → ⌘Z returns
+  to STATE_A. Typing over a selection, paste, cut, a replacement, an inserted
+  citation and a pause longer than 1.5 s each start a new undo step. Japanese
+  IME composition is never split, even after a long pause. (BUG-002)
+- Undo back to the saved document clears the unsaved marker, and redo back onto
+  it does too. (MISS-12)
+- ⌘Z / ⇧⌘Z in plain fields (titles, notes, dialog fields, the palette) undo that
+  field's own typing instead of the document.
+
+**Markdown, Slides and export**
+
+- **Export as PDF** now opens a save dialog and writes the PDF directly, using
+  the same renderer as the CLI. It no longer depends on a print dialog. What the
+  PDF could not carry is counted in the persistent export report in the status
+  bar: images become placeholders, diagrams print as Mermaid source, and
+  Markdown markup prints literally. Japanese text is embedded with a system
+  Unicode font. (BUG-003)
+- Speaker notes work on the first slide when its title comes from the document
+  title. Notes now live on the slide's lead chunk, appear with `N` in Present,
+  and are exported to the PPTX notes page. (BUG-007)
+- Slide bodies render Markdown in Preview, Present and PPTX: bold, italic,
+  inline code, links, separate list items with nesting and numbering, code
+  blocks in a monospace font without fences, and quotes. The TS and Rust
+  converters share one golden fixture. Only http(s) and mailto links are
+  clickable in the PPTX. The overflow warning counts visible text only.
+  (BUG-020)
+- PPTX export embeds images given as paths relative to the document folder, as
+  the preview already did. A figure that cannot be read is reported as "couldn't
+  be read from the document's folder". (G11)
+- RTF exports now report what they could not carry, in the GUI, the CLI and MCP.
+- The Markdown source editor no longer underlines headings or overlays a heavy
+  active-line and selection colour on Japanese text. (BUG-008)
+- The status bar counts Japanese documents in characters (文字), not "words".
+  Diagrams and images are excluded, and the tooltip shows both counts.
+  (BUG-012)
+- AI drafts ask Japanese, Chinese and Korean output for a length in characters,
+  with a ceiling. After drafting, the result reports the achieved length against
+  the target. A miss of more than ±20% is kept in the persistent report.
+  (BUG-005)
+
+**Dialogs and keyboard**
+
+- The unsaved-changes dialog now offers **Save / Don't Save / Cancel**, for
+  closing a tab and for ⌘Q (asked once per unsaved tab). Esc or a dismissed
+  dialog always means Cancel. A cancelled Save As or a failed write keeps the
+  tab open. (BUG-011)
+- The last tab can be closed. It is replaced by a fresh untitled tab, and the
+  close X is always visible. ⌘W closes the tab, not the window. (BUG-018)
+- Draft, Help, Settings, the prompt and the command palette share one modal
+  layer. Esc closes the topmost dialog, except during IME conversion. Tab is
+  trapped inside the dialog, the background is inert, and focus returns when the
+  dialog closes. While a dialog is open, document shortcuts and menu commands do
+  nothing. ⌘K does not open the palette over another dialog. (BUG-016/017)
+- A Japanese IME Enter or Esc that confirms a conversion no longer submits or
+  closes the palette, prompts, Draft, Settings or the find bar.
+- No document shortcut or menu command acts behind presentation mode.
+- An AI draft that fails before any content arrives no longer leaves an empty
+  tab. The dialog stays open with your inputs, an inline error and Retry. A
+  failure after partial content keeps the partial draft in its own unsaved tab.
+  A draft that finishes in a background tab lands in that tab. (BUG-014)
+- Analyze is disabled and does nothing on an empty document. The changes label
+  never says "No changes" while the document is unsaved, and reports
+  title-only changes. (BUG-015)
+
+**Find and Replace** (BUG-010)
+
+- New Find (⌘F), Find and Replace (⌥⌘F), Find Next/Previous (⌘G / ⇧⌘G) and Go to
+  Line (⌘L, Markdown source). They are available from the Edit menu, the
+  palette and a docked find bar, which is not a modal. Search handles CJK and
+  mixed scripts, with case and whole-word options. Replacement text is inserted
+  literally. Replace All is one undo step. ⌘Z right after Replace undoes the
+  replacement. Full-width digits typed with the IME work in Go to Line. Find in
+  Slides mode is planned.
+
+**Settings and models**
+
+- The retired `meta-llama/llama-3.3-70b-instruct:free` preset is no longer
+  seeded for new installs. Lists you already saved are left as they are.
+  (BUG-013)
+- An HTTP 404 from the provider is classified the same way on every path. It
+  names the model and is shown in Japanese. The status bar keeps a persistent
+  **モデル利用不可: {model}** chip with **設定を開く**. (BUG-013)
+- New **OpenRouter model catalog** in Settings (palette: "Browse OpenRouter
+  models…"). Nothing is fetched until you press Fetch. The stored API key is
+  sent only when the *saved* endpoint is OpenRouter.
+- Export and save commands refuse a path without the expected extension. This
+  includes dotfiles such as `.zshrc`.
+- Settings, keychain, session and file commands no longer run on the main
+  thread. This is a BUG-006 mitigation, not a fix.
+
+**Japanese UI**
+
+- The remaining English in the Japanese UI is translated. This covers toasts,
+  the Draft dialog, Citations, Library, the slide rail, the network panel,
+  export warnings, AI errors and Help, whose 日本語 page now uses the real
+  Japanese control names. Wording fixes include 「Markdown」, 「ファイル一覧を
+  非表示／表示」, a Save split button with 別名で保存… ⇧⌘S (⇧⌘S used to overwrite),
+  and Draft lengths in 文字. (BUG-009, UX audit)
+- The per-paragraph ✨ button is now named by outcome:
+  「AIで書き換え・翻訳・図解…」.
+- Slide commands are in the palette in Slides mode: add, duplicate, delete,
+  merge, split, AI layout, summarize.
+- Help shows the build identity, for example `バージョン 1.4.0 (abc1234-dirty)`,
+  so a QA report can name the exact binary.
+
+**Known limitations / planned** (summary — the complete Known Issues and
+Future Release lists are in `release-notes/v1.4.0.md`)
+
+- BUG-006 (intermittent accessibility hang on long Markdown) is mitigated, not
+  closed. Closing it needs a profiling run with Instruments.
+- BUG-019c (`**# 見出し**` wrapping) has no code path. Confirm it by clipboard
+  or a file diff, not by an accessibility read.
+- English-output draft length overrun (BUG-005) has not been re-verified.
+- An empty ATX heading (`## ` with no text) is not treated as a heading, in the
+  GUI or the CLI/MCP import.
+- Find in Slides mode, slide-title Markdown, structured tables in slides and
+  PPTX, and a native **Print…** command are planned.
+- The PPTX has no notes master. Some versions of PowerPoint or Keynote may offer
+  to repair a deck that has speaker notes.
+- The OpenRouter catalog needs the endpoint and key to be saved first; until
+  then **Fetch** is disabled and says why.
+- Images read for the preview or export are limited by extension and size
+  (25 MB), but not to the document folder. MCP export does not resolve
+  document-relative figures yet; that is pending a decision.
+- The unsaved-dialog button order ([Cancel][Don't Save][Save]) is a recorded
+  deviation that is awaiting product sign-off.
+
 ### NurumayuEditor + Markdown workspace
 
 - Renamed the application to **NurumayuEditor** across the window, native menu,
@@ -28,6 +216,8 @@
   proper `notesSlide` OOXML part in `.pptx` (skipped entirely for slides with no
   notes, so empty decks stay untouched), and round-tripped losslessly through
   `.aix`. XML-escaped through the same helper as slide bodies.
+  _(Superseded in the QA fix pass above: notes now live on the slide's lead
+  chunk, so a title-derived first slide can hold notes too — BUG-007.)_
 - **"Changes since last save" view** — the health bar now shows how many
   paragraphs changed since the last save/open, backed by a new document-level
   diff (added / removed / changed, by chunk id, CJK-safe) and a docked panel
@@ -39,7 +229,7 @@
   rendered with the exact same slide component Preview/export use, so what you
   present matches what exports. A weekly lab-meeting talk no longer needs a
   PPTX export step first.
-- **Headless AI via CLI** — `nurumayufacet ai <verb> <file.aix> <chunkId>
+- **Headless AI via CLI** — `nurumayueditor ai <verb> <file.aix> <chunkId>
   [instruction] [--json]` runs any existing per-paragraph AI action
   (translate/proofread/summarize/…) from a script or agent, without the GUI.
   Read-only in this pass (prints a result, does not modify the source file).
@@ -56,7 +246,7 @@
   call sites in `ai.rs` (via their shared retry funnel) *and* `net.rs`'s
   guarded reference/image fetch — correcting an earlier assumption that
   `net.rs` alone was the sole chokepoint; it wasn't.
-- **Minimal MCP server** (`nurumayufacet mcp`) — a standards-correct,
+- **Minimal MCP server** (`nurumayueditor mcp`) — a standards-correct,
   read-only Model Context Protocol server over stdio (JSON-RPC 2.0,
   newline-delimited), so any MCP client (Claude Desktop, Claude Code, or
   otherwise) can inspect a `.aix` document without the GUI: `list_chunks`,
@@ -150,6 +340,9 @@ views didn't treat each other as equals — this closes that gap.
   (Markdown keeps the editable ` ```mermaid ` fence; PDF already printed the
   live SVG, and unmounted diagrams now render offscreen instead of falling
   back to raw code). CLI exports can't render, and say so in their warning.
+  _(Superseded in Unreleased: the GUI no longer prints PDFs through the
+  webview. PDF export is now written by the Rust renderer, and diagrams appear
+  as their Mermaid source, counted in the export report — BUG-003.)_
 - **PPTX multi-image slides** — up to 6 images per slide, arranged in a grid
   that subdivides the layout's image region (stacked/2×2/2×3 in the side
   columns; side-by-side/2×2/3×2 in the top band), each aspect-fit in its cell.
@@ -401,6 +594,9 @@ accessibility.
 ### Other
 - **Read aloud** (text-to-speech) for any paragraph (macOS speech synthesizer).
 - **PDF export** via the system print dialog (handles CJK fonts correctly).
+  _(Superseded in Unreleased: the print-dialog route is no longer used. PDF
+  export now goes through a save dialog and the Rust PDF renderer — BUG-003.
+  A native "Print…" command is planned.)_
 - **Help** menu — an in-app guide to the writing workflow (toolbar + native menu).
 - **Tooltips** on the gutter and menu controls.
 

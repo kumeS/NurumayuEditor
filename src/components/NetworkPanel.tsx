@@ -3,40 +3,12 @@
 // tapping an edge flashes both of its endpoint paragraphs.
 
 import cytoscape from "cytoscape";
-import { useEffect, useMemo, useRef } from "react";
-import { useT } from "../i18n";
-import { pruneAnalysis, useStore } from "../store";
-import { analyzeDocument } from "../aiActions";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { translateWith, useLang, useT } from "../i18n";
+import { AI_OP_LOG_MAX, pruneAnalysis, useStore, type AiOpPhase } from "../store";
+import { aiOpLogToJsonLines, analyzeDocument, hasAnalyzableContent } from "../aiActions";
+import { RELATION_COLORS, analyzedLabel, relationLabel } from "../networkLabels";
 import { CloseIcon, NetworkIcon, SpinnerIcon } from "./icons";
-
-// Canonical relation → edge color (line + arrow). The analyzer lowercases
-// relations to this set; unknown/legacy values fall through to the grey base
-// edge style. The legend below the header is driven by the same map.
-const RELATION_COLORS: Record<string, string> = {
-  cause: "#ea580c",
-  effect: "#d97706",
-  evidence: "#059669",
-  claim: "#7c3aed",
-  elaboration: "#9ca3af",
-  contrast: "#dc2626",
-  condition: "#0891b2",
-  example: "#65a30d",
-  definition: "#475569",
-  sequence: "#2563eb",
-};
-
-/** "analyzed …" timestamp: s/min/h/d ago, or a locale date past a week. */
-function relativeTime(ts: number): string {
-  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
-  if (s < 60) return `${s}s ago`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m} min ago`;
-  const h = Math.round(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.round(h / 24);
-  if (d <= 7) return `${d}d ago`;
-  return new Date(ts).toLocaleDateString();
-}
 
 /**
  * Map a graph node back to its owning paragraph chunk id. Sentence node ids
@@ -52,8 +24,108 @@ function nodeChunkId(node: cytoscape.NodeSingular): string {
   return cut >= 0 ? id.slice(0, cut) : id;
 }
 
+/** First `n` chars of an id — the full id stays in the row's tooltip. */
+function shortId(id: string, n = 8): string {
+  return id.length > n ? id.slice(0, n) : id;
+}
+
+/**
+ * Read-only view of the store's AI op log (MISS-01): ids, phases and reason
+ * codes only — never document text. Lets QA correlate a late/discarded AI
+ * result with its tab and document load in the RELEASE build, and copy the
+ * log (JSON lines) into a report. In-memory, this session only.
+ */
+function AiOpLogSection() {
+  const t = useT();
+  const lang = useLang();
+  const log = useStore((s) => s.aiOpLog);
+  const notify = useStore((s) => s.notify);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const id = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(id);
+  }, [copied]);
+
+  const phaseLabel = (p: AiOpPhase) =>
+    p === "start" ? t("Started") : p === "commit" ? t("Applied") : t("Discarded");
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(aiOpLogToJsonLines(log));
+      setCopied(true); // quiet success: the button label flips briefly
+    } catch {
+      notify(t("Couldn't copy the log to the clipboard."), "error");
+    }
+  };
+
+  const rows = [...log].reverse(); // newest first
+
+  return (
+    <details className="border-t border-chrome-line text-xs">
+      <summary className="cursor-pointer select-none px-3 py-1.5 text-ink-soft hover:text-ink">
+        {t("Recent AI operations")} ({log.length})
+      </summary>
+      <div className="flex items-center justify-between gap-2 px-3 pb-1">
+        <span className="text-[10px] text-ink-faint">
+          {translateWith("Kept in memory for this session only (last {n} operations).", lang, {
+            n: AI_OP_LOG_MAX,
+          })}
+        </span>
+        <button
+          type="button"
+          onClick={() => void copy()}
+          disabled={log.length === 0}
+          className="shrink-0 rounded border border-chrome-edge px-2 py-0.5 text-ink-soft hover:bg-chrome-hairline disabled:opacity-40"
+          title={t("Copy the AI operation log (ids only, no document text) as JSON lines for a QA report")}
+        >
+          {copied ? t("Copied") : t("Copy log")}
+        </button>
+      </div>
+      {rows.length === 0 ? (
+        <p className="px-3 pb-2 text-ink-faint">{t("No AI operations yet in this session.")}</p>
+      ) : (
+        <div className="max-h-40 overflow-auto px-3 pb-2">
+          <table className="w-full text-left text-[10px] text-ink-soft">
+            <thead className="text-ink-faint">
+              <tr>
+                <th className="pr-2 font-normal">{t("Time")}</th>
+                <th className="pr-2 font-normal">{t("Action")}</th>
+                <th className="pr-2 font-normal">{t("Phase")}</th>
+                <th className="pr-2 font-normal">{t("Reason")}</th>
+                <th className="font-normal">{t("IDs")}</th>
+              </tr>
+            </thead>
+            <tbody className="font-mono">
+              {rows.map((e, i) => (
+                <tr key={`${e.opId}-${e.phase}-${i}`}>
+                  <td className="whitespace-nowrap pr-2">{new Date(e.ts).toLocaleTimeString(lang === "ja" ? "ja-JP" : undefined)}</td>
+                  <td className="pr-2">{e.action}</td>
+                  <td className={`pr-2 font-sans ${e.phase === "discard" ? "font-medium text-ink" : ""}`}>
+                    {phaseLabel(e.phase)}
+                  </td>
+                  <td className="pr-2">{e.reason ?? ""}</td>
+                  <td
+                    className="whitespace-nowrap"
+                    title={[e.opId, e.tabId, e.docNonce, e.chunkId].filter((v) => v !== undefined).join(" · ")}
+                  >
+                    {`${shortId(e.tabId, 6)} #${e.docNonce}${e.chunkId ? ` ${shortId(e.chunkId)}` : ""}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </details>
+  );
+}
+
 export default function NetworkPanel() {
   const t = useT();
+  const lang = useLang();
+  const analyzable = useStore((s) => hasAnalyzableContent(s.doc));
   const analysis = useStore((s) => s.analysis);
   const analysisStale = useStore((s) => s.analysisStale);
   const globalBusy = useStore((s) => s.globalBusy);
@@ -128,7 +200,7 @@ export default function NetworkPanel() {
             id: `e${i}`,
             source: e.source,
             target: e.target,
-            label: e.relation || "",
+            label: relationLabel(e.relation || "", lang),
             relation: e.relation || "",
           },
         });
@@ -283,7 +355,7 @@ export default function NetworkPanel() {
       cy.destroy();
       cyRef.current = null;
     };
-  }, [pruned, flashChunk, flashChunks]);
+  }, [pruned, flashChunk, flashChunks, lang]);
 
   // Editor → graph sync: outline the node whose paragraph currently has
   // focus. Depends on `pruned` too so the class is re-applied after a graph
@@ -304,43 +376,47 @@ export default function NetworkPanel() {
   const isEmpty = !pruned || pruned.nodes.length === 0;
 
   return (
-    <aside className="flex h-full w-80 shrink-0 flex-col border-l border-gray-200 bg-white">
-      <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
+    <aside className="flex h-full w-80 shrink-0 flex-col border-l border-chrome-line bg-white">
+      <div className="flex items-center justify-between border-b border-chrome-line px-3 py-2">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-          <NetworkIcon /> Relationships
+          <NetworkIcon /> {t("Relationships")}
           {!isEmpty && analysisStale && (
             <span
-              className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
+              className="rounded-full bg-warn-tint px-1.5 py-0.5 text-[10px] font-medium text-warn-strong"
               title={t("The document changed since this graph was built — click Refresh to re-analyze.")}
             >
-              out of date
+              {t("out of date")}
             </span>
           )}
           {!isEmpty && analysis?.analyzedAt !== undefined && (
             <span
               className="whitespace-nowrap text-[10px] font-normal text-ink-faint"
-              title={new Date(analysis.analyzedAt).toLocaleString()}
+              title={new Date(analysis.analyzedAt).toLocaleString(lang === "ja" ? "ja-JP" : undefined)}
             >
-              analyzed {relativeTime(analysis.analyzedAt)}
+              {analyzedLabel(analysis.analyzedAt, lang)}
             </span>
           )}
         </div>
         <div className="flex items-center gap-1">
           <button
             onClick={() => void analyzeDocument()}
-            className={`rounded px-2 py-1 text-xs hover:bg-gray-100 ${
+            className={`rounded px-2 py-1 text-xs hover:bg-chrome-hairline disabled:opacity-40 disabled:hover:bg-transparent ${
               !isEmpty && analysisStale
-                ? "font-medium text-amber-700"
+                ? "font-medium text-warn-strong"
                 : "text-ink-soft"
             }`}
-            disabled={!!globalBusy}
-            title={t("Re-analyze document")}
+            disabled={!!globalBusy || !analyzable}
+            title={
+              analyzable
+                ? t("Re-analyze document")
+                : t("Nothing to analyze yet — write some text first.")
+            }
           >
             {t("Refresh")}
           </button>
           <button
             onClick={relayout}
-            className="rounded px-2 py-1 text-xs text-ink-soft hover:bg-gray-100"
+            className="rounded px-2 py-1 text-xs text-ink-soft hover:bg-chrome-hairline disabled:opacity-40 disabled:hover:bg-transparent"
             disabled={isEmpty}
             title={t("Re-layout graph")}
           >
@@ -348,8 +424,9 @@ export default function NetworkPanel() {
           </button>
           <button
             onClick={() => toggleNetwork(false)}
-            className="rounded p-1 text-ink-faint hover:bg-gray-100 hover:text-ink"
+            className="rounded p-1 text-ink-faint hover:bg-chrome-hairline hover:text-ink"
             aria-label={t("Close panel")}
+            title={t("Close panel")}
           >
             <CloseIcon />
           </button>
@@ -357,14 +434,14 @@ export default function NetworkPanel() {
       </div>
 
       {legendRelations.length > 0 && (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-gray-100 px-3 py-1.5 text-[10px] text-ink-soft">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-chrome-hairline px-3 py-1.5 text-[10px] text-ink-soft">
           {legendRelations.map((r) => (
             <span key={r} className="flex items-center gap-1">
               <span
                 className="inline-block h-2 w-2 rounded-full"
                 style={{ backgroundColor: RELATION_COLORS[r] }}
               />
-              {r}
+              {relationLabel(r, lang)}
             </span>
           ))}
         </div>
@@ -380,13 +457,17 @@ export default function NetworkPanel() {
         {isEmpty && !globalBusy && (
           <div className="absolute inset-0 flex flex-col items-center justify-center px-6 text-center text-sm text-ink-faint">
             <NetworkIcon className="mb-2 h-6 w-6" />
-            No relationships yet. Click “Analyze” to extract the logical structure
-            of your document.
+            {/* Names the button on screen (Refresh); with no text yet, says why it is off. */}
+            {analyzable
+              ? t("No relationships yet. Click “Refresh” to extract the logical structure of your document.")
+              : t("Nothing to analyze yet — write some text first.")}
           </div>
         )}
       </div>
 
-      <div className="border-t border-gray-100 px-3 py-2 text-xs text-ink-faint">
+      <AiOpLogSection />
+
+      <div className="border-t border-chrome-hairline px-3 py-2 text-xs text-ink-faint">
         {t("Tap a node to jump to its paragraph; tap an edge to flash both ends.")}
       </div>
     </aside>

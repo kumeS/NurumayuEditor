@@ -3,10 +3,18 @@
 
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { aiReady } from "./aiActions";
+import { localizeAiError } from "./aiErrors";
+import { askUnsaved } from "./confirm";
+import { draftDoneMessage, draftLengthWarning, draftProgressLabel, measureDraft } from "./draftLength";
+import { samePath } from "./folderTree";
 import { api } from "./api";
-import { renderMermaidToPng, renderMermaidToSvg } from "./mermaidRender";
-import { tNow } from "./i18n";
-import { useStore } from "./store";
+import { resolveImageSource } from "./localImages";
+import { localizeExportWarning } from "./exportWarnings";
+import { localizeImageError } from "./imageErrors";
+import { documentToMarkdown, markdownToDocument } from "./markdown";
+import { renderMermaidToPng } from "./mermaidRender";
+import { tf, tNow, uiLangFor } from "./i18n";
+import { captureOp, ownsOp, useStore, type OpTicket } from "./store";
 import type { Document, ExportFormat } from "./types";
 
 const NATIVE_EXT = "aix";
@@ -15,15 +23,35 @@ function isMarkdownPath(path: string): boolean {
   return /\.(md|markdown)$/i.test(path);
 }
 
+/**
+ * TS is the single owner of the Markdown → chunk projection in the GUI
+ * (BUG-019d): a Markdown import from Rust is re-projected with
+ * markdownToDocument (images, frontmatter) before it is shown. Pure.
+ */
+function projectMarkdownImport(doc: Document): Document {
+  if (doc.mode !== "markdown" || doc.markdownSource === undefined) return doc;
+  return markdownToDocument({ ...doc, chunks: [] }, doc.markdownSource);
+}
+
+/**
+ * The payload for writing a .md file: the TS merge serializer's text in
+ * markdown mode, so Rust `document_to_md` writes exactly it (BUG-019b).
+ */
+function markdownSavePayload(doc: Document): Document {
+  return { ...doc, mode: "markdown", markdownSource: documentToMarkdown(doc) };
+}
+
 function message(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 }
 
 /**
- * After a save, if no tab has unsaved changes any more, drop the crash-recovery
- * session so it isn't offered on next launch (A2). Called from the save paths so
- * saving your work clears the "restore?" prompt; the startup-restore race is
- * avoided because we never clear during startup.
+ * After a save or a tab close, if no tab has unsaved changes any more, drop the
+ * crash-recovery session so it isn't offered on next launch (A2). Called from
+ * the save paths and from requestCloseTab (so a discarded document is not
+ * offered for restore after a crash — BUG-018); the startup-restore race is
+ * avoided because we never clear during startup. The call is serialized with
+ * autosaves by api.ts's session queue.
  */
 function clearSessionIfAllSaved(): void {
   const st = useStore.getState();
@@ -62,7 +90,7 @@ export async function syncConfirmedChunksToRag(doc: Document, path: string): Pro
     await api.ragSyncConfirmedChunks(path, pairs);
   } catch (e) {
     useStore.getState().notify(
-      `Saved, but couldn't update your personal library: ${message(e)}`,
+      tf("Saved, but couldn't update your personal library: {error}", { error: message(e) }),
       "info"
     );
   }
@@ -74,7 +102,7 @@ function safeName(title: string): string {
 }
 
 /**
- * True if the active tab is an untouched blank document we can reuse.
+ * True if the active tab is an untouched, idle blank document we can reuse.
  */
 function activeIsPristine(): boolean {
   const s = useStore.getState();
@@ -84,7 +112,13 @@ function activeIsPristine(): boolean {
     !s.dirty &&
     !s.filePath &&
     c.length === 1 &&
-    !c[0].content.trim()
+    !c[0].content.trim() &&
+    // A tab with an AI op in flight is never reused (BUG-001c): its late
+    // results are routed by tab id, so a document loaded into it would be
+    // overwritten.
+    !s.globalBusy &&
+    Object.keys(s.busyChunks).length === 0 &&
+    !s.streamingChunkId
   );
 }
 
@@ -94,6 +128,26 @@ function openInTab(doc: Document, filePath: string | null, dirty = false): void 
   useStore.getState().loadDocument(doc, filePath, { dirty });
 }
 
+/** The tab already showing the file at `path` (active or background), if any. */
+export function tabIdForPath(path: string): string | null {
+  const s = useStore.getState();
+  if (s.filePath && samePath(s.filePath, path)) return s.activeTabId;
+  for (const id of s.tabOrder) {
+    const snap = s.inactiveTabs[id];
+    if (id !== s.activeTabId && snap?.filePath && samePath(snap.filePath, path)) return id;
+  }
+  return null;
+}
+
+/** Bring an already-open file's tab forward instead of opening it twice. */
+function focusExisting(path: string): boolean {
+  const id = tabIdForPath(path);
+  if (id === null) return false;
+  useStore.getState().switchTab(id);
+  useStore.getState().notify(tNow("Already open — switched to its tab."), "info");
+  return true;
+}
+
 /**
  * Open one file at `path` in a new tab, dispatching by extension. Shared by
  * `openNative()` (the file picker) and the folder tree sidebar's file click —
@@ -101,19 +155,25 @@ function openInTab(doc: Document, filePath: string | null, dirty = false): void 
  * opened.
  */
 export async function openPath(path: string): Promise<void> {
+  // A file is open in at most one tab: opening it again switches to that tab
+  // (its unsaved edits stay; nothing is re-read over them).
+  if (focusExisting(path)) return;
   try {
     if (isMarkdownPath(path)) {
-      const document = await api.importDocument(path);
+      const document = projectMarkdownImport(await api.importDocument(path));
+      // Re-check: a second click may have opened it while this one was reading.
+      if (focusExisting(path)) return;
       openInTab(document, path, false);
       useStore.getState().notify(tNow("Markdown document opened."), "success");
       return;
     }
     const { document, notes } = await api.openDocumentJson(path);
+    if (focusExisting(path)) return;
     // If the file had to be repaired on load (A1), open it dirty so the cleaned
     // version can be saved back, and tell the user exactly what changed.
     openInTab(document, path, notes.length > 0);
     if (notes.length > 0) {
-      useStore.getState().notify(`Opened and repaired this file: ${notes.join(" ")}`, "info");
+      useStore.getState().notify(tf("Opened and repaired this file: {notes}", { notes: notes.join(" ") }), "info");
     } else {
       useStore.getState().notify(tNow("Document opened."), "success");
     }
@@ -122,50 +182,143 @@ export async function openPath(path: string): Promise<void> {
   }
 }
 
+/** How a Draft attempt ended (BUG-014). `error` is localized ("" when there is
+ *  nothing to show); `hadContent` says whether a draft tab was created. */
+export type DraftOutcome =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: "not-ready" | "no-theme" | "busy" | "detached" | "failed";
+      error: string;
+      hadContent: boolean;
+    };
+
+/** A draft still waiting for its first content (at most one — double-submit
+ *  guard). Once content arrives the draft owns a tab and its tab-scoped busy
+ *  label takes over. */
+let pendingDraft: { detached: boolean } | null = null;
+
+/** Give up on the draft that is still waiting for its first content: its
+ *  result is ignored and no tab is created. The backend request itself is not
+ *  aborted (same as a chunk action's Stop). No-op once content has arrived. */
+export function detachPendingDraft(): void {
+  if (pendingDraft) pendingDraft.detached = true;
+  pendingDraft = null;
+}
+
+// Progress label repaint interval: at most 4 updates per second (BUG-005c).
+const DRAFT_PROGRESS_INTERVAL_MS = 250;
+
 /**
- * Generate a fresh document draft on a theme into a new tab, streaming the
- * result into the editor in real time.
+ * Generate a fresh document draft on a theme, streaming it into the editor.
+ *
+ * The draft tab is created lazily on the FIRST content event (reusing the
+ * active tab only if it is pristine and idle), so a failure before any content
+ * leaves the tab set untouched (BUG-014) and there is no blank placeholder for
+ * Open to hijack (BUG-001c). Updates are painted only while the draft still
+ * owns the active tab; the final document is committed to its own tab, active
+ * or background (BUG-005b). The achieved length is reported against the
+ * target in the shared unit (BUG-005a); a miss beyond ±20%, or a failure after
+ * partial content, also goes to the persistent export report.
  */
 export async function draftDocument(
   theme: string,
   targetWords?: number,
-  reference?: string
-): Promise<void> {
+  reference?: string,
+  onFirstContent?: () => void
+): Promise<DraftOutcome> {
   const s = useStore.getState();
   if (!aiReady()) {
-    s.notify(tNow("Set your OpenRouter API key in Settings first."), "error");
+    const error = tNow("Set your OpenRouter API key in Settings first.");
+    s.notify(error, "error");
     s.openSettings();
-    return;
+    return { ok: false, reason: "not-ready", error, hadContent: false };
   }
-  if (!theme.trim()) return;
-  // Draft into a new tab (reuse a blank one) so current work is preserved.
-  if (!activeIsPristine()) useStore.getState().newTab();
-  // Stream only while the draft's own tab stays active (the user may switch).
-  const draftTab = useStore.getState().activeTabId;
-  const onDraftTab = () => useStore.getState().activeTabId === draftTab;
-  // B3: scope the busy spinner to the draft's own tab, so switching away during
-  // generation doesn't strand a "Drafting…" spinner (which would also trip the
-  // Analyze/Draft busy guards) on that tab or clear the foreground tab's spinner.
-  useStore.getState().setGlobalBusy("Drafting…", draftTab);
+  if (!theme.trim()) return { ok: false, reason: "no-theme", error: "", hadContent: false };
+  if (pendingDraft) {
+    return { ok: false, reason: "busy", error: tNow("A draft is already being generated."), hadContent: false };
+  }
+  const handle = { detached: false };
+  pendingDraft = handle;
+  const release = () => {
+    if (pendingDraft === handle) pendingDraft = null;
+  };
+  const lang = () => uiLangFor(useStore.getState().settings?.defaultTargetLanguage);
+
+  let op: OpTicket | null = null; // set once the draft owns a tab
+  let settled = false;
+  let lastPaint = -Infinity;
+  const ensureTab = (): OpTicket => {
+    if (op) return op;
+    if (!activeIsPristine()) useStore.getState().newTab();
+    const ticket = captureOp();
+    op = ticket;
+    release();
+    // B3: the busy label is scoped to the draft's own tab.
+    useStore.getState().setGlobalBusy(tNow("Drafting…"), ticket.tabId);
+    onFirstContent?.();
+    return ticket;
+  };
+
   try {
     await api.aiDraftStream(theme.trim(), targetWords, reference, (e) => {
-      if (!onDraftTab()) return; // user switched tabs — don't write elsewhere
+      if (handle.detached) return;
+      // After the invoke settled: never create a tab (the outcome was already
+      // reported as empty/failed) and never re-set a cleared busy label.
+      if (settled && (!op || e.kind === "update")) return;
+      const ticket = ensureTab();
       if (e.kind === "update") {
-        useStore.getState().setStreamingDocument(e.document);
+        if (!ownsOp(ticket)) return; // backgrounded or replaced: don't paint elsewhere
+        useStore.getState().setStreamingDocument(e.document); // marks the tab dirty
+        const now = Date.now();
+        if (now - lastPaint >= DRAFT_PROGRESS_INTERVAL_MS) {
+          lastPaint = now;
+          const label = draftProgressLabel(measureDraft(e.document.chunks, targetWords), lang());
+          useStore.getState().setGlobalBusy(label, ticket.tabId);
+        }
       } else if (e.kind === "done") {
-        // B2: a fresh AI draft is unsaved & irreproducible — mark it dirty so the
-        // tab/quit guards protect it.
-        useStore.getState().loadDocument(e.document, null, { dirty: true });
+        // B2: a fresh AI draft is unsaved & irreproducible — committed dirty.
+        if (!useStore.getState().commitDraftToTab(ticket.tabId, ticket.docNonce, e.document)) return;
+        const m = measureDraft(e.document.chunks, targetWords);
+        useStore.getState().notify(draftDoneMessage(m, e.document.chunks.length, lang()), "success");
+        const warning = draftLengthWarning(m, lang());
+        if (warning) useStore.getState().setLastExportReport("draft", [warning]);
       }
     });
-    if (onDraftTab()) {
-      const n = useStore.getState().doc.chunks.length;
-      useStore.getState().notify(`Draft created — ${n} chunks.`, "success");
+    settled = true;
+    if (handle.detached) return { ok: false, reason: "detached", error: "", hadContent: false };
+    if (!op) {
+      // Empty streams fail loudly (rust.md rule 8) — nothing was created.
+      const error = tNow("The model returned an empty response. Try again, or switch models in Settings.");
+      return { ok: false, reason: "failed", error, hadContent: false };
     }
+    return { ok: true };
   } catch (e) {
-    useStore.getState().notify(message(e), "error");
+    settled = true;
+    if (handle.detached) return { ok: false, reason: "detached", error: "", hadContent: false };
+    const loc = localizeAiError(message(e), lang());
+    if (loc.kind === "model-unavailable" && loc.model) {
+      useStore.getState().setAiModelIssue({ model: loc.model });
+    }
+    const draftTab = (op as OpTicket | null)?.tabId;
+    if (draftTab !== undefined) {
+      // The dialog has closed; the partial draft stays (dirty) in its tab —
+      // unless the user already closed that tab, so the report can't say so.
+      useStore.getState().notify(loc.text, "error");
+      if (useStore.getState().tabOrder.includes(draftTab)) {
+        useStore.getState().setLastExportReport("draft", [
+          tf("The draft stopped before it finished: {error} The partial draft is kept in its tab (unsaved).", {
+            error: loc.text,
+          }),
+        ]);
+      }
+    }
+    return { ok: false, reason: "failed", error: loc.text, hadContent: draftTab !== undefined };
   } finally {
-    useStore.getState().setGlobalBusy(null, draftTab);
+    release();
+    // `op` is assigned inside the stream callback; TS can't see that here.
+    const ticket = op as OpTicket | null;
+    if (ticket) useStore.getState().setGlobalBusy(null, ticket.tabId);
   }
 }
 
@@ -175,11 +328,11 @@ export async function importDocument(): Promise<void> {
       multiple: false,
       directory: false,
       filters: [
-        { name: "Text documents", extensions: ["txt", "md", "markdown", "rtf"] },
+        { name: tNow("Text documents"), extensions: ["txt", "md", "markdown", "rtf"] },
       ],
     });
     if (typeof selected !== "string") return;
-    const doc = await api.importDocument(selected);
+    const doc = projectMarkdownImport(await api.importDocument(selected));
     openInTab(doc, null, true); // imported doc has no .aix backing → dirty (B2)
     useStore.getState().notify(tNow("Document imported."), "success");
   } catch (e) {
@@ -202,7 +355,7 @@ export async function pickAndInsertLocalImage(chunkId: string | null): Promise<v
       multiple: false,
       directory: false,
       filters: [
-        { name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] },
+        { name: tNow("Images"), extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] },
       ],
     });
     if (typeof selected !== "string") return;
@@ -211,7 +364,8 @@ export async function pickAndInsertLocalImage(chunkId: string | null): Promise<v
     useStore.getState().insertLocalImageAfter(chunkId, dataUrl, fileName);
     useStore.getState().notify(tNow("Image inserted."), "success");
   } catch (e) {
-    useStore.getState().notify(message(e), "error");
+    const lang = uiLangFor(useStore.getState().settings?.defaultTargetLanguage);
+    useStore.getState().notify(localizeImageError(message(e), lang), "error");
   }
 }
 
@@ -233,127 +387,53 @@ async function withRenderedDiagrams(doc: Document): Promise<Document> {
   return { ...doc, chunks };
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-/** Build a clean, print-ready HTML document from the current document. */
-async function buildPrintHtml(doc: Document): Promise<string> {
-  const parts: string[] = [];
-  for (const c of doc.chunks) {
-    const type = c.metadata.chunkType;
-    if (type === "heading") {
-      const lv = Math.min(Math.max(c.metadata.level ?? 1, 1), 3);
-      parts.push(`<h${lv}>${escapeHtml(c.content)}</h${lv}>`);
-    } else if (type === "image") {
-      const cap = c.metadata.summary
-        ? `<figcaption>${escapeHtml(c.metadata.summary)}</figcaption>`
-        : "";
-      if (c.content) parts.push(`<figure><img src="${c.content}" />${cap}</figure>`);
-    } else if (type === "diagram") {
-      // Reuse the already-rendered Mermaid SVG from the live DOM when present;
-      // for unmounted chunks (backgrounded slide, virtualized view) render it
-      // off-screen instead — the raw source <pre> is only a last resort.
-      const live = document.querySelector(`#chunk-${c.id} svg`);
-      if (live) {
-        parts.push(`<figure class="diagram">${live.outerHTML}</figure>`);
-      } else {
-        const svg = c.content.trim() ? await renderMermaidToSvg(c.content) : null;
-        if (svg) parts.push(`<figure class="diagram">${svg}</figure>`);
-        else parts.push(`<pre>${escapeHtml(c.content)}</pre>`);
-      }
-    } else {
-      // text
-      parts.push(`<p>${escapeHtml(c.content)}</p>`);
+/**
+ * Inline every image chunk that references a local file (a path relative to
+ * the document's folder, an absolute path or a `file:` URL) as a data URL, on
+ * a clone of the document, for EXPORT payloads only — the editor's own
+ * document is never mutated. Uses the SAME resolver as the preview
+ * (`resolveImageSource` + Rust `read_local_image`), so preview and export
+ * agree on which file a figure is. A figure that can't be read is left as-is:
+ * the PPTX exporter reports it as a local image that couldn't be read (G11),
+ * and the RTF exporter keeps an "[Image: …]" placeholder and counts it in its
+ * `RtfReport` (fileio.rs), whose warnings land on the health bar's report.
+ */
+async function withEmbeddedLocalImages(doc: Document, filePath: string | null): Promise<Document> {
+  const chunks = [...doc.chunks];
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    if (c.metadata.chunkType !== "image") continue;
+    const src = resolveImageSource(c.content, filePath);
+    if (src.kind !== "local") continue;
+    try {
+      chunks[i] = { ...c, content: await api.readLocalImage(src.path) };
+    } catch {
+      // Left unresolved: pptx.rs and fileio.rs (RTF) each count it under
+      // their own specific "local image(s) couldn't be read" warning.
     }
   }
-  const body = parts.join("\n");
-
-  const title = escapeHtml(doc.title.trim() || "Untitled");
-  return `<!doctype html><html><head><meta charset="utf-8" />
-<title>${title}</title>
-<style>
-  @page { margin: 20mm; }
-  * { box-sizing: border-box; }
-  body { font-family: Georgia, "Hiragino Mincho ProN", "Yu Mincho", serif;
-         color: #1a1a1a; line-height: 1.8; max-width: 760px; margin: 0 auto; }
-  h1 { font-size: 1.9rem; margin: 1.4em 0 .5em; }
-  h2 { font-size: 1.5rem; margin: 1.2em 0 .4em; }
-  h3 { font-size: 1.2rem; margin: 1em 0 .3em; }
-  p { margin: 0 0 1em; white-space: pre-wrap; word-break: break-word; }
-  figure { margin: 1.2em 0; text-align: center; page-break-inside: avoid; }
-  figure img { max-width: 100%; }
-  figure.diagram svg { max-width: 100%; height: auto; }
-  figcaption { font-size: .85rem; color: #666; font-style: italic; margin-top: .4em; }
-  pre { background: #f6f6f6; padding: .8em; border-radius: 6px; overflow-x: auto;
-        white-space: pre-wrap; font-size: .85rem; }
-</style></head>
-<body>${doc.title.trim() ? `<h1>${title}</h1>` : ""}${body}</body></html>`;
+  return { ...doc, chunks };
 }
 
 /**
- * Export to PDF via the OS print dialog ("Save as PDF"). Printing through the
- * webview lets the OS handle font rendering — crucially for CJK text, which
- * pure-Rust PDF generators render as missing glyphs.
+ * Export to PDF: the native save dialog picks a `.pdf` path, Rust renders an
+ * A4 PDF with an embedded system Unicode font (CJK included — see pdf.rs) and
+ * writes it atomically. What the PDF cannot carry (images → text placeholders,
+ * diagrams → source text, literal Markdown markup) comes back as counted
+ * warnings that stay on the health bar's export report. There is no print
+ * dialog: printing from the webview is a separate, planned command.
  */
 export async function exportPdf(): Promise<void> {
   const s = useStore.getState();
   try {
-    const html = await buildPrintHtml(s.doc);
-    const iframe = document.createElement("iframe");
-    iframe.setAttribute("aria-hidden", "true");
-    Object.assign(iframe.style, {
-      position: "fixed",
-      right: "0",
-      bottom: "0",
-      width: "0",
-      height: "0",
-      border: "0",
+    const path = await save({
+      defaultPath: `${safeName(s.doc.title)}.pdf`,
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
     });
-    document.body.appendChild(iframe);
-    const idoc = iframe.contentDocument;
-    const iwin = iframe.contentWindow;
-    if (!idoc || !iwin) {
-      iframe.remove();
-      s.notify(tNow("Could not prepare the PDF view."), "error");
-      return;
-    }
-    idoc.open();
-    idoc.write(html);
-    idoc.close();
-
-    // Wait for images (data/remote URLs) to settle so they aren't clipped, then
-    // print. Clean the iframe up after printing (or after a safety timeout).
-    const imgs = Array.from(idoc.images);
-    await Promise.race([
-      Promise.all(
-        imgs.map((img) =>
-          img.complete
-            ? Promise.resolve()
-            : new Promise<void>((res) => {
-                img.onload = () => res();
-                img.onerror = () => res();
-              })
-        )
-      ),
-      new Promise<void>((res) => setTimeout(res, 2500)),
-    ]);
-
-    let removed = false;
-    const cleanup = () => {
-      if (removed) return;
-      removed = true;
-      setTimeout(() => iframe.remove(), 500);
-    };
-    iwin.onafterprint = cleanup;
-    iwin.focus();
-    iwin.print();
-    setTimeout(cleanup, 60000); // safety net if onafterprint never fires
-    s.notify('Choose "Save as PDF" in the print dialog.', "info");
+    if (!path) return;
+    const report = await api.exportPdf(s.doc, path);
+    s.setLastExportReport("pdf", report.warnings);
+    s.notify(tNow("Exported as PDF."), "success");
   } catch (e) {
     s.notify(message(e), "error");
   }
@@ -367,12 +447,18 @@ export async function exportDocument(format: ExportFormat): Promise<void> {
       filters: [{ name: format.toUpperCase(), extensions: [format] }],
     });
     if (!path) return;
-    // RTF embeds diagram snapshots (PNG); txt is placeholder-by-design and md
-    // keeps the mermaid fences, so neither needs the (costly) render pass.
-    const payload = format === "rtf" ? await withRenderedDiagrams(s.doc) : s.doc;
-    await api.exportDocument(payload, path, format);
-    s.setLastExportReport(format, []);
-    s.notify(`Exported as ${format.toUpperCase()}.`, "success");
+    // RTF embeds diagram snapshots and PNG/JPEG figures (fileio.rs
+    // rtf_picture_group), so document-relative figures are inlined the same
+    // way PPTX does it; txt is placeholder-by-design and md keeps the mermaid
+    // fences and figure references, so neither needs these (costly) passes.
+    const payload =
+      format === "rtf"
+        ? await withEmbeddedLocalImages(await withRenderedDiagrams(s.doc), s.filePath)
+        : s.doc;
+    // RTF returns its lossy report (fileio.rs RtfReport); txt/md return null.
+    const report = await api.exportDocument(payload, path, format);
+    s.setLastExportReport(format, report?.warnings ?? []);
+    s.notify(tf("Exported as {format}.", { format: format.toUpperCase() }), "success");
   } catch (e) {
     s.notify(message(e), "error");
   }
@@ -381,7 +467,8 @@ export async function exportDocument(format: ExportFormat): Promise<void> {
 /**
  * Export the document as a PowerPoint deck (.pptx). The document is turned into
  * slides on the Rust side (headings → slides, paragraphs → bullets, images
- * embedded); this only picks the destination path.
+ * embedded); this picks the destination path and prepares the payload
+ * (diagram snapshots, local figures inlined from the document's folder).
  */
 export async function exportPptx(): Promise<void> {
   const s = useStore.getState();
@@ -392,19 +479,23 @@ export async function exportPptx(): Promise<void> {
     });
     if (!path) return;
     // Snapshot diagrams to PNG so the deck embeds real graphs (ズレ① FE half).
-    const payload = await withRenderedDiagrams(s.doc);
+    // Inline document-relative figures the preview shows (G11).
+    const payload = await withEmbeddedLocalImages(
+      await withRenderedDiagrams(s.doc),
+      s.filePath
+    );
     const report = await api.exportPptx(payload, path);
     // Keep the warnings reviewable in the health bar (提案2) — a toast alone
     // disappears in seconds and silently-lost content was the report's core
     // complaint (ズレ①).
     s.setLastExportReport("pptx", report.warnings);
+    const done = tf("Exported {n} slide(s) as PPTX.", { n: report.slides });
     if (report.warnings.length > 0) {
-      s.notify(
-        `Exported ${report.slides} slide(s) as PPTX. ${report.warnings.join(" ")}`,
-        "info"
-      );
+      const lang = uiLangFor(useStore.getState().settings?.defaultTargetLanguage);
+      const warnings = report.warnings.map((w) => localizeExportWarning(w, lang));
+      s.notify(`${done} ${warnings.join(" ")}`, "info");
     } else {
-      s.notify(`Exported ${report.slides} slide(s) as PPTX.`, "success");
+      s.notify(done, "success");
     }
   } catch (e) {
     s.notify(message(e), "error");
@@ -417,7 +508,7 @@ export async function openNative(): Promise<void> {
       multiple: false,
       directory: false,
       filters: [
-        { name: "NurumayuEditor documents", extensions: [NATIVE_EXT, "md", "markdown"] },
+        { name: tNow("NurumayuEditor documents"), extensions: [NATIVE_EXT, "md", "markdown"] },
       ],
     });
     if (typeof selected !== "string") return;
@@ -440,24 +531,45 @@ export async function openFolder(): Promise<void> {
   }
 }
 
-export async function saveNativeAs(): Promise<void> {
+/**
+ * Save the ACTIVE tab under a path picked in the save dialog. Resolves true
+ * only once the file is written and the tab marked clean; false when the
+ * dialog is cancelled, the path is open in another tab, the write fails
+ * (failures are still reported as a toast), or the tab was closed/reloaded
+ * during the write. Close/quit rely on this outcome.
+ *
+ * state-async-3: the save is pinned to the tab + load it started on (an
+ * OpTicket); the tab bar stays live during the write, so the clean mark is
+ * routed to THAT tab (markTabClean), never to whichever tab is active when
+ * the write resolves.
+ */
+export async function saveNativeAs(): Promise<boolean> {
   const s = useStore.getState();
+  const ticket = captureOp();
+  let saved = false;
   try {
     // Both formats are always offered — Save is no longer locked to .aix for
     // Editor/Slide-mode docs — but the DEFAULT (pre-selected filter and
     // suggested filename) still follows the doc's mode, preserving today's
     // one-click behavior for anyone who doesn't change it.
     const markdownDefault = (s.doc.mode ?? "editor") === "markdown";
-    const nativeFilter = { name: "NurumayuEditor Document", extensions: [NATIVE_EXT] };
+    const nativeFilter = { name: tNow("NurumayuEditor Document"), extensions: [NATIVE_EXT] };
     const markdownFilter = { name: "Markdown", extensions: ["md", "markdown"] };
     const path = await save({
       defaultPath: `${safeName(s.doc.title)}.${markdownDefault ? "md" : NATIVE_EXT}`,
       filters: markdownDefault ? [markdownFilter, nativeFilter] : [nativeFilter, markdownFilter],
     });
-    if (!path) return;
+    if (!path) return false;
+    // One file, one tab: writing over a file another tab has open would leave
+    // two tabs claiming it (and the other's next save would silently win).
+    const holder = tabIdForPath(path);
+    if (holder !== null && holder !== ticket.tabId) {
+      s.notify(tNow("That file is open in another tab. Close that tab first, or save under a different name."), "error");
+      return false;
+    }
     // Capture the exact document being written — the save is awaited without
     // blocking the editor, so `useStore.getState().doc` could advance (another
-    // keystroke) before this resolves. markClean must anchor the new baseline
+    // keystroke) before this resolves. markTabClean anchors the new baseline
     // to what actually reached disk, not to whatever is live when it returns.
     const written = s.doc;
     // Which format to WRITE is decided by the extension the user actually
@@ -468,7 +580,7 @@ export async function saveNativeAs(): Promise<void> {
     // the persistent health-bar surface, not silently degraded).
     const savingAsMarkdown = isMarkdownPath(path);
     if (savingAsMarkdown) {
-      await api.exportDocument(written, path, "md");
+      await api.exportDocument(markdownSavePayload(written), path, "md");
       if ((written.mode ?? "editor") !== "markdown") {
         s.setLastExportReport("md", [
           "Saved as Markdown — view mode and any slide-only details won't round-trip; reopening this file will load it as a Markdown document.",
@@ -477,33 +589,123 @@ export async function saveNativeAs(): Promise<void> {
     } else {
       await api.saveDocumentJson(written, path);
     }
-    s.markClean(path, written);
+    if (!useStore.getState().markTabClean(ticket.tabId, ticket.docNonce, path, written)) return false;
+    saved = true;
     clearSessionIfAllSaved();
     s.notify(tNow("Document saved."), "success");
     await syncConfirmedChunksToRag(written, path);
   } catch (e) {
     s.notify(message(e), "error");
   }
+  return saved;
 }
 
-export async function saveNative(): Promise<void> {
+/**
+ * Whether saving `doc` would write exactly what the last save (or open) did —
+ * compared in the format actually written, so e.g. a Markdown file is
+ * unchanged when its Markdown is, whatever the in-memory chunk ids.
+ */
+export function unchangedSinceSave(doc: Document, savedDoc: Document | null, asMarkdown: boolean): boolean {
+  if (!savedDoc) return false;
+  if (doc === savedDoc) return true;
+  return asMarkdown
+    ? documentToMarkdown(doc) === documentToMarkdown(savedDoc)
+    : JSON.stringify(doc) === JSON.stringify(savedDoc);
+}
+
+/**
+ * Save the ACTIVE tab to its file (Save As when it has none). Same outcome
+ * contract as saveNativeAs: true only after the write and the routed clean
+ * mark on the tab + load the save started on (state-async-3).
+ */
+export async function saveNative(): Promise<boolean> {
   const s = useStore.getState();
-  if (!s.filePath) {
-    await saveNativeAs();
-    return;
-  }
+  const path = s.filePath;
+  if (!path) return saveNativeAs();
+  const ticket = captureOp();
+  let saved = false;
   try {
     const written = s.doc;
-    if (isMarkdownPath(s.filePath)) {
-      await api.exportDocument(written, s.filePath, "md");
+    // Saving again with nothing changed still writes (the file on disk stays
+    // authoritative), but quietly: "Document saved." only when it says news.
+    const unchanged = unchangedSinceSave(written, s.savedDoc, isMarkdownPath(path));
+    if (isMarkdownPath(path)) {
+      await api.exportDocument(markdownSavePayload(written), path, "md");
     } else {
-      await api.saveDocumentJson(written, s.filePath);
+      await api.saveDocumentJson(written, path);
     }
-    s.markClean(undefined, written);
+    if (!useStore.getState().markTabClean(ticket.tabId, ticket.docNonce, undefined, written)) return false;
+    saved = true;
     clearSessionIfAllSaved();
-    s.notify(tNow("Document saved."), "success");
-    await syncConfirmedChunksToRag(written, s.filePath);
+    if (!unchanged) s.notify(tNow("Document saved."), "success");
+    await syncConfirmedChunksToRag(written, path);
   } catch (e) {
     s.notify(message(e), "error");
+  }
+  return saved;
+}
+
+/** Dirty flag and title of a tab, active or in the background. */
+function tabState(id: string): { open: boolean; dirty: boolean; title: string } {
+  const st = useStore.getState();
+  if (id === st.activeTabId) return { open: true, dirty: st.dirty, title: st.doc.title };
+  const snap = st.inactiveTabs[id];
+  return snap
+    ? { open: true, dirty: !!snap.dirty, title: snap.doc.title }
+    : { open: false, dirty: false, title: "" };
+}
+
+/**
+ * Resolve a tab's unsaved changes before it goes away (BUG-011). True means it
+ * is safe to proceed: the tab is clean (no dialog), the user chose Don't Save,
+ * or Save succeeded. False on Cancel / a dismissed dialog, or when the save
+ * did not complete (Save As cancelled, refused, or the write failed) — the
+ * tab then stays open and dirty. Saving a background tab switches to it first,
+ * since the save functions act on the active tab.
+ */
+export async function resolveDirtyTab(id: string, scope: "tab" | "quit" = "tab"): Promise<boolean> {
+  const before = tabState(id);
+  if (!before.open || !before.dirty) return true;
+  const choice = await askUnsaved(scope, before.title);
+  if (choice === "cancel") return false;
+  if (choice === "discard") return true;
+  // The tab may have been closed while the dialog was up: nothing to save.
+  if (!tabState(id).open) return false;
+  if (useStore.getState().activeTabId !== id) useStore.getState().switchTab(id);
+  return saveNative();
+}
+
+/**
+ * The single close path for the tab X, ⌘W and the palette's Close tab
+ * (BUG-018): resolve unsaved work, close (the last tab is replaced by a fresh
+ * untitled one), then drop the crash-recovery session if nothing dirty is
+ * left. Resolves false when the tab stays open.
+ */
+export async function requestCloseTab(id: string): Promise<boolean> {
+  if (!(await resolveDirtyTab(id, "tab"))) return false;
+  useStore.getState().closeTab(id);
+  clearSessionIfAllSaved();
+  return true;
+}
+
+/**
+ * ⌘Q review (BUG-011): ask about each dirty tab in tab order, like macOS
+ * "Review changes", and stop at the first Cancel or failed save. True when
+ * the quit may proceed. Tabs answered Don't Save stay open (and dirty) if a
+ * later tab cancels the quit.
+ *
+ * state-async-5: the tab list is re-read after every dialog, so a tab created
+ * or dirtied while a dialog was up (e.g. a Draft's first content) is asked
+ * about too. Each tab is asked at most once per quit.
+ */
+export async function resolveDirtyTabsForQuit(): Promise<boolean> {
+  const asked = new Set<string>();
+  for (;;) {
+    const id = useStore
+      .getState()
+      .tabOrder.find((t) => !asked.has(t) && tabState(t).dirty);
+    if (id === undefined) return true;
+    asked.add(id);
+    if (!(await resolveDirtyTab(id, "quit"))) return false;
   }
 }

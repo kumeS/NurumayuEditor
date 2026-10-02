@@ -16,6 +16,14 @@ use std::path::Path;
 // stored API key. The rebrand is display-only, so internal ids stay put and
 // no migration is needed.
 pub const KEYRING_SERVICE: &str = "com.aix.texteditor";
+
+/// Allowed Markdown preview background tones. Mirrored by the CSS tokens
+/// (`--preview-bg-*` in src/index.css) and the TS `PreviewBackground` type.
+pub const PREVIEW_BACKGROUNDS: &[&str] = &["white", "warm", "gray", "paper", "mint", "blue"];
+/// Files sidebar width bounds in CSS px. Mirrored by `SIDEBAR_WIDTH_MIN/MAX`
+/// in src/sidebarWidth.ts (contract-tested).
+pub const SIDEBAR_WIDTH_MIN: u32 = 180;
+pub const SIDEBAR_WIDTH_MAX: u32 = 560;
 pub const KEYRING_ACCOUNT: &str = "openrouter-api-key";
 pub const SETTINGS_FILE: &str = "settings.json";
 
@@ -30,6 +38,10 @@ pub const DEFAULT_IMAGE_MODEL: &str = "google/gemini-2.5-flash-image";
 
 /// Starter list of selectable text models. Users add/remove their own from
 /// Settings; ids may change over time on OpenRouter, so the list is editable.
+/// Every entry here is merged into every user's list on load (unless
+/// tombstoned), so a slug OpenRouter retires must be removed here — e.g.
+/// "meta-llama/llama-3.3-70b-instruct:free" (BUG-013a). Removal only stops
+/// seeding; a copy already saved in a user's list is kept.
 fn default_models() -> Vec<String> {
     vec![
         DEFAULT_MODEL.to_string(), // deepseek/deepseek-v4-flash (default)
@@ -37,7 +49,6 @@ fn default_models() -> Vec<String> {
         "meta-llama/llama-4-maverick".to_string(),
         "moonshotai/kimi-k2.5".to_string(),
         "google/gemma-4-31b-it:free".to_string(),
-        "meta-llama/llama-3.3-70b-instruct:free".to_string(),
         "deepseek/deepseek-r1:free".to_string(),
     ]
 }
@@ -245,6 +256,15 @@ pub struct Settings {
     /// then persists the answer, so upgrading users are asked at most once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_present: Option<bool>,
+    /// Background tone of the Markdown preview surface — one of
+    /// `PREVIEW_BACKGROUNDS`; `None` means the default (white). Screen-only:
+    /// print/PDF export ignores it. Unknown values are reset on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_background: Option<String>,
+    /// Width of the Files sidebar in CSS px, as last dragged; `None` means the
+    /// default. Clamped to `SIDEBAR_WIDTH_MIN..=SIDEBAR_WIDTH_MAX` on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<u32>,
     /// Blindspot QA v1 (project.md Q13): true once the one-time first-run
     /// worked example (progress note → slides → own-figure) has been shown.
     /// The frontend checks this flag on startup; while false it replaces the
@@ -289,6 +309,8 @@ impl Default for Settings {
             char_limit_warning: None,
             personal_rag_enabled: false,
             api_key_present: None,
+            preview_background: None,
+            sidebar_width: None,
             has_seen_welcome_example: false,
             mcp_write_enabled: false,
         }
@@ -347,9 +369,27 @@ impl Settings {
     /// ones so the editor never renders with an unusable font.
     fn sanitize(&mut self) {
         self.editor_font_size = self.editor_font_size.clamp(12, 28);
+        if let Some(width) = self.sidebar_width {
+            self.sidebar_width = Some(width.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX));
+        }
+        if let Some(bg) = &self.preview_background {
+            if !PREVIEW_BACKGROUNDS.contains(&bg.as_str()) {
+                self.preview_background = None;
+            }
+        }
         if !matches!(self.editor_font_family.as_str(), "serif" | "sans" | "mono") {
             self.editor_font_family = default_editor_font_family();
         }
+    }
+
+    /// Fields the backend owns and the frontend must never overwrite through a
+    /// whole-object save. The UI holds the copy it loaded at startup; if the
+    /// backend has changed a field since (e.g. the API key was deleted, which
+    /// clears `api_key_present`), a later save of that stale copy must not
+    /// resurrect the old value.
+    pub fn with_backend_owned_fields_from(mut self, on_disk: &Settings) -> Settings {
+        self.api_key_present = on_disk.api_key_present;
+        self
     }
 
     /// Written atomically (temp + rename, same pattern as the session autosave)
@@ -407,6 +447,8 @@ fn prime_api_key_cache(value: Option<String>) {
     *API_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
 }
 
+/// Test-only: forget the cached key so a test starts from "never read".
+#[cfg(test)]
 fn invalidate_api_key_cache() {
     *API_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -516,6 +558,83 @@ mod tests {
         assert_eq!(reloaded.editor_font_size, 22);
         assert_eq!(reloaded.api_key_present, Some(true));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+
+    #[test]
+    fn preview_background_round_trips_and_defaults_to_unset() {
+        let dir = temp_config_dir("previewbg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        assert_eq!(Settings::load(&dir).preview_background, None);
+
+        let mut s = Settings::load(&dir);
+        s.preview_background = Some("paper".to_string());
+        s.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir).preview_background.as_deref(), Some("paper"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unknown_preview_background_is_reset_on_load() {
+        // A hand-edited or future value must not reach the UI as an unstyled
+        // key; it falls back to the default (unset = white).
+        let dir = temp_config_dir("previewbgbad");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r##"{"endpoint":"e","model":"m","defaultTargetLanguage":"English","temperature":0.3,"previewBackground":"#000000"}"##,
+        )
+        .unwrap();
+        assert_eq!(Settings::load(&dir).preview_background, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sidebar_width_round_trips_and_is_clamped_on_load() {
+        let dir = temp_config_dir("sidebarwidth");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"endpoint":"e","model":"m","defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        assert_eq!(Settings::load(&dir).sidebar_width, None);
+
+        let mut s = Settings::load(&dir);
+        s.sidebar_width = Some(320);
+        s.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir).sidebar_width, Some(320));
+
+        for (raw, expected) in [(5, SIDEBAR_WIDTH_MIN), (99_999, SIDEBAR_WIDTH_MAX)] {
+            std::fs::write(
+                dir.join("settings.json"),
+                format!(r#"{{"endpoint":"e","model":"m","defaultTargetLanguage":"English","temperature":0.3,"sidebarWidth":{raw}}}"#),
+            )
+            .unwrap();
+            assert_eq!(Settings::load(&dir).sidebar_width, Some(expected));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saving_from_the_frontend_never_overwrites_the_api_key_flag() {
+        // Rust owns `api_key_present` (set/delete key maintain it). A frontend
+        // save carries whatever copy the UI loaded at startup — possibly stale
+        // (e.g. the key was deleted since) — so it must not win.
+        let on_disk = Settings { api_key_present: Some(false), ..Settings::default() };
+        let incoming = Settings {
+            api_key_present: Some(true),
+            preview_background: Some("gray".to_string()),
+            ..Settings::default()
+        };
+        let merged = incoming.with_backend_owned_fields_from(&on_disk);
+        assert_eq!(merged.api_key_present, Some(false), "stale UI copy overwrote the flag");
+        assert_eq!(merged.preview_background.as_deref(), Some("gray"), "the user's change was lost");
     }
 
     // ----- API-key cache (macOS keychain prompt reduction) -----------------
@@ -674,6 +793,70 @@ mod tests {
         );
         // Non-tombstoned defaults still merge in.
         assert!(settings.models.iter().any(|m| m == "qwen/qwen3.6-flash"));
+    }
+
+    const RETIRED_FREE_PRESET: &str = "meta-llama/llama-3.3-70b-instruct:free";
+
+    // BUG-013a: OpenRouter retired this :free slug (404 "No endpoints
+    // found"), so it must not be seeded — neither for a fresh install nor by
+    // the load-time merge into an existing user's list.
+    #[test]
+    fn retired_free_preset_is_not_seeded_for_new_installs() {
+        assert!(!Settings::default().models.iter().any(|m| m == RETIRED_FREE_PRESET));
+
+        let dir = temp_config_dir("retired-preset-merge");
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"custom/x","models":["custom/x"],"defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert!(
+            !loaded.models.iter().any(|m| m == RETIRED_FREE_PRESET),
+            "merge re-seeded the retired preset: {:?}",
+            loaded.models
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Regression guard: removing the preset from the defaults must not prune
+    // it from a list the user already has (no silent deletion; the user
+    // removes it with the × button, which tombstones it).
+    #[test]
+    fn load_keeps_a_user_saved_retired_preset() {
+        let dir = temp_config_dir("retired-preset-kept");
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            format!(
+                r#"{{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"{RETIRED_FREE_PRESET}","models":["custom/x","{RETIRED_FREE_PRESET}"],"defaultTargetLanguage":"English","temperature":0.3}}"#
+            ),
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert_eq!(loaded.models[..2], ["custom/x", RETIRED_FREE_PRESET]);
+        assert_eq!(loaded.model, RETIRED_FREE_PRESET);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Regression guard (catalog plan task 5): a legacy file keeps every saved
+    // model field. `load` appends non-tombstoned built-ins AFTER the saved
+    // entries, so the saved list is asserted as a prefix, not the whole list.
+    #[test]
+    fn legacy_settings_keep_all_saved_model_fields_after_catalog_feature() {
+        let dir = temp_config_dir("legacy-model-fields");
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"endpoint":"https://openrouter.ai/api/v1/chat/completions","model":"old/free","models":["custom/text","old/free"],"imageModel":"custom/image","imageModels":["custom/image"],"removedModels":["qwen/qwen3.6-flash"],"defaultTargetLanguage":"English","temperature":0.3}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert_eq!(loaded.model, "old/free");
+        assert_eq!(loaded.models[..2], ["custom/text", "old/free"]);
+        assert_eq!(loaded.image_model, "custom/image");
+        assert_eq!(loaded.image_models[..1], ["custom/image"]);
+        assert_eq!(loaded.removed_models, ["qwen/qwen3.6-flash"]);
+        assert!(!loaded.models.iter().any(|m| m == "qwen/qwen3.6-flash"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

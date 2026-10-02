@@ -28,19 +28,20 @@ function relativeTime(ts: number): string {
 }
 
 /** A chunk's display title: its first ~60 chars (headings read as-is). */
-function chunkTitle(chunk: Chunk): string {
+function chunkTitle(chunk: Chunk, t: (key: string) => string): string {
   const text = chunk.content.trim().replace(/\s+/g, " ");
-  if (!text) return "(empty paragraph)";
+  if (!text) return t("(empty paragraph)");
   return text.length > 60 ? `${text.slice(0, 60)}…` : text;
 }
 
 /** Author chip label: "You" for user comments, "AI · kind" for AI ones. */
-function authorLabel(cm: ReviewComment): string {
+function authorLabel(cm: ReviewComment, t: (key: string) => string): string {
   if (cm.author === "ai") return cm.kind ? `AI · ${cm.kind}` : "AI";
-  return "You";
+  return t("You");
 }
 
 function AuthorChip({ comment }: { comment: ReviewComment }) {
+  const t = useT();
   return (
     <span
       className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
@@ -49,7 +50,7 @@ function AuthorChip({ comment }: { comment: ReviewComment }) {
           : "bg-accent/10 text-accent"
       }`}
     >
-      {authorLabel(comment)}
+      {authorLabel(comment, t)}
     </span>
   );
 }
@@ -101,8 +102,9 @@ function CommentRow({ chunkId, comment }: { chunkId: string; comment: ReviewComm
           >
             {comment.resolved ? t("Unresolve") : t("Resolve")}
           </button>
-          <Tooltip label="Delete comment">
+          <Tooltip label={t("Delete comment")}>
             <button
+              aria-label={t("Delete comment")}
               className="rounded p-0.5 text-ink-faint hover:bg-gray-100 hover:text-red-500"
               onClick={() => deleteComment(chunkId, comment.id)}
             >
@@ -202,7 +204,9 @@ export default function ReviewPanel() {
             onClick={() => void checkIntegrity()}
             className="rounded px-2 py-1 text-xs text-ink-soft hover:bg-gray-100 disabled:opacity-40 disabled:hover:bg-transparent"
             disabled={!!globalBusy}
-            title="AI's opinion on possibly-unsupported claims and contradictions, using the relationship graph (run Analyze first) — not a verified audit"
+            title={t(
+              "AI's opinion on possibly-unsupported claims and contradictions, using the relationship graph (run Analyze first) — not a verified audit"
+            )}
           >
             {t("Map logic")}
           </button>
@@ -226,7 +230,7 @@ export default function ReviewPanel() {
               onClick={() => flashChunk(composerChunk.id)}
               title={t("Jump to this paragraph")}
             >
-              {chunkTitle(composerChunk)}
+              {chunkTitle(composerChunk, t)}
             </button>
             <textarea
               value={composerText}
@@ -259,7 +263,7 @@ export default function ReviewPanel() {
 
         {isEmpty && !composerChunk && (
           <div className="px-1 py-6 text-center text-xs leading-5 text-ink-faint">{t("No comments yet. Use a paragraph's")}<CommentIcon className="inline h-3.5 w-3.5" />{" "}
-            button to add one, or run “AI review” / “Map logic” above.
+            {t("button to add one, or run “AI review” / “Map logic” above.")}
           </div>
         )}
 
@@ -271,10 +275,11 @@ export default function ReviewPanel() {
                 onClick={() => flashChunk(chunk.id)}
                 title={t("Jump to this paragraph")}
               >
-                {chunkTitle(chunk)}
+                {chunkTitle(chunk, t)}
               </button>
-              <Tooltip label="Add a comment on this paragraph">
+              <Tooltip label={t("Add a comment on this paragraph")}>
                 <button
+                  aria-label={t("Add a comment on this paragraph")}
                   className="rounded p-0.5 text-ink-faint hover:bg-gray-100 hover:text-ink"
                   onClick={() => setReviewTarget(chunk.id)}
                 >
@@ -307,7 +312,7 @@ export default function ReviewPanel() {
                       onClick={() => flashChunk(chunk.id)}
                       title={t("Jump to this paragraph")}
                     >
-                      {chunkTitle(chunk)}
+                      {chunkTitle(chunk, t)}
                     </button>
                     <CommentRow chunkId={chunk.id} comment={comment} />
                   </div>

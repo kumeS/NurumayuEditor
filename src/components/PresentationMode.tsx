@@ -1,4 +1,6 @@
-// Fullscreen presentation overlay (item 1-3 — 開発.txt Stage 1): slide-by-slide
+// Presentation overlay (item 1-3 — 開発.txt Stage 1): it fills the app window
+// (fixed inset-0); switching the OS window to native full screen is planned,
+// so no copy here promises "full screen". Slide-by-slide
 // presenting for a weekly lab-meeting talk, so it never needs a PPTX export
 // step first. Opened from the Slide editor's "Present" button or the command
 // palette ("Start presentation"); an ephemeral, UI-only overlay driven by the
@@ -22,7 +24,12 @@
 // window keydown listener scoped to its own mount lifecycle (added on mount,
 // removed on unmount), active only while the overlay is open.
 //
-// Testing: this is a highly interactive, highly visual surface (fullscreen
+// Layout: the slide is sized by the stage's height as well as its width
+// (container query units), so in a short window — or with notes open — the
+// slide shrinks instead of pushing the notes and the control bar off-screen.
+// Notes keep their line breaks and scroll past 30vh.
+//
+// Testing: this is a highly interactive, highly visual surface (window-filling
 // keyboard-driven slideshow) — full keyboard + rendering integration testing
 // here is disproportionate to the value it adds over the existing SlideStage/
 // slides.ts unit coverage, so it is deliberately not attempted. The PURE logic
@@ -121,15 +128,15 @@ export default function PresentationMode() {
       >
         <CloseIcon className="h-5 w-5" />
       </button>
-      <div className="flex flex-1 items-center justify-center p-6">
-        <div className="w-full max-w-[1280px] shadow-2xl">
+      <div className="flex min-h-0 flex-1 items-center justify-center p-6 [container-type:size]">
+        <div className="w-[min(100%,1280px,calc(100cqh*16/9))] shadow-2xl">
           <SlideStage slide={current} layout={resolveLayout(current)} docTitle={title} />
         </div>
       </div>
 
       {notesOpen && (
         <div className="mx-auto mb-2 w-full max-w-[1280px] shrink-0 px-6">
-          <div className="rounded-lg border border-white/15 bg-white/5 p-3 text-sm leading-6 text-white/80">
+          <div className="max-h-[30vh] overflow-y-auto whitespace-pre-wrap rounded-lg border border-white/15 bg-white/5 p-3 text-sm leading-6 text-white/80">
             <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-white/40">
               {t("Speaker notes")}
             </div>
@@ -161,6 +168,7 @@ export default function PresentationMode() {
         <button
           onClick={() => setNotesOpen((v) => !v)}
           title={t("Toggle speaker notes (N)")}
+          aria-pressed={notesOpen}
           className={`rounded px-2 py-0.5 hover:text-white ${notesOpen ? "text-white" : ""}`}
         >
           {t("Notes (N)")}

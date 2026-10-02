@@ -49,3 +49,27 @@ describe("spliceTextAtCursor", () => {
     expect(result.caretAfter).toBe("これは (佐藤, 2020) ".length);
   });
 });
+
+// Wiring guard (BUG-002): the Citations panel's insert must start its own undo
+// step. Scoped to insertAtCursor's body so an unrelated updateChunkContent call
+// elsewhere in the file cannot satisfy it.
+const panelSource = import.meta.glob("./components/CitationsPanel.tsx", {
+  eager: true,
+  query: "?raw",
+  import: "default",
+}) as Record<string, string>;
+
+describe("CitationsPanel insertAtCursor wiring", () => {
+  it("inserts the citation as its own undo step (newUndoStep: true)", () => {
+    const source = panelSource["./components/CitationsPanel.tsx"];
+    expect(source, "CitationsPanel.tsx not found").toBeTruthy();
+    const start = source.indexOf("function insertAtCursor(");
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\n}\n", start);
+    const body = source.slice(start, end);
+    const calls = body.match(/updateChunkContent\([^)]*\)/g) ?? [];
+    expect(calls).toEqual([
+      "updateChunkContent(chunkId, newContent, { newUndoStep: true })",
+    ]);
+  });
+});

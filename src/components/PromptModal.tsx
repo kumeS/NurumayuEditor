@@ -2,9 +2,11 @@
 // anywhere and `await` the user's input (or null on cancel). `<PromptHost/>`
 // must be mounted once near the app root.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { CloseIcon } from "./icons";
 import { useT } from "../i18n";
+import { isImeKeyEvent } from "../modalBehavior";
+import Modal from "./Modal";
 
 interface PromptOptions {
   title: string;
@@ -32,6 +34,8 @@ export function PromptHost() {
   const [value, setValue] = useState("");
   const resolverRef = useRef<Resolver | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
+  const titleId = useId();
+  const fieldId = useId();
 
   useEffect(() => {
     openImpl = (o: PromptOptions) =>
@@ -45,13 +49,6 @@ export function PromptHost() {
     };
   }, []);
 
-  useEffect(() => {
-    if (opts) {
-      const t = setTimeout(() => inputRef.current?.focus(), 30);
-      return () => clearTimeout(t);
-    }
-  }, [opts]);
-
   if (!opts) return null;
 
   const finish = (result: string | null) => {
@@ -63,26 +60,26 @@ export function PromptHost() {
   const submit = () => finish(value.trim().length ? value : opts.defaultValue ?? "");
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
-      onMouseDown={() => finish(null)}
+    <Modal
+      name="prompt"
+      onClose={() => finish(null)}
+      labelledBy={titleId}
+      initialFocusRef={inputRef}
+      panelClassName="w-full max-w-md rounded-xl bg-white p-5 shadow-xl"
     >
-      <div
-        className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-base font-semibold text-ink">{opts.title}</h2>
+          <h2 id={titleId} className="text-base font-semibold text-ink">{opts.title}</h2>
           <button
             className="text-ink-faint hover:text-ink"
             onClick={() => finish(null)}
             aria-label={t("Close")}
+            title={t("Close")}
           >
             <CloseIcon />
           </button>
         </div>
         {opts.label && (
-          <label className="mb-1 block text-sm text-ink-soft">{opts.label}</label>
+          <label htmlFor={fieldId} className="mb-1 block text-sm text-ink-soft">{opts.label}</label>
         )}
         {opts.presets && opts.presets.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5">
@@ -91,7 +88,7 @@ export function PromptHost() {
                 key={p.value}
                 type="button"
                 onClick={() => finish(p.value)}
-                className="rounded-full border border-gray-200 px-3 py-1 text-sm text-ink-soft transition-colors hover:border-accent hover:bg-accent/10 hover:text-accent"
+                className="rounded-full border border-chrome-line px-3 py-1 text-sm text-ink-soft transition-colors hover:border-accent hover:bg-accent/10 hover:text-accent"
               >
                 {t(p.label)}
               </button>
@@ -100,6 +97,8 @@ export function PromptHost() {
         )}
         {opts.multiline ? (
           <textarea
+            id={fieldId}
+            aria-label={opts.label ? undefined : opts.title}
             ref={(el) => {
               inputRef.current = el;
             }}
@@ -107,14 +106,16 @@ export function PromptHost() {
             placeholder={opts.placeholder}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
+              if (isImeKeyEvent(e.nativeEvent)) return;
               if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
-              if (e.key === "Escape") finish(null);
             }}
             rows={4}
-            className="w-full resize-y rounded-md border border-gray-300 p-2 text-sm outline-none focus:border-accent"
+            className="w-full resize-y rounded-md border border-chrome-edge p-2 text-sm outline-none focus:border-accent"
           />
         ) : (
           <input
+            id={fieldId}
+            aria-label={opts.label ? undefined : opts.title}
             ref={(el) => {
               inputRef.current = el;
             }}
@@ -122,15 +123,15 @@ export function PromptHost() {
             placeholder={opts.placeholder}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
+              if (isImeKeyEvent(e.nativeEvent)) return;
               if (e.key === "Enter") submit();
-              if (e.key === "Escape") finish(null);
             }}
-            className="w-full rounded-md border border-gray-300 p-2 text-sm outline-none focus:border-accent"
+            className="w-full rounded-md border border-chrome-edge p-2 text-sm outline-none focus:border-accent"
           />
         )}
         <div className="mt-4 flex justify-end gap-2">
           <button
-            className="rounded-md px-3 py-1.5 text-sm text-ink-soft hover:bg-gray-100"
+            className="rounded-md px-3 py-1.5 text-sm text-ink-soft hover:bg-chrome-hairline"
             onClick={() => finish(null)}
           >
             {t("Cancel")}
@@ -139,10 +140,9 @@ export function PromptHost() {
             className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent-soft"
             onClick={submit}
           >
-            {opts.submitLabel ?? "OK"}
+            {opts.submitLabel ?? t("Apply")}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
