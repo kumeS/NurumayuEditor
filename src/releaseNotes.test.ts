@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { APP_VERSION } from "./buildInfo";
 
 // Release discipline (release-notes/README.md): every update bumps the
-// version in all three manifests and ships release notes for that version
-// with "what changed", Known Issues and Future Release. These tests fail when
-// a version is bumped in one place only, or when a version has no notes.
+// version in all three manifests and ships release notes for that version, in
+// Japanese (v<version>.md) and English (v<version>.en.md), each with "what
+// changed", Known Issues and Future Release. These tests fail when a version
+// is bumped in one place only, when a version has no notes in either
+// language, or when the two languages list different KI-/FR- entries.
 
 const raw = import.meta.glob(
   [
@@ -17,6 +19,12 @@ const raw = import.meta.glob(
 ) as Record<string, string>;
 
 const notesPath = `../release-notes/v${APP_VERSION}.md`;
+const notesPathEn = `../release-notes/v${APP_VERSION}.en.md`;
+
+/** The KI-nn / FR-nn ids a release note defines (first cell of a table row). */
+function entryIds(markdown: string): string[] {
+  return [...markdown.matchAll(/^\| ((?:KI|FR)-\d{2}) \|/gm)].map((m) => m[1]).sort();
+}
 
 /** Level-2 headings ("## …") of a Markdown text, without the "## " prefix. */
 function h2(markdown: string): string[] {
@@ -38,15 +46,26 @@ describe("release discipline", () => {
 
   it("the current version has release notes", () => {
     expect(Object.keys(raw)).toContain(notesPath);
+    expect(Object.keys(raw)).toContain(notesPathEn);
   });
 
   it("the release notes say what changed and list Known Issues and Future Release", () => {
-    const headings = h2(raw[notesPath] ?? "");
-    for (const required of ["アップデート内容", "Known Issues", "Future Release"]) {
-      expect(headings.some((h) => h.includes(required)), `missing "## … ${required}" heading`).toBe(true);
+    const required: Array<[string, string[]]> = [
+      [notesPath, ["アップデート内容", "Known Issues", "Future Release"]],
+      [notesPathEn, ["What's updated", "Known Issues", "Future Release"]],
+    ];
+    for (const [path, names] of required) {
+      const headings = h2(raw[path] ?? "");
+      for (const name of names) {
+        expect(headings.some((h) => h.includes(name)), `${path}: missing "## … ${name}" heading`).toBe(true);
+      }
+      // The title names the version the file is for.
+      expect((raw[path] ?? "").split("\n")[0]).toContain(`v${APP_VERSION}`);
     }
-    // The title names the version the file is for.
-    expect((raw[notesPath] ?? "").split("\n")[0]).toContain(`v${APP_VERSION}`);
+    // Both languages list the same Known Issues and Future Release entries.
+    const ids = entryIds(raw[notesPath] ?? "");
+    expect(ids.length).toBeGreaterThan(0);
+    expect(entryIds(raw[notesPathEn] ?? "")).toEqual(ids);
   });
 
   it("CHANGELOG.md has a heading for the current version", () => {

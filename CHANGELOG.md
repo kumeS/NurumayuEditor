@@ -9,7 +9,8 @@ _Nothing yet._
 Everything since v1.3.0: the QA fix pass below, plus the Markdown workspace,
 Stage 1–3 features and the rebrand, which were built after v1.3.0 and had not
 shipped under a version number. Release notes with the full **Known Issues**
-and **Future Release** lists (Japanese): `release-notes/v1.4.0.md`.
+and **Future Release** lists: `release-notes/v1.4.0.en.md` (English) and
+`release-notes/v1.4.0.md` (Japanese).
 
 ### QA fix pass (QA run 20260927-computer-use-v1, 2026-10-01)
 
@@ -169,7 +170,7 @@ Items that only a person can confirm in the installed app are listed in
   so a QA report can name the exact binary.
 
 **Known limitations / planned** (summary — the complete Known Issues and
-Future Release lists are in `release-notes/v1.4.0.md`)
+Future Release lists are in `release-notes/v1.4.0.en.md`)
 
 - BUG-006 (intermittent accessibility hang on long Markdown) is mitigated, not
   closed. Closing it needs a profiling run with Instruments.
