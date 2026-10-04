@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NurumayuEditor v1.4.0</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#0b1418;overflow:hidden}
+h1,h2,h3,p,ul,table{margin:0}
+ul{padding-left:1.2em}
+#stage{position:fixed;left:50%;top:50%;width:1920px;height:1080px;transform-origin:center center}
+#stage>section{position:absolute;inset:0;width:1920px;height:1080px;opacity:0;pointer-events:none;transition:opacity .35s ease}
+#stage>section.on{opacity:1;pointer-events:auto}
+section>aside{display:none}
+#notes{position:fixed;left:0;right:0;bottom:0;max-height:35vh;overflow:auto;background:rgba(10,18,22,.94);color:#e8eef0;font:16px/1.5 'IBM Plex Sans',Arial,sans-serif;padding:16px 24px;display:none}
+body.shownotes #notes{display:block}
+#hud{position:fixed;right:16px;bottom:12px;color:#8FA8AE;font:14px 'JetBrains Mono',monospace;opacity:.7}
+@media print{
+ @page{size:1920px 1080px;margin:0}
+ html,body{overflow:visible;height:auto;background:none}
+ #stage{position:static;transform:none!important;width:auto;height:auto}
+ #stage>section{position:relative;opacity:1;page-break-after:always;break-after:page}
+ #notes,#hud{display:none!important}
+}
+</style></head>
+<body>
+<div id="stage">
+<section id="cover" data-transition="fade" style="background:#14232B;color:#F4F1EA;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;justify-content:center;gap:48px">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:36px;color:#E8A25A;letter-spacing:2px">RELEASE 1.4.0 · 2026-10-02 · macOS</p>
+<h1 style="font-size:140px;font-weight:700;line-height:1.05">NurumayuEditor v1.4</h1>
+<p style="font-size:52px;color:#B9CDD2;line-height:1.3;width:1500px">Safer AI edits, Find &amp; Replace, a model picker and direct PDF export.</p>
+<p style="position:absolute;left:128px;bottom:64px;width:1664px;font-size:28px;color:#8FA8AE">Write Markdown. Preview it. Present it.</p>
+<aside>NurumayuEditor v1.4.0 shipped on 2 October 2026, about three months after v1.3.0. It is the first numbered release that includes everything built since July, and the main theme is trust: the editor no longer changes your data without being asked. It also fixes 18 of the 21 defects found in QA.</aside>
+</section>
+<section id="overview" data-transition="fade" style="background:#F6F4EF;color:#14232B;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;justify-content:space-between;gap:40px">
+<div style="display:flex;flex-direction:column;gap:20px">
+<h2 style="font-size:80px;font-weight:700;line-height:1.1">What is NurumayuEditor?</h2>
+<p style="font-size:40px;line-height:1.35;color:#3E4F55">A local-first Markdown and slide editor built on <b style="color:#14232B">chunks</b>.</p>
+</div>
+<div style="display:flex;gap:32px">
+<div style="flex:1;display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #B5601A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">One file, two faces</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">The same chunks are your document and your deck.</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #B5601A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">AI per chunk</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">Translate, proofread, expand, diagram, in context.</p>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #B5601A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">Your own library</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">Grounded in your notes and papers, on-device.</p>
+</div>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:32px">
+<div style="display:flex;flex-direction:column;gap:8px">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;color:#1F6E7A;font-weight:600">STACK</p>
+<p style="font-size:32px;line-height:1.35">Tauri · Rust · React</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;color:#1F6E7A;font-weight:600">FILES</p>
+<p style="font-size:32px;line-height:1.35">.aix / .md → PDF, PPTX</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;color:#1F6E7A;font-weight:600">MODELS</p>
+<p style="font-size:32px;line-height:1.35">OpenRouter or Ollama</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:28px;color:#1F6E7A;font-weight:600">SECURITY</p>
+<p style="font-size:32px;line-height:1.35">Keys in OS keychain</p>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;width:1664px;font-size:28px;color:#6A777B">A scratchpad for weekly progress, not a finishing tool</p>
+<aside>NurumayuEditor treats a document as an ordered list of chunks, like notebook cells for writing. That list is projected two ways: a document you edit and a deck you present, with no export step in between. Each chunk is also the unit for AI actions (translate, proofread, expand, summarize, diagram, illustrate), which read the surrounding context and can draw on a personal library kept entirely on the device. API keys live in the OS keychain and all network calls happen in Rust. It is meant for rough weekly progress; final polish still happens in your usual apps.</aside>
+</section>
+<section id="features" data-transition="fade" style="background:#F6F4EF;color:#14232B;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;justify-content:space-between;gap:40px">
+<h2 style="font-size:80px;font-weight:700;line-height:1.1">NurumayuEditor v1.4.0 features</h2>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:32px">
+<div style="display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #B5601A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">Find &amp; Replace</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">Japanese search, Go to Line, one-step undo</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #B5601A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">Model picker</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">Browse OpenRouter models and prices</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #B5601A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">Direct PDF export</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">Writes straight from a save dialog</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #1F6E7A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">Safer saving</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">Save As (⇧⌘S); Save, Don't Save, Cancel</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #1F6E7A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">AI operations log</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">What ran, what applied, and why</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:12px;background:#FFFDF8;padding:36px;border:1px solid #DDD6C8;border-top:8px solid #1F6E7A;border-radius:16px">
+<h3 style="font-size:44px;font-weight:600">Slide commands</h3>
+<p style="font-size:36px;line-height:1.35;color:#3E4F55">Add, split, merge, AI layout in ⌘K</p>
+</div>
+</div>
+<p style="font-size:32px;line-height:1.35;color:#3E4F55"><b style="color:#14232B">First shipped:</b> Markdown workspace, Presentation mode, on-device RAG, MCP</p>
+<p style="position:absolute;left:128px;bottom:64px;width:1664px;font-size:28px;color:#6A777B">Source: release notes v1.4.0 · §2.1, §2.4</p>
+<aside>Six headline features. Find and Replace works in the Editor and Markdown source, including Japanese, with Go to Line and a one-step undo of Replace All. The model picker loads the OpenRouter list with search, a free-only filter and prices. PDF export now writes directly. Saving gained Save As on ⇧⌘S and a three-way prompt for unsaved changes, and the last tab can be closed. The AI operations log records only identifiers, never document text or keys. Slide commands are all in the command palette. Also shipping under a version number for the first time: the Markdown workspace, Presentation mode, ghost-text completion, the on-device personal library, citations, the CLI and the read-only MCP server.</aside>
+</section>
+<section id="safety" data-transition="fade" style="background:#F6F4EF;color:#14232B;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;gap:48px">
+<h2 style="font-size:80px;font-weight:700;line-height:1.1">Fixes and behavior changes</h2>
+<div style="display:flex;gap:48px">
+<div style="flex:1;display:flex;flex-direction:column;gap:24px">
+<h3 style="font-size:44px;font-weight:600;color:#1F6E7A">Data safety first</h3>
+<div style="display:flex;flex-direction:column;gap:6px;padding:20px 28px;background:#FFFDF8;border-left:8px solid #1F6E7A;border-radius:8px">
+<p style="font-size:36px;font-weight:600">AI edits hit the right place</p>
+<p style="font-size:32px;line-height:1.35;color:#3E4F55">Applied only if the text still matches</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px;padding:20px 28px;background:#FFFDF8;border-left:8px solid #1F6E7A;border-radius:8px">
+<p style="font-size:36px;font-weight:600">Markdown stays intact</p>
+<p style="font-size:32px;line-height:1.35;color:#3E4F55">Switching modes no longer rewrites it</p>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px;padding:20px 28px;background:#FFFDF8;border-left:8px solid #1F6E7A;border-radius:8px">
+<p style="font-size:36px;font-weight:600">Undo and Esc fixed</p>
+<p style="font-size:32px;line-height:1.35;color:#3E4F55">Field-level Undo; Esc closes dialogs</p>
+</div>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:24px">
+<h3 style="font-size:44px;font-weight:600;color:#B5601A">Know before you update</h3>
+<table style="font-size:32px;line-height:1.3;border-collapse:collapse;width:100%">
+<tr><th style="text-align:left;padding:12px 16px;border-bottom:2px solid #14232B">Change</th><th style="text-align:left;padding:12px 16px;border-bottom:2px solid #14232B">Now</th></tr>
+<tr><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8;font-family:'JetBrains Mono', 'Courier New', monospace">⇧⌘S</td><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">Save As</td></tr>
+<tr><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">PDF export</td><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">Text only, no images</td></tr>
+<tr><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">Ghost text</td><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">Only after typing</td></tr>
+<tr><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">JP drafts</td><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">Length in characters</td></tr>
+<tr><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">Last tab</td><td style="padding:12px 16px;border-bottom:1px solid #DDD6C8">Can be closed</td></tr>
+</table>
+</div>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;width:1664px;font-size:28px;color:#6A777B">Source: release notes v1.4.0 · §2.2, §2.3</p>
+<aside>Left: the fixes that matter most, all about not touching data the user didn't ask to change. An AI result is applied only when the tab, the loaded document and the sent text all still match (BUG-001). Switching between Markdown, Editor and Slides no longer marks the document unsaved or rewrites its source; an unedited round trip is byte-for-byte identical (BUG-019). Undo works per field, Esc closes dialogs, and focus can no longer reach buttons behind a dialog. Right: changes users will notice on upgrade. ⇧⌘S used to overwrite; exports to a path with no extension are now refused; and automation scripts that find the per-paragraph AI button by name need updating, since its label changed.</aside>
+</section>
+<section id="next" data-transition="fade" style="background:#14232B;color:#F4F1EA;font-family:'IBM Plex Sans', Arial, sans-serif;padding:128px 128px 160px;display:flex;flex-direction:column;justify-content:space-between;gap:48px">
+<h2 style="font-size:80px;font-weight:700;line-height:1.1">Known issues and what's next</h2>
+<div style="display:flex;gap:48px">
+<div style="flex:1;display:flex;flex-direction:column;gap:24px">
+<h3 style="font-size:44px;font-weight:600;color:#E8A25A">43 known issues, documented</h3>
+<ul style="font-size:32px;line-height:1.4;color:#D3E0E2;display:flex;flex-direction:column;gap:12px">
+<li>Long Markdown can stall screen readers</li>
+<li>Notes not saved in .md files</li>
+<li>PDFs omit images and formatting</li>
+<li>Images readable outside doc folder</li>
+</ul>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;gap:24px">
+<h3 style="font-size:44px;font-weight:600;color:#7FC4CE">High priority next</h3>
+<ul style="font-size:32px;line-height:1.4;color:#D3E0E2;display:flex;flex-direction:column;gap:12px">
+<li>Faster long-Markdown rendering</li>
+<li>Print via the OS dialog</li>
+<li>Images and formatting in PDFs</li>
+<li>Limit image reads to doc folder</li>
+</ul>
+</div>
+</div>
+<div style="display:flex;gap:32px;align-items:center;background:#E8A25A;color:#14232B;padding:32px 40px;border-radius:16px">
+<p style="font-family:'JetBrains Mono', 'Courier New', monospace;font-size:32px;font-weight:600">NEXT STEP</p>
+<p style="font-size:36px;line-height:1.3;font-weight:500">Manual retest: display, keyboard, Japanese IME</p>
+</div>
+<p style="position:absolute;left:128px;bottom:64px;width:1664px;font-size:28px;color:#8FA8AE">Source: release notes v1.4.0 · §3, §4</p>
+<aside>Known issues, left to right: KI-01 long Markdown documents can intermittently hang accessibility readers; KI-04 speaker notes are not saved in .md files; KI-12 PDFs omit images, diagrams and formatting; KI-37 local images can be read from outside the document folder. High-priority future releases: FR-01 lighter rendering of long Markdown, FR-02 printing through the OS dialog, FR-03 images and formatting in PDFs, FR-14 limiting image reads to the document folder. All automated tests pass, but the new build has not yet been checked in the running app; that manual retest is the immediate next step.</aside>
+</section>
+</div>
+<div id="notes"></div>
+<div id="hud"></div>
+<script>
+const S=[...document.querySelectorAll('#stage>section')];let i=0;
+const stage=document.getElementById('stage'),notes=document.getElementById('notes'),hud=document.getElementById('hud');
+function fit(){const k=Math.min(innerWidth/1920,innerHeight/1080);stage.style.transform='translate(-50%,-50%) scale('+k+')';}
+function show(n){i=Math.max(0,Math.min(S.length-1,n));S.forEach((s,j)=>s.classList.toggle('on',j===i));
+ const a=S[i].querySelector('aside');notes.textContent=a?a.textContent:'';hud.textContent=(i+1)+' / '+S.length+'  ·  N: notes  F: fullscreen';
+ history.replaceState(null,'','#'+(i+1));}
+addEventListener('resize',fit);
+addEventListener('keydown',e=>{
+ if(['ArrowRight','PageDown',' ','Enter'].includes(e.key)){show(i+1);e.preventDefault();}
+ else if(['ArrowLeft','PageUp','Backspace'].includes(e.key)){show(i-1);e.preventDefault();}
+ else if(e.key==='Home')show(0);else if(e.key==='End')show(S.length-1);
+ else if(e.key==='n'||e.key==='N')document.body.classList.toggle('shownotes');
+ else if(e.key==='f'||e.key==='F'){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen();}
+});
+addEventListener('click',e=>{if(e.target.closest('#notes'))return;show(e.clientX<innerWidth/3?i-1:i+1);});
+fit();show((parseInt(location.hash.slice(1))||1)-1);
+</script>
+</body></html>
