@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { documentDiff } from "./diff";
+import { changeSummary, documentDiff, hasChanges, sameAsSaved } from "./diff";
 import { documentToMarkdown, eolOf, markdownToDocument, normalizeEol, restoreEol } from "./markdown";
+import { draftToMarkdown } from "./previewEditing";
 import { groupSlides, hasLayoutOverride, resolveLayout, slideLead, slideNotes } from "./slides";
 import {
   AI_OP_LOG_MAX,
@@ -20,6 +21,7 @@ import type {
   AnalysisResult,
   Chunk,
   ChunkType,
+  DocMode,
   Document,
   Settings,
   SlideLayout,
@@ -998,7 +1000,11 @@ describe("item 1-2 — savedDoc baseline lifecycle", () => {
     st().updateChunkContent("a", "hello, typed during the save"); // race window
     expect(st().doc).not.toBe(writtenDoc);
     st().markClean("/path/to/file.aix", writtenDoc);
-    expect(st().dirty).toBe(false);
+    // Flipped (QA 20261003, one dirty notion): the live doc is past what was
+    // written, so the tab stays dirty — same rule as markTabClean. The old
+    // `false` here was the 保存済み-with-a-listed-change contradiction, and
+    // would have let the tab close without asking about the keystroke.
+    expect(st().dirty).toBe(true);
     expect(st().savedDoc).toBe(writtenDoc); // baseline = what was saved
     expect(st().savedDoc).not.toBe(st().doc); // NOT the newer, unsaved doc
     // The diff view must still report the mid-save keystroke as a real change.
@@ -2129,5 +2135,362 @@ describe("ux-a11y-i18n-5 — settingsFocus", () => {
     (st().openSettings as (x: unknown) => void)({ type: "click" }); // onClick={openSettings}
     expect(st().settingsFocus).toBeNull();
     st().closeSettings();
+  });
+});
+
+// ----- QA 20261003: ONE "matches the saved baseline" notion -----
+// BUG-001 (title ⌘Z), BUG-005 (Markdown preview edit + ⌘Z) and BUG-007
+// (speaker notes) all showed 未保存 next to 未保存(保存時と同じ内容): the dirty
+// flag and the health bar's change summary disagreed. Every test here also
+// asserts the contract itself (expectConsistent).
+describe("QA 20261003 — dirty agrees with the change summary", () => {
+  /** The UI can never show 未保存 + 保存時と同じ内容 for a clean baseline. */
+  const expectConsistent = () => {
+    expect(st().savedDocIsClean).toBe(true);
+    const summaryChanged = hasChanges(changeSummary(st().savedDoc, st().doc));
+    expect(st().dirty).toBe(summaryChanged);
+    expect(st().dirty).toBe(!sameAsSaved(st().savedDoc, st().doc));
+  };
+  /** A brand-new blank tab, the QA starting point ("新規の空ドキュメント"). */
+  const blankTab = (mode: DocMode = "editor") => {
+    reset([chunk("a", "text")]);
+    st().newTab(mode);
+    expect(st().dirty).toBe(false);
+  };
+  /** Open a .md file as fileActions does (re-parsed source, file stem as the fallback title). */
+  const openMd = (source: string) => {
+    reset([chunk("a", "text")]);
+    st().loadDocument(markdownToDocument({ ...doc([]), title: "stem" }, source), "/x.md");
+  };
+
+  describe("BUG-001 — a title edit reverted in the field is clean", () => {
+    it("blank doc: type a title, field-undo back to empty → clean", () => {
+      blankTab();
+      for (const v of ["タ", "タイトル", "タイトルC"]) st().setTitle(v);
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+      st().setTitle(""); // document.execCommand("undo") → onChange("")
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    const WITH_H1: [string, string][] = [
+      ["canonical H1", "# 見出し\n\n本文です。\n"],
+      ["H1 with a closing # run and extra spaces", "#  見出し  ##\n\n本文です。\n"],
+      ["frontmatter, then the H1, then a blank-line run", "---\nk: v\n---\n\n# 見出し\n\n\n\n本文です。\n"],
+      ["leading blank lines, CRLF", "\r\n\r\n# 見出し\r\n\r\n\r\n本文です。\r\n"],
+    ];
+
+    it.each(WITH_H1)(".md with an H1 (%s): change the title and set it back → clean, source byte-identical", (_n, S) => {
+      openMd(S);
+      st().setMode("editor"); // the title field lives in Editor/Slides
+      const title = st().doc.title;
+      expect(title).toBe("見出し");
+      st().setTitle(`${title}X`);
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+      st().setTitle(title);
+      expect(st().doc.markdownSource).toBe(S);
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it.each(WITH_H1)(".md with an H1 (%s): clear the title, retype it → clean, source byte-identical", (_n, S) => {
+      openMd(S);
+      st().setMode("editor");
+      for (const v of ["見出", "見", "", "見", "見出", "見出し"]) {
+        st().setTitle(v);
+        expectConsistent();
+      }
+      expect(st().doc.markdownSource).toBe(S);
+      expect(st().dirty).toBe(false);
+    });
+
+    const NO_H1: [string, string][] = [
+      ["plain body with a blank-line run", "body  \n\n\nmore\n"],
+      ["leading blank lines", "\n\n本文です。\n"],
+      ["frontmatter directly followed by the body", "---\nk: v\n---\n本文です。\n"],
+    ];
+
+    it.each(NO_H1)(".md without an H1 (%s): title edit + revert → clean, no H1 left behind", (_n, S) => {
+      openMd(S);
+      st().setMode("editor");
+      expect(st().doc.title).toBe("stem");
+      st().setTitle("stemX");
+      expect(st().doc.markdownSource).toContain("# stemX");
+      st().setTitle("stem");
+      expect(st().doc.markdownSource).toBe(S);
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+      // …and through an empty title.
+      for (const v of ["", "s", "stem"]) st().setTitle(v);
+      expect(st().doc.markdownSource).toBe(S);
+      expect(st().dirty).toBe(false);
+    });
+
+    it("never reverts a separate source edit: a blank line added under the H1 survives a title round trip", () => {
+      const S = "# 見出し\n\n本文です。\n";
+      openMd(S);
+      st().setMarkdownSource("# 見出し\n\n\n本文です。\n");
+      st().setMode("editor");
+      st().setTitle("別");
+      st().setTitle("見出し");
+      expect(st().doc.markdownSource).toBe("# 見出し\n\n\n本文です。\n");
+      expect(st().dirty).toBe(true);
+      expect(changeSummary(st().savedDoc, st().doc).sourceChanged).toBe(true);
+      expectConsistent();
+    });
+  });
+
+  describe("BUG-005 — undo after a Markdown-mode edit lands on clean", () => {
+    /** The preview's "+ 段落を追加" commit (MarkdownPreview DraftBlock.finish, place "end"). */
+    const addParagraphInPreview = (text: string) => {
+      const current = documentToMarkdown(st().doc);
+      const trimmed = current.replace(/\s+$/, "");
+      st().setMarkdownSource(`${trimmed}${trimmed ? "\n\n" : ""}${draftToMarkdown(text, "paragraph")}\n`, {
+        newUndoStep: true,
+      });
+    };
+
+    it("blank doc → Markdown → + 段落を追加 → type → ⌘Z is clean; redo dirty; undo clean", () => {
+      blankTab();
+      st().setMode("markdown");
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+      addParagraphInPreview("再現テスト");
+      expect(st().doc.chunks.map((c) => c.content)).toEqual(["再現テスト"]);
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+      st().undo();
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+      st().redo();
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+      st().undo();
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it("an .aix doc: Markdown → source typing → undo is clean (redo dirty)", () => {
+      reset([chunk("a", "text", "本文")]);
+      st().setMode("markdown");
+      st().setMarkdownSource("# T\n\n本文を編集\n");
+      expect(st().dirty).toBe(true);
+      st().undo();
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+      st().redo();
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    it("Slides → edit a slide → undo is clean (redo dirty), for typing and for a layout pick", () => {
+      reset([chunk("h", "heading", "スライド"), chunk("a", "text", "本文")]);
+      st().setMode("slide");
+      st().updateChunkContent("h", "スライド1");
+      expect(st().dirty).toBe(true);
+      st().undo();
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+      st().redo();
+      expect(st().dirty).toBe(true);
+      st().undo();
+      st().setChunkLayout("h", "section");
+      expect(st().dirty).toBe(true);
+      st().undo();
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it("typing back to the saved text (no undo) is clean too — the same predicate on every edit", () => {
+      reset([chunk("a", "text", "本文")]);
+      st().updateChunkContent("a", "本文。");
+      expect(st().dirty).toBe(true);
+      st().updateChunkContent("a", "本文");
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it("a frontmatter-only source edit is dirty (and named), editing it back is clean", () => {
+      const S = "---\nk: v\n---\n\n# 見出し\n\n本文\n";
+      openMd(S);
+      st().setMarkdownSource(S.replace("k: v", "k: w"));
+      expect(st().dirty).toBe(true);
+      expect(changeSummary(st().savedDoc, st().doc)).toEqual({
+        paragraphs: 0,
+        titleChanged: false,
+        otherChanged: false,
+        sourceChanged: true,
+      });
+      expectConsistent();
+      st().setMarkdownSource(S);
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it("a whitespace-only source edit (blank-line run, CRLF→LF) is dirty", () => {
+      openMd("a\r\n\r\n\r\nb\r\n");
+      st().setMarkdownSource("a\r\n\r\nb\r\n");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+      st().setMarkdownSource("a\n\n\nb\n");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    const MODE_DOCS: [string, () => void][] = [
+      ["blank editor tab", () => blankTab("editor")],
+      ["blank Markdown tab", () => blankTab("markdown")],
+      ["blank Slides tab", () => blankTab("slide")],
+      [".md with frontmatter", () => openMd("---\nk: v\n---\n\n# 見出し\n\n#### x\n\na\n\n\n\nb  \n")],
+      [".md with CRLF and no H1", () => openMd("本文\r\n\r\n二段落目\r\n")],
+      [".aix with content", () => reset([chunk("h", "heading", "見出し"), chunk("a", "text", "本文")])],
+    ];
+
+    it.each(MODE_DOCS)("mode switches never change dirty or the summary (%s)", (_n, open) => {
+      open();
+      for (const m of ["editor", "markdown", "slide", "markdown", "editor", "slide", "editor"] as DocMode[]) {
+        st().setMode(m);
+        expect(st().dirty).toBe(false);
+        expectConsistent();
+      }
+    });
+  });
+
+  describe("BUG-007 — speaker notes are live document edits", () => {
+    const slideDoc = () => {
+      reset([chunk("h1", "heading", "一枚目"), chunk("a", "text", "本文"), chunk("h2", "heading", "二枚目")]);
+      st().setMode("slide");
+    };
+    const notesOf = (id: string) => st().doc.chunks.find((c) => c.id === id)!.metadata.notes;
+    afterEach(() => vi.useRealTimers());
+
+    it("the first keystroke marks the tab dirty and is undoable at once", () => {
+      slideDoc();
+      const depth = st().past.length;
+      st().updateChunkNotes("h1", "発");
+      expect(notesOf("h1")).toBe("発");
+      expect(st().dirty).toBe(true);
+      expect(st().past.length).toBe(depth + 1);
+      expectConsistent();
+    });
+
+    it("continuous typing is ONE undo step; undo restores the saved note and is clean; redo is dirty", () => {
+      slideDoc();
+      const depth = st().past.length;
+      for (const v of ["発", "発表", "発表者", "発表者ノート"]) st().updateChunkNotes("h1", v);
+      expect(st().past.length).toBe(depth + 1);
+      st().undo();
+      expect(notesOf("h1")).toBeUndefined();
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+      st().redo();
+      expect(notesOf("h1")).toBe("発表者ノート");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    it("typing back to the saved note (no undo) is clean", () => {
+      reset([chunk("h1", "heading", "一枚目")]);
+      st().setChunkNotes("h1", "保存済み");
+      st().markClean("/d.aix");
+      st().updateChunkNotes("h1", "保存済みX");
+      expect(st().dirty).toBe(true);
+      st().updateChunkNotes("h1", "保存済み");
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it("a different slide's notes, an explicit boundary, or the slide title start a new step", () => {
+      slideDoc();
+      const depth = st().past.length;
+      st().updateChunkNotes("h1", "a");
+      st().updateChunkNotes("h2", "b"); // different chunk
+      expect(st().past.length).toBe(depth + 2);
+      st().updateChunkNotes("h2", "bc", { newUndoStep: true }); // paste / selection replace
+      expect(st().past.length).toBe(depth + 3);
+      st().updateChunkContent("h2", "二枚目!"); // the same chunk's TITLE is its own step
+      expect(st().past.length).toBe(depth + 4);
+      st().updateChunkNotes("h2", "bcd"); // …and back to its notes, another
+      expect(st().past.length).toBe(depth + 5);
+    });
+
+    it("an idle gap > UNDO_IDLE_MS splits, except inside an IME composition", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(10_000);
+      slideDoc();
+      const depth = st().past.length;
+      st().updateChunkNotes("h1", "は");
+      vi.setSystemTime(10_000 + UNDO_IDLE_MS + 1);
+      st().updateChunkNotes("h1", "はっ", { composing: true }); // choosing a candidate
+      expect(st().past.length).toBe(depth + 1);
+      vi.setSystemTime(10_000 + 2 * (UNDO_IDLE_MS + 1));
+      st().updateChunkNotes("h1", "発表"); // a real pause, not composing
+      expect(st().past.length).toBe(depth + 2);
+    });
+
+    it("a whitespace-only keystroke on an empty note records nothing (no step, stays clean)", () => {
+      slideDoc();
+      const before = st().doc;
+      const depth = st().past.length;
+      st().updateChunkNotes("h1", " ");
+      expect(st().doc).toBe(before);
+      expect(st().past.length).toBe(depth);
+      expect(st().dirty).toBe(false);
+      // …and the next character keeps the typed leading space.
+      st().updateChunkNotes("h1", " a");
+      expect(notesOf("h1")).toBe(" a");
+    });
+
+    it("an unknown chunk is a no-op", () => {
+      slideDoc();
+      const before = st().doc;
+      st().updateChunkNotes("nope", "x");
+      expect(st().doc).toBe(before);
+    });
+
+    it("setChunkNotes (one discrete step) also recomputes dirty: setting the note back is clean", () => {
+      slideDoc();
+      st().setChunkNotes("h1", "x");
+      expect(st().dirty).toBe(true);
+      st().setChunkNotes("h1", "");
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+  });
+
+  it("contract over a mixed session: after every action dirty === the summary reports a change", () => {
+    reset([chunk("h", "heading", "見出し"), chunk("a", "text", "本文"), chunk("b", "text", "二段落目")]);
+    const steps: (() => void)[] = [
+      () => st().setTitle("新しい題名"),
+      () => st().setTitle("T"),
+      () => st().updateChunkContent("a", "本文。"),
+      () => st().updateChunkContent("a", "本文"),
+      () => st().setMode("slide"),
+      () => st().updateChunkNotes("h", "ノート"),
+      () => st().undo(),
+      () => st().redo(),
+      () => st().setChunkLayout("h", "section"),
+      () => st().setChunkLayout("h", null),
+      () => st().moveChunk("b", -1),
+      () => st().moveChunk("b", 1),
+      () => st().setMode("markdown"),
+      () => st().setMarkdownSource(`${documentToMarkdown(st().doc)}\n`),
+      () => st().undo(),
+      () => st().undo(),
+      () => st().undo(),
+      () => st().setMode("editor"),
+      () => st().addComment("a", "要確認"),
+      () => st().undo(),
+      () => st().redo(),
+      () => st().markClean("/d.aix"),
+      () => st().undo(),
+      () => st().redo(),
+    ];
+    for (const step of steps) {
+      step();
+      expectConsistent();
+    }
   });
 });
