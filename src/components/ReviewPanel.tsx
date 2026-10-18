@@ -11,6 +11,7 @@ import { checkIntegrity, reviewDocument } from "../aiActions";
 import { useT } from "../i18n";
 import { useStore } from "../store";
 import type { Chunk, ReviewComment } from "../types";
+import { usePanelEscape } from "../usePanelEscape";
 import { CloseIcon, CommentIcon, PlusIcon, TrashIcon } from "./icons";
 import Tooltip from "./Tooltip";
 
@@ -155,6 +156,8 @@ export default function ReviewPanel() {
   const reviewTargetChunkId = useStore((s) => s.reviewTargetChunkId);
   const setReviewTarget = useStore((s) => s.setReviewTarget);
   const addComment = useStore((s) => s.addComment);
+  // One close path for the ✕ button and Esc (BUG-006, QA 20261003).
+  const closePanel = usePanelEscape("review", () => toggleReviewPanel(false));
 
   const [composerText, setComposerText] = useState("");
   const [showResolved, setShowResolved] = useState(false);
@@ -187,7 +190,10 @@ export default function ReviewPanel() {
   };
 
   return (
-    <aside className="flex h-full w-80 shrink-0 flex-col border-l border-gray-200 bg-white">
+    <aside
+      data-docked-panel="review"
+      className="flex h-full w-80 shrink-0 flex-col border-l border-gray-200 bg-white"
+    >
       <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <CommentIcon />{t("Review")}</div>
@@ -211,9 +217,10 @@ export default function ReviewPanel() {
             {t("Map logic")}
           </button>
           <button
-            onClick={() => toggleReviewPanel(false)}
+            onClick={closePanel}
             className="rounded p-1 text-ink-faint hover:bg-gray-100 hover:text-ink"
             aria-label={t("Close panel")}
+            title={t("Close panel (Esc)")}
           >
             <CloseIcon />
           </button>

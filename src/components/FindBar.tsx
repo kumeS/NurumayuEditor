@@ -8,31 +8,39 @@
 // - Editor mode: chunk text (text + heading chunks). The current match is
 //   handed to ChunkView through `find.hit` (highlighted + selected + scrolled);
 //   Replace / Replace All go through store actions (one undo step each).
-// - Markdown mode: the CodeMirror source (markdownSourceBridge). Opening the
-//   bar from the Preview switches to Split so matches are visible; replaces
-//   are ONE isolated CodeMirror transaction that the update listener commits
-//   as its own store undo step. Go to Line works here only.
+// - Markdown mode: matches are located in the store's source (LF-normalized,
+//   so offsets are CodeMirror positions); the CodeMirror view
+//   (markdownSourceBridge) only selects and replaces (BUG-002, QA 20261003).
+//   Opening the bar from the Preview switches to Split so matches are
+//   visible; replaces are ONE isolated CodeMirror transaction that the update
+//   listener commits as its own store undo step. Go to Line works here only,
+//   and only for a line in 1..N (`parseLineNumber`, BUG-004, QA 20261003).
+// - "Replaced N." is shown only while the searched text is the one Replace
+//   All left; any later undo / redo / edit shows the live matches again.
 // - Slides mode: planned — the bar says so instead of searching.
 // Focus stays in the bar while stepping (Enter / ⇧Enter, ⌘G / ⇧⌘G); Esc
 // (IME-safe) closes it and returns focus to the editor on the current match.
 
-import { type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type MouseEvent, type ReactNode, type Ref, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   applyChanges,
   type ChunkMatch,
   chunkDocOffset,
+  chunkSearchText,
   findAvailability,
   findInChunks,
   findMatches,
   findSeed,
+  freshReplaceReport,
   lineCount,
-  lineInputDigits,
   lineStartOffset,
   nextMatch,
+  parseLineNumber,
+  type ReplaceReport,
   replacementChanges,
   type TextMatch,
 } from "../findReplace";
-import { translateWith, useLang, useT } from "../i18n";
+import { translateWith, type UiLang, useLang, useT } from "../i18n";
 import { documentToMarkdown, eolOf, normalizeEol, restoreEol } from "../markdown";
 import { isImeKeyEvent } from "../modalBehavior";
 import { type FindMode, useStore } from "../store";
@@ -46,24 +54,32 @@ type Dir = "next" | "prev";
 type Located =
   | { kind: "unavailable" }
   | { kind: "markdown"; text: string; matches: TextMatch[] }
-  | { kind: "chunks"; hits: ChunkMatch[]; matches: TextMatch[] };
+  | { kind: "chunks"; text: string; hits: ChunkMatch[]; matches: TextMatch[] };
 
-/** The searchable text of the current view and its matches. While the
- *  CodeMirror source is mounted its own text is searched, so offsets are
- *  CodeMirror positions (it normalises CRLF). */
-function locate(s: State): Located {
+/** The text a location searched ("" when find is unavailable). */
+const searchedText = (loc: Located): string => (loc.kind === "unavailable" ? "" : loc.text);
+
+/** The searchable text of the current view and its matches. Markdown mode
+ *  searches the STORE's source, LF-normalized, so offsets are the CodeMirror
+ *  positions `select` uses. Never the mounted view's own text: after a store
+ *  undo / redo MarkdownEditor syncs the view in an effect, a render after
+ *  this bar has re-located, and nothing re-renders the bar once it has — so
+ *  reading the view found the pre-undo text (BUG-002, QA 20261003). */
+export function locate(s: State): Located {
   const mode = s.doc.mode ?? "editor";
   if (findAvailability(mode) !== "available") return { kind: "unavailable" };
   const opts = { caseSensitive: s.find.caseSensitive, wholeWord: s.find.wholeWord };
   if (mode === "markdown") {
-    const view = markdownSourceBridge.view();
-    // No view mounted (Preview): search the LF-normalized source, so offsets
-    // are the CodeMirror positions `select` uses once Split mounts it.
-    const text = view ? view.state.doc.toString() : normalizeEol(documentToMarkdown(s.doc));
+    const text = normalizeEol(documentToMarkdown(s.doc));
     return { kind: "markdown", text, matches: findMatches(text, s.find.query, opts) };
   }
   const hits = findInChunks(s.doc.chunks, s.find.query, opts);
-  return { kind: "chunks", hits, matches: hits.map((h) => ({ from: h.docFrom, to: h.docTo })) };
+  return {
+    kind: "chunks",
+    text: chunkSearchText(s.doc.chunks),
+    hits,
+    matches: hits.map((h) => ({ from: h.docFrom, to: h.docTo })),
+  };
 }
 
 /** Run `fn` once the source view exists (Preview → Split mounts it a render later). */
@@ -213,12 +229,13 @@ function replaceCurrent() {
   goTo(next, nextMatch(next.matches, cur.from + replacement.length, "next"));
 }
 
-/** Replace every match as one undo step; returns the count. */
-function replaceEverything(): number {
+/** Replace every match as one undo step; returns the count and the searched
+ *  text it leaves (the report is shown only while that text is current). */
+function replaceEverything(): ReplaceReport {
   const s = useStore.getState();
   const loc = locate(s);
   const { query, replacement, caseSensitive, wholeWord } = s.find;
-  if (loc.kind === "unavailable" || !query) return 0;
+  if (loc.kind === "unavailable" || !query) return { count: 0, text: searchedText(loc) };
   const opts = { caseSensitive, wholeWord };
   let count: number;
   if (loc.kind === "chunks") {
@@ -231,7 +248,9 @@ function replaceEverything(): number {
     }
   }
   s.setFind({ current: -1, hit: null, replacePending: count > 0 });
-  return count;
+  // Both paths update the store synchronously (CodeMirror's update listener
+  // commits the replace), so this is the text the next render searches.
+  return { count, text: searchedText(locate(useStore.getState())) };
 }
 
 /** Close the bar and give focus back to the editor, on the current match. */
@@ -248,6 +267,7 @@ function closeAndReturnFocus() {
   }
 }
 
+/** Jump to a line that `parseLineNumber` accepted (1..N). */
 function goToLine(line: number) {
   const s = useStore.getState();
   if ((s.doc.mode ?? "editor") !== "markdown") return;
@@ -276,6 +296,76 @@ const iconBtn =
 const field =
   "h-7 min-w-0 rounded border border-chrome-edge bg-white px-2 text-xs text-ink outline-none focus:border-accent";
 
+/**
+ * The Go to Line row (BUG-004, QA 20261003). The field keeps exactly what was
+ * typed — nothing is stripped or rewritten, so an IME composition is never
+ * disturbed — and `parseLineNumber` decides: Go (button or Enter) acts only
+ * on a line in 1..total, never a clamped one. Anything else disables Go and
+ * says why next to the field, which is aria-invalid and described by that
+ * message; an empty field only disables Go. `t` / `lang` are props so the
+ * row renders without the store (findBarRender.test.ts).
+ */
+export function GoToLineField({
+  value,
+  total,
+  onValue,
+  onClose,
+  inputRef,
+  closeButton,
+  t,
+  lang,
+}: {
+  value: string;
+  total: number;
+  onValue: (value: string) => void;
+  onClose: () => void;
+  inputRef?: Ref<HTMLInputElement>;
+  closeButton?: ReactNode;
+  t: (key: string) => string;
+  lang: UiLang;
+}) {
+  const descriptionId = useId();
+  const check = parseLineNumber(value, total);
+  const invalid = !check.ok && check.reason !== "empty";
+  const go = () => {
+    if (check.ok) goToLine(check.line);
+  };
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        ref={inputRef}
+        inputMode="numeric"
+        value={value}
+        onChange={(e) => onValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (isImeKeyEvent(e.nativeEvent)) return;
+          if (e.key === "Enter") {
+            e.preventDefault();
+            go();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            onClose();
+          }
+        }}
+        aria-label={t("Line number")}
+        aria-invalid={invalid}
+        aria-describedby={descriptionId}
+        placeholder={t("Line number")}
+        className={`${field} w-28`}
+      />
+      <button onMouseDown={keepFieldFocus} type="button" className={btn} disabled={!check.ok} onClick={go}>
+        {t("Go")}
+      </button>
+      <span id={descriptionId} aria-live="polite" className={invalid ? "text-danger" : "text-ink-faint"}>
+        {invalid
+          ? translateWith("Enter a whole number from 1 to {total}.", lang, { total })
+          : translateWith("Lines 1–{total}", lang, { total })}
+      </span>
+      {closeButton}
+    </div>
+  );
+}
+
 export default function FindBar() {
   const t = useT();
   const lang = useLang();
@@ -287,7 +377,7 @@ export default function FindBar() {
   const source = useStore((s) => (s.doc.mode === "markdown" ? documentToMarkdown(s.doc) : ""));
   const queryRef = useRef<HTMLInputElement>(null);
   const lineRef = useRef<HTMLInputElement>(null);
-  const [replaced, setReplaced] = useState<number | null>(null);
+  const [replaced, setReplaced] = useState<ReplaceReport | null>(null);
   const [line, setLine] = useState("");
 
   const available = findAvailability(docMode) === "available";
@@ -297,6 +387,9 @@ export default function FindBar() {
     [find.open, find.query, find.caseSensitive, find.wholeWord, chunks, source, docMode]
   );
   const total = loc.kind === "unavailable" ? 0 : loc.matches.length;
+  // "Replaced N." describes only the text Replace All left: an undo, redo or
+  // edit after it shows the live matches again (BUG-002, QA 20261003).
+  const report = freshReplaceReport(replaced, searchedText(loc));
 
   // Focus the field on every open (⌘F again re-focuses an open bar). A frame
   // later, so a closing palette's focus restore cannot steal it back.
@@ -320,14 +413,22 @@ export default function FindBar() {
       const i = hit ? loc.hits.findIndex((h) => h.chunkId === hit.chunkId && h.from === hit.from && h.to === hit.to) : -1;
       if (i !== s.find.current || (i < 0 && hit)) setFind({ current: i, hit: i < 0 ? null : hit });
     } else {
-      // Markdown: the current match is the source selection, if it is one.
-      const sel = markdownSourceBridge.view()?.state.selection.main;
+      // Markdown: the current match is the source selection, if it is one —
+      // once the view shows the searched text (after a store undo it syncs
+      // an effect later, its selection still on the old text; BUG-002).
+      const view = markdownSourceBridge.view();
+      const sel = view && view.state.doc.toString() === loc.text ? view.state.selection.main : null;
       const i = sel ? loc.matches.findIndex((m) => m.from === sel.from && m.to === sel.to) : -1;
       if (i !== s.find.current) setFind({ current: i });
     }
   }, [loc, find.open, setFind]);
 
   useEffect(() => setReplaced(null), [find.query, find.replacement, find.open]);
+  // One-shot: a stale report is dropped, so a redo back to the replaced text
+  // shows its matches (none), not a revived "Replaced N.".
+  useEffect(() => {
+    if (replaced !== null && report === null) setReplaced(null);
+  }, [replaced, report]);
 
   if (!find.open) return null;
 
@@ -339,9 +440,9 @@ export default function FindBar() {
       : null;
 
   const status =
-    replaced !== null
-      ? replaced > 0
-        ? translateWith("Replaced {n}.", lang, { n: replaced })
+    report !== null
+      ? report.count > 0
+        ? translateWith("Replaced {n}.", lang, { n: report.count })
         : t("No matches")
       : !find.query
         ? ""
@@ -380,42 +481,16 @@ export default function FindBar() {
           {closeButton}
         </div>
       ) : find.mode === "line" ? (
-        <div className="flex items-center gap-2">
-          <input
-            ref={lineRef}
-            inputMode="numeric"
-            value={line}
-            // Full-width digits (IME) are folded after the composition ends —
-            // rewriting the value mid-composition would break the IME.
-            onChange={(e) => {
-              const v = e.target.value;
-              setLine((e.nativeEvent as InputEvent).isComposing ? v : lineInputDigits(v));
-            }}
-            onCompositionEnd={(e) => setLine(lineInputDigits(e.currentTarget.value))}
-            onKeyDown={(e) => {
-              if (isImeKeyEvent(e.nativeEvent)) return;
-              if (e.key === "Enter") {
-                e.preventDefault();
-                if (line) goToLine(Number(line));
-              } else if (e.key === "Escape") {
-                e.preventDefault();
-                close();
-              }
-            }}
-            aria-label={t("Line number")}
-            placeholder={t("Line number")}
-            className={`${field} w-28`}
-          />
-          <button onMouseDown={keepFieldFocus} type="button" className={btn} disabled={!line} onClick={() => goToLine(Number(line))}>
-            {t("Go")}
-          </button>
-          <span className="text-ink-faint">
-            {translateWith("Lines 1–{total}", lang, {
-              total: lineCount(loc.kind === "markdown" ? loc.text : source),
-            })}
-          </span>
-          {closeButton}
-        </div>
+        <GoToLineField
+          value={line}
+          onValue={setLine}
+          total={lineCount(searchedText(loc))}
+          onClose={close}
+          inputRef={lineRef}
+          closeButton={closeButton}
+          t={t}
+          lang={lang}
+        />
       ) : (
         <>
           <div className="flex items-center gap-1.5">

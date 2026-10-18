@@ -58,7 +58,7 @@ describe("FindBar uses the pure core and the store actions", () => {
     );
   });
 
-  it("prefills from the selection with findSeed and Go to Line clamps with lineStartOffset", () => {
+  it("prefills from the selection with findSeed and Go to Line jumps with lineStartOffset (its clamp is only a safety net, BUG-004)", () => {
     expect(fnBody(bar(), "selectionSeed")).toContain("findSeed(");
     expect(fnBody(bar(), "goToLine")).toContain("lineStartOffset(");
   });
@@ -224,13 +224,81 @@ describe("ux-a11y-i18n-1 — Replace marks a pending replace for ⌘Z routing", 
   });
 });
 
-describe("ux-a11y-i18n-7 — the Go to Line field normalizes after composition, not during it", () => {
-  it("onChange keeps the raw text while composing and normalizes otherwise; compositionend normalizes", () => {
+describe("ux-a11y-i18n-7 / BUG-004 (QA 20261003) — the Go to Line field is validated, never rewritten or clamped", () => {
+  const row = () => {
     const s = src("FindBar");
-    const at = s.indexOf("ref={lineRef}");
+    const at = s.indexOf("export function GoToLineField(");
+    expect(at).toBeGreaterThan(-1);
+    return s.slice(at, s.indexOf("\nexport default function FindBar(", at));
+  };
+  const inputTag = () => {
+    const r = row();
+    const at = r.indexOf("<input");
+    return r.slice(at, r.indexOf("/>", at));
+  };
+
+  // Fails if the field goes back to filtering keystrokes (the old
+  // lineInputDigits turned "-1" into 1 and "1.5" into 15 before any check)
+  // or rewrites the value around an IME composition.
+  it("the field keeps the raw text; parseLineNumber validates it against the line count", () => {
+    expect(inputTag()).toMatch(/onChange=\{\(e\) => onValue\(e\.target\.value\)\}/);
+    expect(inputTag()).not.toContain("onCompositionEnd");
+    expect(row()).toMatch(/const check = parseLineNumber\(value, total\);/);
+  });
+
+  // Fails if Enter or the Go button can reach goToLine with a rejected value,
+  // or if Enter commits an IME composition as a jump.
+  it("Enter and Go both act only on an accepted line; Enter is IME-guarded", () => {
+    expect(row()).toMatch(/const go = \(\) => \{\s*if \(check\.ok\) goToLine\(check\.line\);\s*\};/);
+    const keys = inputTag().slice(inputTag().indexOf("onKeyDown="));
+    expect(keys).toMatch(/^onKeyDown=\{\(e\) => \{\s*if \(isImeKeyEvent\(e\.nativeEvent\)\) return;\s*if \(e\.key === "Enter"\) \{\s*e\.preventDefault\(\);\s*go\(\);/);
+    expect(row()).not.toMatch(/goToLine\(Number\(/);
+    const goButton = row().slice(row().indexOf("<button"), row().indexOf("</button>"));
+    expect(goButton).toMatch(/disabled=\{!check\.ok\} onClick=\{go\}/);
+  });
+
+  it("the field is aria-invalid and described by the hint / error span (semantic tokens)", () => {
+    expect(inputTag()).toMatch(/aria-invalid=\{invalid\}/);
+    expect(inputTag()).toMatch(/aria-describedby=\{descriptionId\}/);
+    const r = row();
+    const span = r.slice(r.indexOf("<span id={descriptionId}"), r.indexOf("</span>", r.indexOf("<span id={descriptionId}")));
+    expect(span).toMatch(/className=\{invalid \? "text-danger" : "text-ink-faint"\}/);
+    expect(span).toContain('translateWith("Enter a whole number from 1 to {total}.", lang, { total })');
+  });
+
+  it("FindBar renders the row with the line count of the text it searches and focuses its field", () => {
+    const s = src("FindBar");
+    const at = s.indexOf("<GoToLineField");
+    expect(at).toBeGreaterThan(-1);
     const tag = s.slice(at, s.indexOf("/>", at));
-    expect(tag).toMatch(/\.isComposing \? v : lineInputDigits\(v\)/);
-    expect(tag).toMatch(/onCompositionEnd=\{\(e\) => setLine\(lineInputDigits\(e\.currentTarget\.value\)\)\}/);
-    expect(tag).not.toMatch(/replace\(\/\[\^0-9\]\/g/);
+    expect(tag).toMatch(/total=\{lineCount\(searchedText\(loc\)\)\}/);
+    expect(tag).toMatch(/inputRef=\{lineRef\}/);
+    expect(tag).toMatch(/value=\{line\}\s+onValue=\{setLine\}/);
+  });
+});
+
+describe("BUG-002 (QA 20261003) — the Replace All report is checked for freshness where it is shown", () => {
+  const bar = () => src("FindBar");
+
+  // Fails if the status goes back to a bare count that only a query /
+  // replacement edit clears (the "3 件を置換しました" that outlived ⌘Z).
+  it("the status reads the report through freshReplaceReport with the text being searched now", () => {
+    const b = bar();
+    expect(b).toMatch(/const report = freshReplaceReport\(replaced, searchedText\(loc\)\);/);
+    const status = b.slice(b.indexOf("const status ="), b.indexOf("const closeButton"));
+    expect(status).toMatch(/^const status =\s*report !== null\s*\? report\.count > 0/);
+    expect(status).not.toMatch(/\breplaced\b/);
+  });
+
+  it("a stale report is dropped (one-shot), so redo does not revive it", () => {
+    expect(bar()).toMatch(
+      /useEffect\(\(\) => \{\s*if \(replaced !== null && report === null\) setReplaced\(null\);\s*\}, \[replaced, report\]\);/
+    );
+  });
+
+  it("replaceEverything reports the text the replace left (re-located from the store)", () => {
+    const body = fnBody(bar(), "replaceEverything");
+    expect(body).toMatch(/return \{ count, text: searchedText\(locate\(useStore\.getState\(\)\)\) \};/);
+    expect(bar()).toMatch(/onClick=\{\(\) => setReplaced\(replaceEverything\(\)\)\}/);
   });
 });

@@ -144,3 +144,122 @@ describe("promise-sync-5 — Help step 3 / step 6 match where diagrams live and 
     expect(step("English", 6)).toMatch(/images become text placeholders and diagrams print as their Mermaid source/);
   });
 });
+
+// ----- BUG-008 (QA 20261003): Help §6 lists every export format the menus offer
+// Help §6 ("Save & export") listed .txt / .md / .rtf / .pdf while both export
+// menus also offered .pptx. The format list is derived from the code that
+// BUILDS the menus — the native File → Export submenu (menu.rs `export_<ext>`
+// item ids) and the toolbar's Import / Export dropdown (Toolbar.tsx) — so a
+// format added to a menu without a Help mention fails here, in every language.
+
+const menuSources = import.meta.glob(["../src-tauri/src/menu.rs", "./components/Toolbar.tsx"], {
+  eager: true,
+  query: "?raw",
+  import: "default",
+}) as Record<string, string>;
+
+/** Export formats the native menu builds: `export_<ext>` item ids in
+ *  production code only (menu.rs's #[cfg(test)] module excluded). */
+const nativeMenuExportExts = (): string[] => {
+  const prod = menuSources["../src-tauri/src/menu.rs"].split("#[cfg(test)]")[0];
+  return [...prod.matchAll(/with_id\("export_([a-z0-9]+)"/g)].map((m) => m[1]);
+};
+
+/** Export formats the toolbar's Import / Export dropdown renders — scoped to
+ *  the dropdown body after its "Export as" header: the `.{fmt}` loop's array
+ *  literal plus the literal `.ext` buttons (.pptx, .pdf). */
+const toolbarExportExts = (): string[] => {
+  const src = menuSources["./components/Toolbar.tsx"];
+  const start = src.indexOf('t("Export as")');
+  if (start < 0) return [];
+  const end = src.slice(start).search(/<\/div>\s*\)\}/);
+  const dropdown = src.slice(start, end < 0 ? undefined : start + end);
+  const loop = dropdown.match(/\(\[([^\]]*)\]\s*as ExportFormat\[\]\)/)?.[1] ?? "";
+  const looped = [...loop.matchAll(/"([a-z0-9]+)"/g)].map((m) => m[1]);
+  const literal = [...dropdown.matchAll(/\/>\s*\.([a-z0-9]+)\s*</g)].map((m) => m[1]);
+  return [...looped, ...literal];
+};
+
+/** `.ext` file-extension tokens in `text`: a dot not glued to a preceding
+ *  word/dot (so "openrouter.ai" is not one), not followed by more letters (so
+ *  ".ppt" never passes on ".pptx"). Works beside CJK text and punctuation. */
+const extTokens = (text: string): string[] =>
+  [...text.matchAll(/(?<![A-Za-z0-9_.])\.([a-z0-9]{2,5})(?![A-Za-z0-9])/g)].map((m) => m[1]);
+
+/** The native .aix format is SAVED, not exported — the one other extension §6 may name. */
+const NATIVE_SAVE_EXT = "aix";
+
+const sorted = (xs: string[]) => [...new Set(xs)].sort();
+
+/** The enumerated format list in a §6 body (".txt / .md / … / .pdf"): the
+ *  first run of two or more `.ext` tokens joined by "/" — the list QA compared
+ *  against the menu. A mention elsewhere in §6 (e.g. "PowerPoint (.pptx)
+ *  export …") must not stand in for the list. */
+const formatList = (body: string): string[] =>
+  extTokens(body.match(/\.[a-z0-9]+(?:\s*\/\s*\.[a-z0-9]+)+/)?.[0] ?? "");
+
+/** Help §6 body for one language — the section under test, never the whole bundle. */
+const saveExportSection = (lang: keyof typeof HELP_I18N): string =>
+  HELP_I18N[lang].steps.find((s) => s.title.startsWith("6. "))?.body ?? "";
+
+describe("BUG-008 — Help §6 names every export format the menus offer", () => {
+  const langs = Object.keys(HELP_I18N) as (keyof typeof HELP_I18N)[];
+  const menuExts = () => sorted([...nativeMenuExportExts(), ...toolbarExportExts()]);
+
+  it("the scans actually find the export formats (a broken scan must not pass vacuously)", () => {
+    expect(nativeMenuExportExts().length).toBeGreaterThanOrEqual(5);
+    expect(toolbarExportExts().length).toBeGreaterThanOrEqual(5);
+    expect(nativeMenuExportExts()).toContain("pptx");
+    expect(toolbarExportExts()).toContain("pptx");
+    // The token extractor itself, on Latin and CJK neighbours.
+    expect(extTokens("「読み込み / 書き出し」から .txt と（.pptx）、.pdfに。openrouter.ai")).toEqual([
+      "txt",
+      "pptx",
+      "pdf",
+    ]);
+    expect(extTokens("export to .ppt or .pptx.")).toEqual(["ppt", "pptx"]);
+    expect(formatList("Save .aix, or export to .txt / .md / .pdf. PowerPoint (.pptx) export …")).toEqual([
+      "txt",
+      "md",
+      "pdf",
+    ]);
+    expect(formatList("「読み込み / 書き出し」メニューから .txt / .pptx に書き出せます")).toEqual(["txt", "pptx"]);
+  });
+
+  it("the toolbar dropdown and the native Export submenu offer the same formats", () => {
+    expect(sorted(toolbarExportExts())).toEqual(sorted(nativeMenuExportExts()));
+  });
+
+  it.each(langs)("%s: §6's format list is exactly the menus' export formats (incl. .pptx)", (lang) => {
+    const body = saveExportSection(lang);
+    expect(body, `${lang} has no step "6. …"`).not.toBe("");
+    const listed = formatList(body);
+    const missing = menuExts().filter((ext) => !listed.includes(ext));
+    expect(missing, `${lang} §6 list omits .${missing.join(", .")}`).toEqual([]);
+    expect(sorted(listed)).toEqual(menuExts());
+  });
+
+  it.each(langs)("%s: §6 names no export format the menus lack", (lang) => {
+    const allowed = [...menuExts(), NATIVE_SAVE_EXT];
+    const extra = extTokens(saveExportSection(lang)).filter((ext) => !allowed.includes(ext));
+    expect(extra).toEqual([]);
+  });
+});
+
+describe("BUG-008 — §6's PPTX sentence names the Slides view and speaker notes as the UI does", () => {
+  // Behaviour behind the sentence is guarded in Rust: deck.rs
+  // `headings_delimit_slides` (headings → slides) and pptx.rs
+  // `slide_with_notes_gets_a_notes_slide_part_containing_its_text` (notes page).
+  it("English", () => {
+    const body = saveExportSection("English");
+    expect(body).toMatch(/PowerPoint \(\.pptx\) export builds slides from the document’s headings, as in Slides mode/);
+    expect(body).toMatch(/speaker notes on its notes page/);
+  });
+
+  it("日本語 uses the Japanese chrome's own labels for the view and the notes", () => {
+    const body = saveExportSection("日本語");
+    expect(body).toContain(`「${JA["Slides"]}」表示`);
+    expect(body).toContain(JA["Speaker notes"]);
+    expect(body).not.toMatch(/Slides|Speaker notes/);
+  });
+});

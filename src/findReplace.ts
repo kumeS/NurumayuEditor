@@ -20,6 +20,10 @@
 //   the same text.
 // - Chunk search covers text and heading chunks only (image paths and diagram
 //   source are not prose). The document title is not searched.
+// - Go to Line accepts integers 1..N only (`parseLineNumber`): out-of-range
+//   and non-integer input is rejected, never clamped (BUG-004, QA 20261003).
+// - A Replace All report is shown only while the searched text is the one it
+//   was made for (`freshReplaceReport`, BUG-002, QA 20261003).
 // Known limits: no regex mode and no search inside the document title; Slides
 // mode find is planned (`findAvailability`).
 
@@ -186,6 +190,32 @@ export function chunkDocOffset(chunks: readonly Chunk[], chunkId: string, offset
   return 0;
 }
 
+/** The searchable chunks' text joined by one separator each: the text Editor
+ *  mode searches, in the same offsets as `ChunkMatch.docFrom` / `docTo`. */
+export function chunkSearchText(chunks: readonly Chunk[]): string {
+  return chunks
+    .filter(isSearchableChunk)
+    .map((c) => c.content)
+    .join("\n");
+}
+
+/** What the find bar says after Replace All, and the searched text it was
+ *  made for (BUG-002, QA 20261003). */
+export interface ReplaceReport {
+  count: number;
+  text: string;
+}
+
+/**
+ * The report while the searched text is still the one it was made for, else
+ * null: once an undo, redo or edit changes the text, "Replaced N." no longer
+ * describes it (freshness is checked where the report is used). The bar
+ * stores the null, so a redo back to the same text does not revive it.
+ */
+export function freshReplaceReport(report: ReplaceReport | null, text: string): ReplaceReport | null {
+  return report !== null && report.text === text ? report : null;
+}
+
 /** Number of lines (a trailing newline starts a new, empty line). */
 export function lineCount(source: string): number {
   let n = 1;
@@ -193,13 +223,30 @@ export function lineCount(source: string): number {
   return n;
 }
 
-/** Start offset of 1-based `line`, clamped to the document's lines. */
-/** The digits of a Go to Line field, with full-width digits (Japanese IME)
- *  folded to ASCII first (ux-a11y-i18n-7). Pure. */
-export function lineInputDigits(value: string): string {
-  return value.normalize("NFKC").replace(/[^0-9]/g, "");
+/** A Go to Line field value: a line in 1..total, or why it is not one. */
+export type LineInput = { ok: true; line: number } | { ok: false; reason: "empty" | "invalid" | "range" };
+
+/** Full-width digits ０–９ (what a Japanese IME types). */
+const FULL_WIDTH_DIGIT = /[０-９]/g;
+
+/**
+ * Parse a Go to Line field (BUG-004, QA 20261003): full-width digits are
+ * folded to ASCII (ux-a11y-i18n-7) and surrounding whitespace (U+3000
+ * included) is trimmed; what is left must be ASCII digits only and name a
+ * line in 1..total. Nothing is stripped or clamped: signs, decimals,
+ * exponents and other numerals (①, ¹, 十五) are "invalid", 0 and total+1
+ * are "range". Pure.
+ */
+export function parseLineNumber(value: string, total: number): LineInput {
+  const s = value.replace(FULL_WIDTH_DIGIT, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0)).trim();
+  if (s === "") return { ok: false, reason: "empty" };
+  if (!/^[0-9]+$/.test(s)) return { ok: false, reason: "invalid" };
+  const line = Number(s);
+  return line >= 1 && line <= total ? { ok: true, line } : { ok: false, reason: "range" };
 }
 
+/** Start offset of 1-based `line`, clamped to the document's lines (a
+ *  safety net only: the bar validates with `parseLineNumber` first). */
 export function lineStartOffset(source: string, line: number): number {
   const target = Number.isFinite(line) ? Math.min(Math.max(1, Math.floor(line)), lineCount(source)) : 1;
   let current = 1;

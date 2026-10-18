@@ -41,6 +41,7 @@ function ToolButton({
   children,
   disabled,
   expanded,
+  opener,
 }: {
   onClick: () => void;
   title: string;
@@ -48,10 +49,13 @@ function ToolButton({
   disabled?: boolean;
   /** For dropdown toggles: whether the menu is open (aria-expanded). */
   expanded?: boolean;
+  /** For docked-panel toggles: the panel's name, where Esc-close returns focus (BUG-006). */
+  opener?: string;
 }) {
   return (
     <button
       onClick={onClick}
+      data-panel-opener={opener}
       title={title}
       disabled={disabled}
       aria-expanded={expanded}
@@ -330,7 +334,7 @@ export default function Toolbar() {
         <DraftIcon /> {t("Draft by AI")}
       </ToolButton>
 
-      <ToolButton onClick={() => toggleReviewPanel()} title={t("Review comments")}>
+      <ToolButton onClick={() => toggleReviewPanel()} title={t("Review comments")} opener="review">
         <CommentIcon /> {reviewPanelOpen ? t("Hide review") : t("Review")}
       </ToolButton>
 
@@ -381,6 +385,7 @@ export default function Toolbar() {
             if (networkOpen) toggleNetwork(false);
             else void analyzeDocument();
           }}
+          data-panel-opener="network"
           title={
             !networkOpen && !analyzable
               ? t("Nothing to analyze yet — write some text first.")

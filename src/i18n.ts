@@ -70,6 +70,8 @@ export const JA: Record<string, string> = {
   "Line number": "行番号",
   Go: "移動",
   "Lines 1–{total}": "1–{total} 行",
+  // BUG-004 (QA 20261003): Go to Line rejects instead of clamping.
+  "Enter a whole number from 1 to {total}.": "1–{total} の整数を入力してください",
   "Find in Slides is planned — switch to Editor or Markdown to search.":
     "スライドでの検索は今後対応予定です。検索するにはエディタまたは Markdown に切り替えてください。",
   "Go to Line works in Markdown source — switch to Markdown to use it.":
@@ -235,6 +237,7 @@ export const JA: Record<string, string> = {
   "Close changes panel": "変更パネルを閉じる",
   "Close citations panel": "文献パネルを閉じる",
   "Close panel": "パネルを閉じる",
+  "Close panel (Esc)": "パネルを閉じる (Esc)",
   "Close personal library panel": "パーソナルライブラリパネルを閉じる",
   "Close review criteria panel": "審査基準パネルを閉じる",
   Collapse: "折りたたむ",

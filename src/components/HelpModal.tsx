@@ -87,6 +87,8 @@ const STEP_ICONS = [
 // the Japanese UI (guarded by src/helpContent.test.ts). 中文/Español/Français
 // readers see the English chrome, so those bundles keep the English labels.
 // OpenRouter's own site navigation (sign in → Keys → Create Key) stays English.
+// Step 6 names every format the export menus offer, .pptx included (BUG-008,
+// QA 20261003; derived from menu.rs/Toolbar.tsx in src/helpContent.test.ts).
 const ja = (key: string): string => JA[key] ?? key;
 
 export const HELP_I18N: Record<HelpLang, HelpContent> = {
@@ -126,7 +128,7 @@ export const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. Save & export",
-        body: "Save as a native .aix file (lossless), or export to .txt / .md / .rtf / .pdf. PDF export asks where to save and writes an A4 PDF; images become text placeholders and diagrams print as their Mermaid source (both listed in the export report on the status bar — embedding them is planned).",
+        body: "Save as a native .aix file (lossless), or export to .txt / .md / .rtf / .pptx / .pdf. PowerPoint (.pptx) export builds slides from the document’s headings, as in Slides mode, with each slide’s speaker notes on its notes page. PDF export asks where to save and writes an A4 PDF; images become text placeholders and diagrams print as their Mermaid source (both listed in the export report on the status bar — embedding them is planned).",
       },
     ],
     tip: "Tip: set your **Default language** and **Writing tone** in Settings — every AI action then keeps that language and voice.",
@@ -178,7 +180,7 @@ export const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. 保存と書き出し",
-        body: `ネイティブの .aix ファイル（無劣化）として保存するか、「${ja("Import / Export")}」メニューから .txt / .md / .rtf / .pdf に書き出せます。PDF は保存先を選ぶと A4 の PDF ファイルとして書き出されます。画像はテキストの代替表示に、図は Mermaid のソースとして出力されます（ステータスバーの書き出しレポートに一覧表示されます。埋め込みは今後対応予定です）。`,
+        body: `ネイティブの .aix ファイル（無劣化）として保存するか、「${ja("Import / Export")}」メニューから .txt / .md / .rtf / .pptx / .pdf に書き出せます。PowerPoint（.pptx）への書き出しでは、「${ja("Slides")}」表示と同じく文書の見出しごとにスライドを作成し、各スライドの${ja("Speaker notes")}はノートページに書き出されます。PDF は保存先を選ぶと A4 の PDF ファイルとして書き出されます。画像はテキストの代替表示に、図は Mermaid のソースとして出力されます（ステータスバーの書き出しレポートに一覧表示されます。埋め込みは今後対応予定です）。`,
       },
     ],
     tip: `ヒント：${ja("Settings")}で **${ja("Default language")}** と **${ja("Writing tone")}** を設定しておくと、以降のすべての AI 操作がその言語と文体を保ちます。`,
@@ -227,7 +229,7 @@ export const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. 保存与导出",
-        body: "保存为原生 .aix 文件（无损），或导出为 .txt / .md / .rtf / .pdf。导出 PDF 时选择保存位置即可生成 A4 PDF；图片会以文字占位符代替，图表以其 Mermaid 源代码输出（列在状态栏的导出报告中，嵌入功能计划中）。",
+        body: "保存为原生 .aix 文件（无损），或导出为 .txt / .md / .rtf / .pptx / .pdf。导出 PowerPoint（.pptx）时，会像 Slides 模式一样按文档标题生成幻灯片，并将每张幻灯片的演讲者备注写入其备注页。导出 PDF 时选择保存位置即可生成 A4 PDF；图片会以文字占位符代替，图表以其 Mermaid 源代码输出（列在状态栏的导出报告中，嵌入功能计划中）。",
       },
     ],
     tip: "提示：在 Settings 中设置你的 **Default language** 和 **Writing tone** — 此后每个 AI 操作都会沿用该语言与语气。",
@@ -270,7 +272,7 @@ export const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. Guarda y exporta",
-        body: "Guárdalo como archivo nativo .aix (sin pérdidas) o expórtalo a .txt / .md / .rtf / .pdf. Al exportar a PDF eliges dónde guardarlo y se genera un PDF A4; las imágenes se sustituyen por marcadores de texto y los diagramas se imprimen como su código fuente Mermaid (se listan en el informe de exportación de la barra de estado; su inclusión está prevista).",
+        body: "Guárdalo como archivo nativo .aix (sin pérdidas) o expórtalo a .txt / .md / .rtf / .pptx / .pdf. La exportación a PowerPoint (.pptx) crea las diapositivas a partir de los títulos del documento, como en el modo Slides, con las notas del orador de cada diapositiva en su página de notas. Al exportar a PDF eliges dónde guardarlo y se genera un PDF A4; las imágenes se sustituyen por marcadores de texto y los diagramas se imprimen como su código fuente Mermaid (se listan en el informe de exportación de la barra de estado; su inclusión está prevista).",
       },
     ],
     tip: "Consejo: configura tu **Default language** y tu **Writing tone** en Settings — así cada acción de IA mantendrá ese idioma y esa voz.",
@@ -313,7 +315,7 @@ export const HELP_I18N: Record<HelpLang, HelpContent> = {
       },
       {
         title: "6. Enregistrez et exportez",
-        body: "Enregistrez au format natif .aix (sans perte), ou exportez vers .txt / .md / .rtf / .pdf. L'export PDF vous demande où enregistrer et produit un PDF A4 ; les images sont remplacées par des repères textuels et les diagrammes sont imprimés sous forme de leur source Mermaid (listés dans le rapport d'export de la barre d'état ; leur intégration est prévue).",
+        body: "Enregistrez au format natif .aix (sans perte), ou exportez vers .txt / .md / .rtf / .pptx / .pdf. L'export PowerPoint (.pptx) crée les diapositives à partir des titres du document, comme en mode Slides, avec les notes de l'orateur de chaque diapositive dans sa page de notes. L'export PDF vous demande où enregistrer et produit un PDF A4 ; les images sont remplacées par des repères textuels et les diagrammes sont imprimés sous forme de leur source Mermaid (listés dans le rapport d'export de la barre d'état ; leur intégration est prévue).",
       },
     ],
     tip: "Astuce : définissez votre **Default language** et votre **Writing tone** dans Settings — chaque action d'IA conserve alors cette langue et ce ton.",

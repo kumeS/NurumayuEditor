@@ -11,7 +11,9 @@ import {
   replaceAll,
   replacementChanges,
   applyChanges,
-  lineInputDigits,
+  chunkSearchText,
+  freshReplaceReport,
+  parseLineNumber,
 } from "./findReplace";
 import type { Chunk, ChunkType } from "./types";
 
@@ -226,11 +228,98 @@ describe("findAvailability — Slides is planned, Editor and Markdown are live",
   });
 });
 
-describe("ux-a11y-i18n-7 — Go to Line accepts full-width digits", () => {
-  it("normalizes full-width digits (NFKC) and drops everything else", () => {
-    expect(lineInputDigits("１２")).toBe("12");
-    expect(lineInputDigits("12")).toBe("12");
-    expect(lineInputDigits("行３a4")).toBe("34");
-    expect(lineInputDigits("")).toBe("");
+describe("ux-a11y-i18n-7 / BUG-004 (QA 20261003) — parseLineNumber: integers 1..N only", () => {
+  // Fails if full-width digits stop being folded (the ux-a11y-i18n-7 IME
+  // case) or surrounding whitespace stops being trimmed.
+  it("accepts ASCII and full-width (IME) digits, with surrounding whitespace", () => {
+    expect(parseLineNumber("1", 14)).toEqual({ ok: true, line: 1 });
+    expect(parseLineNumber("14", 14)).toEqual({ ok: true, line: 14 });
+    expect(parseLineNumber("１２", 14)).toEqual({ ok: true, line: 12 });
+    expect(parseLineNumber("１4", 14)).toEqual({ ok: true, line: 14 });
+    expect(parseLineNumber(" 7 ", 14)).toEqual({ ok: true, line: 7 });
+    expect(parseLineNumber("\u3000７\u3000", 14)).toEqual({ ok: true, line: 7 }); // ideographic spaces
+    expect(parseLineNumber("\t9\n", 14)).toEqual({ ok: true, line: 9 });
+    expect(parseLineNumber("007", 14)).toEqual({ ok: true, line: 7 });
+  });
+
+  // Fails if the range check is dropped or becomes a clamp (the BUG-004
+  // report: 0 went to line 1 and N+1 to line N, silently).
+  it("rejects 0 and N+1 as out of range instead of clamping", () => {
+    expect(parseLineNumber("0", 14)).toEqual({ ok: false, reason: "range" });
+    expect(parseLineNumber("15", 14)).toEqual({ ok: false, reason: "range" });
+    expect(parseLineNumber("１５", 14)).toEqual({ ok: false, reason: "range" });
+    expect(parseLineNumber("000", 14)).toEqual({ ok: false, reason: "range" });
+    expect(parseLineNumber("99999999999999999999999", 14)).toEqual({ ok: false, reason: "range" });
+    expect(parseLineNumber("1", 1)).toEqual({ ok: true, line: 1 });
+    expect(parseLineNumber("2", 1)).toEqual({ ok: false, reason: "range" });
+  });
+
+  // Fails if any character is stripped or coerced instead of rejected (the
+  // old field filter turned "-1" into 1, "1.5" into 15 and "1e1" into 11),
+  // or if a looser fold (plain NFKC) lets ① / ¹ / ＋ through.
+  it("rejects signs, decimals, exponents, hex, other numerals and inner spaces", () => {
+    for (const bad of [
+      "-1",
+      "+5",
+      "－１",
+      "＋５",
+      "1.5",
+      "１．５",
+      "1,000",
+      "1e1",
+      "0x1",
+      "Infinity",
+      "NaN",
+      "1 2",
+      "①",
+      "¹",
+      "٣",
+      "十五",
+      "行３",
+      "3行",
+      "abc",
+    ]) {
+      expect(parseLineNumber(bad, 1000), bad).toEqual({ ok: false, reason: "invalid" });
+    }
+  });
+
+  it("empty or blank input is 'empty' (no line to go to, nothing typed wrong yet)", () => {
+    expect(parseLineNumber("", 14)).toEqual({ ok: false, reason: "empty" });
+    expect(parseLineNumber("   ", 14)).toEqual({ ok: false, reason: "empty" });
+    expect(parseLineNumber("\u3000", 14)).toEqual({ ok: false, reason: "empty" });
+  });
+});
+
+describe("BUG-002 (QA 20261003) — a Replace All report is shown only for the text it was made for", () => {
+  // Fails if the report ignores the text it belongs to: after ⌘Z the bar
+  // kept saying "3 件を置換しました" over a document with 3 matches again.
+  it("replace → undo makes the report stale; redo does not revive a cleared report", () => {
+    const after = "犬 犬\n犬";
+    const report = { count: 3, text: after };
+    expect(freshReplaceReport(report, after)).toBe(report); // right after Replace All
+    expect(freshReplaceReport(report, "猫 猫\n猫")).toBeNull(); // after undo
+    expect(freshReplaceReport(report, "犬 犬\n犬!")).toBeNull(); // after typing
+    // The bar stores the null (one-shot), so a later redo back to `after` shows matches, not "Replaced".
+    expect(freshReplaceReport(null, after)).toBeNull();
+  });
+});
+
+describe("chunkSearchText — the Editor-mode searched text, in findInChunks' document offsets", () => {
+  // Contract with findInChunks (docFrom/docTo): fails if the separator or the
+  // searchable-chunk filter of either drifts.
+  it("slicing it at each hit's doc offsets gives the matched text", () => {
+    const chunks = [
+      chunk("h", "heading", "猫の話"),
+      chunk("img", "image", "猫.png"),
+      chunk("t", "text", "猫と猫\ncat"),
+      chunk("d", "diagram", "猫-->犬"),
+      chunk("u", "text", "😀猫"),
+    ];
+    const text = chunkSearchText(chunks);
+    expect(text).toBe("猫の話\n猫と猫\ncat\n😀猫");
+    const hits = findInChunks(chunks, "猫", opts);
+    expect(hits).toHaveLength(4);
+    for (const h of hits) expect(text.slice(h.docFrom, h.docTo)).toBe("猫");
+    expect(chunkSearchText([])).toBe("");
   });
 });

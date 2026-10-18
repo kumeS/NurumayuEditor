@@ -8,6 +8,7 @@ import { translateWith, useLang, useT } from "../i18n";
 import { AI_OP_LOG_MAX, pruneAnalysis, useStore, type AiOpPhase } from "../store";
 import { aiOpLogToJsonLines, analyzeDocument, hasAnalyzableContent } from "../aiActions";
 import { RELATION_COLORS, analyzedLabel, relationLabel } from "../networkLabels";
+import { usePanelEscape } from "../usePanelEscape";
 import { CloseIcon, NetworkIcon, SpinnerIcon } from "./icons";
 
 /**
@@ -134,6 +135,8 @@ export default function NetworkPanel() {
   const focusedChunkId = useStore((s) => s.focusedChunkId);
   const toggleNetwork = useStore((s) => s.toggleNetwork);
   const chunks = useStore((s) => s.doc.chunks);
+  // One close path for the ✕ button and Esc (BUG-006, QA 20261003).
+  const closePanel = usePanelEscape("network", () => toggleNetwork(false));
 
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<cytoscape.Core | null>(null);
@@ -376,7 +379,10 @@ export default function NetworkPanel() {
   const isEmpty = !pruned || pruned.nodes.length === 0;
 
   return (
-    <aside className="flex h-full w-80 shrink-0 flex-col border-l border-chrome-line bg-white">
+    <aside
+      data-docked-panel="network"
+      className="flex h-full w-80 shrink-0 flex-col border-l border-chrome-line bg-white"
+    >
       <div className="flex items-center justify-between border-b border-chrome-line px-3 py-2">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <NetworkIcon /> {t("Relationships")}
@@ -423,10 +429,10 @@ export default function NetworkPanel() {
             {t("Re-layout")}
           </button>
           <button
-            onClick={() => toggleNetwork(false)}
+            onClick={closePanel}
             className="rounded p-1 text-ink-faint hover:bg-chrome-hairline hover:text-ink"
             aria-label={t("Close panel")}
-            title={t("Close panel")}
+            title={t("Close panel (Esc)")}
           >
             <CloseIcon />
           </button>
