@@ -4,6 +4,82 @@
 
 _Nothing yet._
 
+## v1.5.0 — 2026-10-18
+
+Fixes for QA run `20261003-computer-use-v1` (BUG-001–BUG-009), plus what a
+seven-angle review of those fixes found. Release notes with the full **Known
+Issues** and **Future Release** lists: `release-notes/v1.5.0.en.md` (English)
+and `release-notes/v1.5.0.md` (Japanese). All three suites pass: `npm test`
+75 files / 1699 tests, `npm run build`, and `cargo test --lib` 347 tests. Tauri capabilities
+and the CSP are unchanged. Nothing was checked in the installed app yet; the
+manual steps are in `../qa-results/20261003-computer-use-v1/retest-checklist-20261018.md`,
+outside this repository.
+
+**One rule for "unsaved"** (BUG-001, BUG-005, BUG-007)
+
+- Saved / Unsaved and the changes label follow one rule, for every edit, undo,
+  redo, title and notes change and save, so the UI no longer shows 未保存 next
+  to 未保存(保存時と同じ内容) (except two blank-Markdown-tab edge cases, KI-49 and
+  KI-50). Switching views never counts as a change; a Markdown text that differs
+  from the file always does. Whitespace-only edits, reordered paragraphs and a
+  kept AI version count as changes.
+- Undoing a title edit in the field back to the saved title is clean. The
+  Markdown bytes are restored from the start of that run of title edits, so a
+  source edit made before it is never rolled back.
+- Undo after a Markdown or Slides edit (including the preview's
+  "+ Add paragraph") lands on clean, and so does typing the saved text back.
+- A source-only change (front matter, blank lines, spacing, line endings,
+  heading or fence markers, the title line) is named "Markdown source changed"
+  in the status bar and explained in the changes panel.
+- `.md` saves leave the bytes actually written as the baseline.
+
+**Live fields** (BUG-007)
+
+- Speaker notes and detached-slide bullets write to the document as you type,
+  coalesced into one undo step per typing run (an IME composition never splits
+  it; a keystroke that stores nothing keeps the run open). ⌘Z in those fields
+  is the document Undo. One click on a tab's close button goes straight to the
+  save prompt.
+- A save ends the typing session when it captures the document (Editor and
+  Slides), and Analyze ends it too, so Undo can land on the saved state.
+
+**Find and Go to Line** (BUG-002, BUG-004)
+
+- Matches are recomputed from the store's current text after undo, redo or
+  typing; "Replaced N." shows only while it describes the current text and
+  options. An all-identity Replace All says "Nothing to change." and is not an
+  undo step.
+- Go to Line accepts only whole numbers 1..N (full-width digits allowed) and
+  shows an inline error instead of clamping.
+- Clicking Replace / Replace All while typing in a Markdown Preview block no
+  longer discards the typed text (pre-existing data loss).
+- ⌘Z in the Markdown source no longer brings back a change that Edit → Undo
+  (or ⌘Z in the find bar) just removed. Known limits: KI-44–KI-46, FR-22.
+
+**Esc and focus** (BUG-006, KI-35)
+
+- Esc closes the Review, graph and changes panels, the status-bar popovers and
+  the Criteria / Personal library / Citations panels — from a non-editable
+  target or a paragraph, never from the Markdown source, the title, a dialog,
+  the find bar or a field inside a panel, and never during IME conversion.
+  One Esc closes the panel you are in, else the most recently opened one; if
+  focus was in it, focus goes back to where it was before the panel opened.
+  With an unsent Review comment, Esc keeps the panel open. The bottom-right
+  corner holds one panel at a time.
+- One Esc, one effect: the background menu, link and TeX popovers, toolbar
+  menus and the find bar claim their Esc.
+- The presentation overlay takes focus when it opens (also from the palette,
+  once the palette has closed), so keys never edit the document behind it. A
+  closing dialog no longer takes back a focus placed since it closed.
+
+**Slides and Help** (BUG-003, BUG-008, BUG-009)
+
+- The Slides Edit/Preview tabs expose exactly one selected tab.
+- Ending a presentation selects the slide on screen (no undo step, not dirty),
+  and the next presentation starts there.
+- The diagram notices say what PPTX export actually does (image layouts only).
+- Help §6 lists .pptx in all five languages; a test ties the list to the menus.
+
 ## v1.4.0 — 2026-10-02
 
 Everything since v1.3.0: the QA fix pass below, plus the Markdown workspace,

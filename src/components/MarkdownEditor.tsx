@@ -2,6 +2,7 @@ import {
   type MutableRefObject,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -26,8 +27,10 @@ import { documentToMarkdown, eolOf, normalizeEol, restoreEol } from "../markdown
 import { findMarkdownLinkAt } from "../markdownPreview";
 import { markdownSourceHighlightStyle, markdownSourceThemeSpec } from "../markdownSourceTheme";
 import { useT } from "../i18n";
+import { isImeKeyEventSince } from "../modalBehavior";
 import { PREVIEW_SCOPE_NOTE, helperFor, type MarkdownSurface } from "../markdownSurfaceHelp";
 import { previewBackgroundOf } from "../previewBackground";
+import { createHistoryReset, onlyStoreSync, syncFromStore } from "../sourceHistory";
 import { useStore } from "../store";
 import MarkdownPreview, { type LinkRequest } from "./MarkdownPreview";
 import PreviewBackgroundPicker from "./PreviewBackgroundPicker";
@@ -111,6 +114,9 @@ function CodeMirrorEditor({
   // Sticky: a source with no line break yet keeps the last known ending.
   const eolRef = useRef(eolOf(source));
   if (/\r\n|\n/.test(source)) eolRef.current = eolOf(source);
+  // Empties CodeMirror's history inside the store → view sync below
+  // (sourceHistory.ts: a store undo must never be re-applied by ⌘Z here).
+  const historyReset = useMemo(createHistoryReset, []);
 
   const extensions = useMemo(
     () => [
@@ -119,6 +125,7 @@ function CodeMirrorEditor({
       highlightActiveLine(),
       highlightSpecialChars(),
       history(),
+      historyReset.extension,
       drawSelection(),
       dropCursor(),
       EditorState.allowMultipleSelections.of(true),
@@ -128,7 +135,7 @@ function CodeMirrorEditor({
       keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
       EditorView.lineWrapping,
       EditorView.updateListener.of((update) => {
-        if (!update.docChanged) return;
+        if (!update.docChanged || onlyStoreSync(update.transactions)) return;
         // A find-bar replace is its own store undo step, never merged into
         // the typing session before it (BUG-010).
         const replaced = update.transactions.some((tr) => tr.isUserEvent(FIND_REPLACE_EVENT));
@@ -151,7 +158,7 @@ function CodeMirrorEditor({
       // Layout, active line and selection styling (tokens only; see module doc).
       EditorView.theme(markdownSourceThemeSpec),
     ],
-    [onLink, setMarkdownSource]
+    [onLink, setMarkdownSource, historyReset]
   );
 
   useEffect(() => {
@@ -175,10 +182,23 @@ function CodeMirrorEditor({
     };
   }, [extensions]);
 
-  useEffect(() => {
+  // Store → view (store undo/redo, preview edit, load): one unrecorded
+  // minimal change that also empties CodeMirror's history, so ⌘Z here can not
+  // re-apply what the store undid. No-op when the LF texts agree (CodeMirror's
+  // own edits keep their history; CRLF sources). See sourceHistory.ts.
+  // A LAYOUT effect (C14, review follow-up, QA 20261003): React runs every
+  // layout effect of a commit before any passive one, so FindBar's passive
+  // [loc] effect — FindBar renders first, in App.tsx — already reads the
+  // synced view and its mapped selection ("k / N", not "N matches"). It also
+  // means a Preview edit committed on the blur of a find-bar press is in the
+  // view before that click runs the replace (C11). Effect kinds are pinned in
+  // sourceHistoryWiring.test.ts; React's ordering in the real webview is NOT
+  // guarded by this suite (no DOM) — manual QA in the installed app. On first
+  // mount the view does not exist yet (created by the passive effect above,
+  // from `source`).
+  useLayoutEffect(() => {
     const view = viewRef.current;
-    if (!view || view.state.doc.toString() === normalizeEol(source)) return;
-    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: normalizeEol(source) } });
+    if (view) syncFromStore(view, historyReset, source);
   }, [source]);
 
   return <div ref={hostRef} className="h-full min-h-0 overflow-hidden" aria-label={t("Markdown source editor")} />;
@@ -190,12 +210,32 @@ function LinkPopover({ request, onClose }: { request: LinkRequest; onClose: () =
   const openable = /^(?:https?:|mailto:)/i.test(request.href);
   const left = Math.max(12, Math.min(request.x, window.innerWidth - 340));
   const top = Math.max(12, Math.min(request.y + 10, window.innerHeight - 150));
+  // Esc closes it like the other local Esc handlers (QA 20261003 follow-up):
+  // never for an IME key — including WebKit's Esc that cancels a conversion
+  // AFTER compositionend with isComposing false (isImeKeyEventSince, 80 ms
+  // window; compositionend is recorded on document in the capture phase, as
+  // usePanelEscape does, in a ref so a re-subscribed effect keeps it) — claims
+  // the key (preventDefault) so the docked-panel Esc (window listener,
+  // panelEscape.ts) does not act on it too, and listens on document, which
+  // runs before that window listener. Wiring pinned in
+  // sourceHistoryWiring.test.ts; real WebKit key order by manual QA.
+  const lastCompositionEnd = useRef(0);
   useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+    const onCompositionEnd = () => {
+      lastCompositionEnd.current = Date.now();
     };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || isImeKeyEventSince(event, lastCompositionEnd.current, Date.now()) || event.defaultPrevented)
+        return;
+      event.preventDefault();
+      onClose();
+    };
+    document.addEventListener("compositionend", onCompositionEnd, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("compositionend", onCompositionEnd, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
   }, [onClose]);
   return (
     <div

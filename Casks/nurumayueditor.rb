@@ -13,7 +13,7 @@
 # sign + notarize the build, or users must run:
 #   xattr -dr com.apple.quarantine "/Applications/NurumayuEditor.app"
 cask "nurumayueditor" do
-  version "1.4.0"
+  version "1.5.0"
   sha256 :no_check # replace with the real sha256 of the released .dmg
 
   url "https://github.com/kumeS/NurumayuEditor/releases/download/v#{version}/NurumayuEditor_#{version}_aarch64.dmg"

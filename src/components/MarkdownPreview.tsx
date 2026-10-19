@@ -448,6 +448,9 @@ function DraftBlock({ draft }: { draft: Draft }) {
         // kana→kanji conversion and must not discard the draft.
         if (isImeKeyEventSince(e.nativeEvent, lastCompositionEnd.current)) return;
         if (e.key === "Escape") {
+          // Claimed, so no later Esc listener (a docked panel's) also acts on
+          // it (QA 20261003 follow-up, defense in depth).
+          e.preventDefault();
           done.current = true;
           ctx?.setDraft(null);
           return;
@@ -573,11 +576,34 @@ function MathEditor({
   const left = Math.max(12, Math.min(rect?.left ?? 100, window.innerWidth - 380));
   const top = Math.min((rect?.bottom ?? 100) + 8, window.innerHeight - 220);
 
+  // Esc cancels — one key, one effect (QA 20261003 follow-up). Two paths:
+  // - Focus inside the popover (the usual case; its field is autoFocused):
+  //   React 19 delegates a portal's events to its container (document.body)
+  //   and the isolation's `stop` ends native propagation there, so no
+  //   document/window listener ever sees the key. onDialogKeyDown handles Esc
+  //   in React instead — and still calls `stop`, so the isolation holds.
+  // - Focus outside it (an outside click leaves it open): this document
+  //   bubble-phase listener runs before usePanelEscape's window listener and
+  //   claims the key, so an open docked panel does not close on the same press.
+  // Both leave IME keys alone (Esc backing out of a kana→kanji conversion).
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (isImeKeyEventSince(e, lastCompositionEnd.current)) return;
+      e.preventDefault();
+      onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  const onDialogKeyDown = (e: ReactKeyboardEvent) => {
+    stop(e);
+    if (e.key !== "Escape") return;
+    if (isImeKeyEventSince(e.nativeEvent, lastCompositionEnd.current)) return;
+    e.preventDefault();
+    onClose();
+  };
 
   const apply = () => {
     const from = start(node);
@@ -599,6 +625,7 @@ function MathEditor({
       className="fixed z-50 w-[360px] rounded-lg border border-ink-faint/30 bg-white p-3 font-sans shadow-xl"
       style={{ left, top }}
       {...isolateFromEditableAncestor}
+      onKeyDown={onDialogKeyDown}
     >
       <label className="mb-1 block text-xs font-medium text-ink-soft" htmlFor="math-editor-input">
         {t("Formula (TeX)")}
@@ -609,6 +636,9 @@ function MathEditor({
           autoFocus
           value={value}
           onChange={(e) => setValue(e.target.value)}
+          onCompositionEnd={() => {
+            lastCompositionEnd.current = Date.now();
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) apply();
           }}

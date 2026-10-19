@@ -95,11 +95,16 @@ export function topmostModal(stack: readonly string[]): string | null {
 /**
  * Whether a closing modal should hand focus back to its opener. `openerOwner`
  * is the id of the modal the opener lives in (null for the app chrome).
+ * `focusElsewhere`: something placed focus since the close (e.g. the
+ * presentation overlay a palette command opened) — never take it back
+ * (review follow-up, QA 20261003).
  */
 export function shouldRestoreFocus(
   stackAfterClose: readonly string[],
-  openerOwner: string | null = null
+  openerOwner: string | null = null,
+  focusElsewhere = false
 ): boolean {
+  if (focusElsewhere) return false;
   if (stackAfterClose.length === 0) return true;
   return openerOwner !== null && topmostModal(stackAfterClose) === openerOwner;
 }

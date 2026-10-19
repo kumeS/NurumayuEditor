@@ -26,7 +26,9 @@
 //   and never under a modal. In any other input/textarea/contentEditable they
 //   resolve to "field-undo"/"field-redo", which useShortcuts runs explicitly on
 //   the focused field (document.execCommand) because the native Edit menu has
-//   no ⌘Z key equivalent. In CodeMirror they return null: its own keymap acts.
+//   no ⌘Z key equivalent. In CodeMirror they return null: its own keymap acts
+//   (⌘Z / ⇧⌘Z; on macOS its keymap does not bind ⌘Y, so ⌘Y does nothing in
+//   the Markdown source — known limit).
 //   Known limit: that execCommand performs the field undo in WKWebView is
 //   verified only by manual QA in the installed app, not by this suite.
 // - Native menu ids are an allowlist under a modal: only `quit` passes. The
@@ -215,8 +217,12 @@ export function shortcutTargetKind(t: unknown): TargetKind {
  * Markdown Preview's contentEditable blocks (tagged data-doc-history) keep
  * typed text in the DOM and commit it on blur; a store undo remounts every
  * block, which would silently drop that text. Blurring first commits it as its
- * own step, so ⌘Z then reverts exactly it. Document-history textareas write
- * the store on every keystroke and keep their focus (and caret).
+ * own step, so ⌘Z then reverts exactly it. Document-history textareas and
+ * inputs write the store on every keystroke and keep their focus (and caret):
+ * ChunkView's textareas, and SlideEditor's detached-slide title, its
+ * speaker-notes textarea (BUG-007, QA 20261003) and its detached-slide
+ * bullets textarea (QA 20261003 follow-up) — the last two no longer commit on
+ * blur, so nothing is pending there.
  */
 export function flushesPendingEditBeforeHistory(t: unknown): boolean {
   return shortcutTargetKind(t) === "doc-history" && (t as TargetLike).isContentEditable === true;

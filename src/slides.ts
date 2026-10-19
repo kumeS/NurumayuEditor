@@ -132,6 +132,20 @@ export function slideNotes(s: SlideGroup): string {
 }
 
 /**
+ * What the speaker-notes field shows (BUG-007, QA 20261003): the stored
+ * notes, except while the text last typed into the field on this slide
+ * (`draft`) means the same thing. The store keeps a whitespace-only note as
+ * "no notes" (setChunkNotes / updateChunkNotes), so a typed leading space
+ * would otherwise vanish under the cursor; any other difference — a document
+ * undo/redo, a mode switch — shows the stored value. UI-only: no deck.rs
+ * counterpart. Pure.
+ */
+export function speakerNotesFieldValue(stored: string, draft: string | null): string {
+  if (draft === null) return stored;
+  return (draft.trim() ? draft : "") === stored ? draft : stored;
+}
+
+/**
  * The slide's explicit subtitle line, if a text chunk on it is flagged
  * `subtitle` (Req 3). Returns undefined when there's no explicit subtitle (the
  * section layout then falls back to the first bullet, matching AI Draft's
@@ -172,6 +186,40 @@ export function slideBullets(s: SlideGroup): string[] {
  */
 export function slideParagraphs(s: SlideGroup): SlidePara[] {
   return slideBullets(s).flatMap(chunkToParagraphs);
+}
+
+/**
+ * The detached-slide bullet lines a typed text stands for: one bullet per
+ * line, each trimmed, blank lines dropped — the normalisation the bullet
+ * field has always applied (it used to on blur; since the QA 20261003
+ * follow-up the store's updateSlideBody applies it on every change). Empty
+ * text is `[]`: the slide stays detached with no bullets (only Re-link
+ * re-attaches it). Pure.
+ */
+export function slideBodyLines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+/** Two slideBody line lists are the same lines in the same order. Pure. */
+export function sameSlideBodyLines(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((l, i) => l === b[i]);
+}
+
+/**
+ * What the detached-slide bullet field shows (QA 20261003 follow-up): the
+ * stored lines, except while the text last typed into the field on this
+ * slide (`draft`) normalises to exactly those lines — so a typed trailing
+ * space, a fresh empty line (Return) or a leading space stays under the
+ * cursor even though the store keeps only normalised lines. Any other
+ * difference (a document undo/redo, Re-link, an AI re-summarize) shows the
+ * stored lines. UI-only: no pptx.rs counterpart. Pure.
+ */
+export function slideBodyFieldValue(stored: readonly string[], draft: string | null): string {
+  if (draft !== null && sameSlideBodyLines(slideBodyLines(draft), stored)) return draft;
+  return stored.join("\n");
 }
 
 /** True if this slide is "detached" — showing custom slideBody, not the prose (Req 2). */
@@ -242,7 +290,12 @@ export function splitImageRegion(layout: SlideLayout, n: number): RegionCell[] {
   return cells;
 }
 
-/** Diagram chunks on the slide (rendered as a placeholder; not yet in .pptx) (D3). */
+/**
+ * Diagram chunks on the slide (D3). Never drawn on the in-app slide canvas
+ * (not in `slideImages`) — the canvas shows a note instead. The in-app .pptx
+ * export embeds a diagram's rendered snapshot only when the slide's layout
+ * has an image area (pptx.rs); `autoLayout` picks one for image chunks only.
+ */
 export function slideDiagrams(s: SlideGroup): Chunk[] {
   return s.items.filter((c) => c.metadata.chunkType === "diagram");
 }

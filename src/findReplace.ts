@@ -18,12 +18,17 @@
 // - Replace All is ONE change list (`replacementChanges`): the store applies it
 //   with `applyChanges`, CodeMirror dispatches the same list, so both produce
 //   the same text.
+// - A match that already reads the replacement is not a change
+//   (`isNoOpChange`): `replacementChanges` / `replaceAll` drop it and do not
+//   count it, so an all-identity Replace All changes nothing, adds no undo
+//   step and reports 0 (C12, review follow-up, QA 20261003).
 // - Chunk search covers text and heading chunks only (image paths and diagram
 //   source are not prose). The document title is not searched.
 // - Go to Line accepts integers 1..N only (`parseLineNumber`): out-of-range
 //   and non-integer input is rejected, never clamped (BUG-004, QA 20261003).
-// - A Replace All report is shown only while the searched text is the one it
-//   was made for (`freshReplaceReport`, BUG-002, QA 20261003).
+// - A Replace All report is shown only while the searched text and the find
+//   options (Match case, Whole word) are the ones it was made for
+//   (`freshReplaceReport`, BUG-002 + C13, QA 20261003).
 // Known limits: no regex mode and no search inside the document title; Slides
 // mode find is planned (`findAvailability`).
 
@@ -110,14 +115,24 @@ export function findMatches(text: string, query: string, opts: FindOptions): Tex
   return out;
 }
 
-/** The edits Replace All makes (one per match, replacement inserted verbatim). */
+/** Whether `change` leaves `text` as it is: its insert equals the span it
+ *  replaces (C12, review follow-up, QA 20261003). */
+export function isNoOpChange(text: string, change: TextChange): boolean {
+  return text.slice(change.from, change.to) === change.insert;
+}
+
+/** The edits Replace All makes: one per match that the replacement (inserted
+ *  verbatim) actually changes. A match already reading the replacement is
+ *  dropped, so it is neither dispatched nor counted (C12). */
 export function replacementChanges(
   text: string,
   query: string,
   replacement: string,
   opts: FindOptions
 ): TextChange[] {
-  return findMatches(text, query, opts).map((m) => ({ from: m.from, to: m.to, insert: replacement }));
+  return findMatches(text, query, opts)
+    .map((m) => ({ from: m.from, to: m.to, insert: replacement }))
+    .filter((c) => !isNoOpChange(text, c));
 }
 
 /** Apply non-overlapping, ascending changes to `text`. */
@@ -131,7 +146,8 @@ export function applyChanges(text: string, changes: readonly TextChange[]): stri
   return out + text.slice(at);
 }
 
-/** Replace every match; `count` is how many were replaced. */
+/** Replace every match; `count` is how many were changed (identity matches
+ *  are not counted, see `replacementChanges`). */
 export function replaceAll(
   text: string,
   query: string,
@@ -199,21 +215,32 @@ export function chunkSearchText(chunks: readonly Chunk[]): string {
     .join("\n");
 }
 
-/** What the find bar says after Replace All, and the searched text it was
- *  made for (BUG-002, QA 20261003). */
-export interface ReplaceReport {
+/** What the find bar says after Replace All, and the search it was made
+ *  for: the searched text (BUG-002) and the find options (C13, review
+ *  follow-up, QA 20261003). `count` is how many matches it changed. */
+export interface ReplaceReport extends FindOptions {
   count: number;
   text: string;
 }
 
 /**
- * The report while the searched text is still the one it was made for, else
- * null: once an undo, redo or edit changes the text, "Replaced N." no longer
- * describes it (freshness is checked where the report is used). The bar
+ * The report while the searched text and the find options are still the ones
+ * it was made for, else null: once an undo, redo or edit changes the text, or
+ * Match case / Whole word is toggled, "Replaced N." no longer describes the
+ * live matches (freshness is checked where the report is used). The bar
  * stores the null, so a redo back to the same text does not revive it.
  */
-export function freshReplaceReport(report: ReplaceReport | null, text: string): ReplaceReport | null {
-  return report !== null && report.text === text ? report : null;
+export function freshReplaceReport(
+  report: ReplaceReport | null,
+  text: string,
+  opts: FindOptions
+): ReplaceReport | null {
+  return report !== null &&
+    report.text === text &&
+    report.caseSensitive === opts.caseSensitive &&
+    report.wholeWord === opts.wholeWord
+    ? report
+    : null;
 }
 
 /** Number of lines (a trailing newline starts a new, empty line). */

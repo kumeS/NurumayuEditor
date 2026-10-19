@@ -4,6 +4,7 @@
 // stated reason while the document has nothing to analyze (BUG-015a).
 
 import { describe, expect, it } from "vitest";
+import { changesLabel } from "./healthLabels";
 import { JA } from "./i18n";
 
 const SOURCES = import.meta.glob(
@@ -51,6 +52,44 @@ describe("HealthBar change label (BUG-015b / MISS-12)", () => {
     expect(dp).toMatch(/const summary = useMemo\(\(\) => changeSummary\(savedDoc, doc\)/);
     expect(dp).toMatch(/summary\.titleChanged && \(\s*<DiffSection title=\{t\("Title"\)\}/);
     expect(dp).toContain("changesLabel(summary, dirty, lang)");
+  });
+});
+
+// QA 20261003 (BUG-005): a change only the Markdown source carries
+// (frontmatter, blank lines, line endings) is dirty, so the label must name
+// it instead of reading "Unsaved (matches last save)".
+describe("source-only change label (QA 20261003)", () => {
+  const SOURCE_ONLY = { paragraphs: 0, titleChanged: false, otherChanged: false, sourceChanged: true };
+
+  it("changesLabel names a source-only change, in both languages", () => {
+    // Fails if changesLabel ignores sourceChanged (falls through to "matches last save").
+    expect(changesLabel(SOURCE_ONLY, true, "en")).toBe("Markdown source changed");
+    expect(changesLabel(SOURCE_ONLY, true, "ja")).toBe("Markdownソースを変更");
+  });
+
+  it("HealthBar colours the change label from hasChanges (which counts sourceChanged)", () => {
+    const hb = src("./components/HealthBar.tsx");
+    expect(hb).toMatch(/import \{[^}]*\bhasChanges\b[^}]*\} from "\.\.\/diff"/);
+    expect(hb).toMatch(/const anyChange = hasChanges\(changes\);/);
+    const button = buttonAround(hb, "<HistoryIcon");
+    expect(button).toContain('${anyChange ? "text-warn" : ""}');
+  });
+
+  it("DiffPanel explains a source-only change under its label", () => {
+    const dp = src("./components/DiffPanel.tsx");
+    const at = dp.indexOf("{summary.sourceChanged && (");
+    expect(at).toBeGreaterThan(-1);
+    const block = dp.slice(at, dp.indexOf("</p>", at));
+    // Review follow-up C20 (QA 20261003): the causes are EXAMPLES ("for
+    // example" / 「など」) — trailing spaces, indentation and fence markers
+    // also produce a source-only change (diff.test.ts backs spacing and
+    // fences). Fails if the note goes back to a closed list.
+    const key =
+      "Only the Markdown text differs (for example front matter, blank lines, spacing, line endings, heading or fence markers, or the title line); the paragraphs in the editor are unchanged.";
+    expect(block).toContain(`t("${key}")`);
+    expect(JA[key]).toBe(
+      "Markdownのテキストだけが異なります(フロントマター・空行・空白・改行コード・見出しやコードフェンスの記号・タイトル行など)。エディタの段落は変わっていません。"
+    );
   });
 });
 

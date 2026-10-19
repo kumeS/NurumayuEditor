@@ -74,7 +74,30 @@ describe("FindBar uses the pure core and the store actions", () => {
     const tags = bar().split("<button").slice(1);
     expect(tags.length).toBeGreaterThanOrEqual(9);
     for (const tag of tags) expect(tag.slice(0, 40)).toMatch(/^ onMouseDown=\{keepFieldFocus\}/);
-    expect(bar()).toMatch(/const keepFieldFocus = \(e: MouseEvent\) => e\.preventDefault\(\);/);
+  });
+
+  // C11 (review follow-up, QA 20261003). Fails if the handler claims every
+  // press again (unconditional preventDefault): a Preview block with typed
+  // text then never blurs, so never commits, and the replace remounts it.
+  // keepsFocusOnPress itself is proven in findBarRender.test.ts.
+  it("keepFieldFocus claims a press only when focus is already in the bar (C11)", () => {
+    const b = bar();
+    const at = b.indexOf("const keepFieldFocus = (e: MouseEvent) => {");
+    expect(at).toBeGreaterThan(-1);
+    const handler = b.slice(at, b.indexOf("\n};", at) + 3);
+    expect(handler).toMatch(
+      /^const keepFieldFocus = \(e: MouseEvent\) => \{\n {2}if \(keepsFocusOnPress\(document\.activeElement\)\) e\.preventDefault\(\);\n\};$/
+    );
+  });
+
+  // C11: the fix is the native blur of the press, NOT a blur inside the
+  // handlers — React renders only after the click handler returns, so the
+  // source view would still show the old text and its write-back would undo
+  // the commit. Fails if either replace handler starts blurring / flushing.
+  it("the replace handlers never blur or flush the focused element themselves (C11)", () => {
+    for (const name of ["replaceEverything", "replaceCurrent"]) {
+      expect(fnBody(bar(), name), name).not.toMatch(/\.blur\(|flushPendingEdit|flushesPendingEditBeforeHistory|activeElement/);
+    }
   });
 
   it("opening the bar in Markdown mode asks the editor to show the source (Preview → Split)", () => {
@@ -190,8 +213,12 @@ describe("md-slides-export-3 — CRLF sources and the CodeMirror editor", () => 
   it("the editor is created and synced with LF text, and writes back in the source's EOL", () => {
     const e = editor();
     expect(e).toMatch(/EditorState\.create\(\{ doc: normalizeEol\(source\), extensions \}\)/);
-    expect(e).toMatch(/view\.state\.doc\.toString\(\) === normalizeEol\(source\)/);
-    expect(e).toMatch(/insert: normalizeEol\(source\)/);
+    // The [source] effect hands the store's raw source to syncFromStore, which
+    // compares and inserts LF text (CRLF no-op proven in sourceHistory.test.ts).
+    // A layout effect (C14, review follow-up, QA 20261003; why: sourceHistoryWiring.test.ts).
+    expect(e).toMatch(
+      /useLayoutEffect\(\(\) => \{\n {4}const view = viewRef\.current;\n {4}if \(view\) syncFromStore\(view, historyReset, source\);\n {2}\}, \[source\]\);/
+    );
     expect(e).toMatch(/setMarkdownSource\(\s*restoreEol\(update\.state\.doc\.toString\(\), eolRef\.current\)/);
   });
 
@@ -204,14 +231,26 @@ describe("md-slides-export-3 — CRLF sources and the CodeMirror editor", () => 
 });
 
 describe("ux-a11y-i18n-1 — Replace marks a pending replace for ⌘Z routing", () => {
-  it("replaceEverything sets replacePending when something was replaced", () => {
+  // C12 (review follow-up, QA 20261003): armed only when the store really
+  // changed (doc identity — past.length saturates at the history cap), and
+  // never disarmed by a replace that changed nothing. Fails if it goes back
+  // to the match count (`count > 0`), or to past.length.
+  it("replaceEverything sets replacePending only when the document changed", () => {
     const body = fnBody(src("FindBar"), "replaceEverything");
-    expect(body).toMatch(/s\.setFind\(\{ current: -1, hit: null, replacePending: count > 0 \}\)/);
+    expect(body).toMatch(
+      /const changed = docChangedSince\(s\);\s*s\.setFind\(\{ current: -1, hit: null, \.\.\.\(changed \? \{ replacePending: true \} : \{\}\) \}\);/
+    );
+    expect(body).not.toMatch(/replacePending: count/);
+    expect(src("FindBar")).toMatch(
+      /const docChangedSince = \(before: State\): boolean => useStore\.getState\(\)\.doc !== before\.doc;/
+    );
   });
 
-  it("replaceCurrent sets it after both the chunk and the Markdown replacement", () => {
+  it("replaceCurrent sets it after both the chunk and the Markdown replacement, only when the document changed", () => {
     const body = fnBody(src("FindBar"), "replaceCurrent");
     expect(body.match(/setFind\(\{ replacePending: true \}\)/g)).toHaveLength(2);
+    const guarded = /if \(docChangedSince\(s\)\) useStore\.getState\(\)\.setFind\(\{ replacePending: true \}\);/g;
+    expect(body.match(guarded)).toHaveLength(2);
     const chunkReplace = body.indexOf("s.replaceMatchInChunk(");
     const firstMark = body.indexOf("setFind({ replacePending: true })");
     expect(firstMark).toBeGreaterThan(chunkReplace);
@@ -282,11 +321,16 @@ describe("BUG-002 (QA 20261003) — the Replace All report is checked for freshn
 
   // Fails if the status goes back to a bare count that only a query /
   // replacement edit clears (the "3 件を置換しました" that outlived ⌘Z).
-  it("the status reads the report through freshReplaceReport with the text being searched now", () => {
+  // + C13 (review follow-up, QA 20261003): with the find options being used
+  // now, so a Match case / Whole word toggle makes the report stale.
+  it("the status reads the report through freshReplaceReport with the text and options being searched now", () => {
     const b = bar();
-    expect(b).toMatch(/const report = freshReplaceReport\(replaced, searchedText\(loc\)\);/);
+    expect(b).toMatch(
+      /const report = freshReplaceReport\(replaced, searchedText\(loc\), \{\s*caseSensitive: find\.caseSensitive,\s*wholeWord: find\.wholeWord,\s*\}\);/
+    );
     const status = b.slice(b.indexOf("const status ="), b.indexOf("const closeButton"));
-    expect(status).toMatch(/^const status =\s*report !== null\s*\? report\.count > 0/);
+    // findStatus (findBarRender.test.ts) puts a fresh report before the live count.
+    expect(status).toMatch(/^const status = findStatus\(\{ report, query: find\.query, total, current: find\.current \}, t, lang\);/);
     expect(status).not.toMatch(/\breplaced\b/);
   });
 
@@ -298,7 +342,34 @@ describe("BUG-002 (QA 20261003) — the Replace All report is checked for freshn
 
   it("replaceEverything reports the text the replace left (re-located from the store)", () => {
     const body = fnBody(bar(), "replaceEverything");
-    expect(body).toMatch(/return \{ count, text: searchedText\(locate\(useStore\.getState\(\)\)\) \};/);
+    expect(body).toMatch(
+      /return \{ count: changed \? count : 0, text: searchedText\(locate\(useStore\.getState\(\)\)\), \.\.\.opts \};/
+    );
     expect(bar()).toMatch(/onClick=\{\(\) => setReplaced\(replaceEverything\(\)\)\}/);
+  });
+});
+
+// Review follow-up (QA 20261003): a press on ↑ / ↓ that starts in a Preview
+// block blurs it (C11), the blur commit makes the "Replaced N." / "Nothing to
+// change." report stale, and the status text shrinks — with a min-width the
+// arrows to its right slid under the pointer between mousedown and click, so
+// the click was lost. The status now has a FIXED width wide enough for the
+// longest copy (EN "Nothing to change.", JA 「12345 件を置換しました」), so nothing
+// after it moves. Fails if the status goes back to a min-width / auto width.
+describe("find bar status keeps the buttons after it in place", () => {
+  const findBar = Object.values(
+    import.meta.glob("./components/FindBar.tsx", { eager: true, query: "?raw", import: "default" })
+  )[0] as string;
+  it("the live status span has a fixed width and never wraps", () => {
+    const at = findBar.indexOf('<span role="status" aria-live="polite"');
+    expect(at).toBeGreaterThan(-1);
+    const tag = findBar.slice(at, findBar.indexOf(">", at) + 1);
+    // 9.5rem fits a 5-digit Japanese "N 件を置換しました" (CoreText, 12px);
+    // anything longer is cut, and the title shows the full text.
+    expect(tag).toMatch(/\bw-\[9\.5rem\]/);
+    expect(tag).toMatch(/\btitle=\{status\}/);
+    expect(tag).toMatch(/\bshrink-0\b/);
+    expect(tag).toMatch(/\bwhitespace-nowrap\b/);
+    expect(tag).not.toMatch(/min-w-/);
   });
 });

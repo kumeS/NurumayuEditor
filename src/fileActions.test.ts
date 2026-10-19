@@ -427,6 +427,75 @@ describe("saveNative — 'Document saved.' only when something changed", () => {
     expect(payload.markdownSource).toBe("# T\n\n\nchanged\n\n#### deep\n");
   });
 
+  // Review follow-up (C1 by another path): saved from the Editor view, an
+  // empty .md was written as "# notes\n" while the baseline kept the stale
+  // source "" — so select-all delete back in the Markdown view matched the
+  // baseline and read clean, and closing lost the deletion. The baseline now
+  // carries the bytes actually written. Fails if markTabClean gets `written`.
+  it(".md saved from the Editor: the baseline is the written bytes, so deleting them in Markdown is unsaved", async () => {
+    const opened = markdownToDocument({ ...doc([]), title: "notes" }, "");
+    useStore.getState().loadDocument(opened, PATH, { dirty: false });
+    useStore.getState().setMode("editor");
+    await saveNative();
+    const written = (exportDocument.mock.calls[0][0] as Document).markdownSource;
+    expect(written).not.toBe("");
+    expect(useStore.getState().savedDoc?.markdownSource).toBe(written);
+    expect(useStore.getState().dirty).toBe(false);
+    useStore.getState().setMode("markdown");
+    expect(useStore.getState().doc.markdownSource).toBe(written);
+    expect(useStore.getState().dirty).toBe(false);
+    useStore.getState().setMarkdownSource(""); // select all, Delete
+    expect(useStore.getState().dirty).toBe(true);
+  });
+
+  // Review follow-up: the .md baseline kept the Editor/Slide doc's mode, so
+  // documentToMarkdown(baseline) RE-MERGED the written bytes — not a fixed
+  // point ("Hello " → "Hello  \n") — and every no-op ⌘S said
+  // "Document saved." again. The baseline is now Markdown-mode, so it reads
+  // back as the on-disk bytes verbatim. Fails if markdownSavedBaseline keeps
+  // `written.mode` (3 toasts, not 1). The live view stays Editor/Slide and
+  // the tab stays clean: sameAsSaved never compares mode.
+  it.each(["editor", "slide"] as const)(
+    "Save As .md from %s mode, then ⌘S twice with nothing changed: one 'Document saved.', clean throughout",
+    async (mode) => {
+      const MD = "/Users/me/notes/trailing.md";
+      useStore.getState().loadDocument({ ...doc([chunk("c1", "Hello ")]), mode }, null, { dirty: true });
+      dialogSave.mockReset();
+      dialogSave.mockResolvedValue(MD);
+      expect(await saveNativeAs()).toBe(true);
+      expect(useStore.getState().filePath).toBe(MD);
+      expect(useStore.getState().doc.mode).toBe(mode); // the view is untouched
+      expect(useStore.getState().dirty).toBe(false);
+      expect(await saveNative()).toBe(true);
+      expect(useStore.getState().dirty).toBe(false);
+      expect(await saveNative()).toBe(true);
+      expect(useStore.getState().dirty).toBe(false);
+      expect(exportDocument).toHaveBeenCalledTimes(3);
+      const bytes = exportDocument.mock.calls.map((c) => (c[0] as Document).markdownSource);
+      expect(new Set(bytes).size).toBe(1); // the same bytes each time
+      expect(savedToasts()).toHaveLength(1); // Save As only
+    }
+  );
+
+  // A Markdown-mode doc with no stored source yet (its serialization is what
+  // gets written) must read clean right after Save As .md. Fails if the
+  // Markdown-mode early return in markdownSavedBaseline is dropped: the
+  // baseline then carries a source the live doc lacks, and a Markdown-mode
+  // doc's missing source is not excused by a view switch it never had.
+  it("Markdown-mode doc with no source yet: Save As .md leaves the tab clean", async () => {
+    const MD = "/Users/me/notes/nosource.md";
+    useStore.getState().loadDocument({ ...doc([chunk("c1", "body")]), mode: "markdown" }, null, { dirty: true });
+    expect(useStore.getState().doc.markdownSource).toBeUndefined();
+    dialogSave.mockReset();
+    dialogSave.mockResolvedValue(MD);
+    expect(await saveNativeAs()).toBe(true);
+    expect(exportDocument).toHaveBeenCalledTimes(1);
+    expect((exportDocument.mock.calls[0][0] as Document).markdownSource).toBe("# T\n\nbody\n");
+    expect(useStore.getState().dirty).toBe(false);
+    expect(await saveNative()).toBe(true);
+    expect(savedToasts()).toHaveLength(1); // the second save changed nothing
+  });
+
   it("a notes-only edit on a .md is 'unchanged' in the written format", () => {
     const opened = { ...markdownToDocument(doc([]), "# T\n\n\nbody  \n"), mode: "slide" as const };
     const noted = {
@@ -818,6 +887,98 @@ describe("state-async-3 — a save marks clean only the tab + load it wrote", ()
     expect(useStore.getState().savedDoc).toBe(written);
     expect(useStore.getState().dirty).toBe(true);
     expect(clearSession).not.toHaveBeenCalled();
+  });
+
+  // Review follow-up C4 (QA 20261003, MISS-12): the save used to end the
+  // typing session only when the write resolved, so a keystroke DURING the
+  // write coalesced into the pre-save session and no undo step held the
+  // saved document — undo could never read clean again. Each case types
+  // before ⌘S (an open session), during the write and after it, then undoes.
+  // Fails if saveNative / saveNativeAs stop calling endEditSession at the
+  // `written` capture: the second undo lands on the pre-session doc (dirty).
+  describe("C4 — a keystroke during the write: undo still reaches the saved state", () => {
+    const st = () => useStore.getState();
+
+    it("paragraph typing (⌘S): undo, undo → exactly what was written, clean", async () => {
+      singleTab(doc([chunk("c1", "本文")]), "/tmp/a.aix", false);
+      st().updateChunkContent("c1", "本文に");
+      st().updateChunkContent("c1", "本文に追記");
+      const written = st().doc;
+      const g = gate();
+      saveDocumentJson.mockImplementation(() => g.p);
+      const run = saveNative();
+      st().updateChunkContent("c1", "本文に追記中");
+      g.release();
+      expect(await run).toBe(true);
+      expect(st().savedDoc).toBe(written);
+      st().updateChunkContent("c1", "本文に追記中です");
+      st().undo();
+      expect(st().doc.chunks[0].content).toBe("本文に追記中");
+      expect(st().dirty).toBe(true);
+      st().undo();
+      expect(st().doc).toBe(written);
+      expect(st().dirty).toBe(false);
+    });
+
+    it("speaker notes (⌘S): undo, undo → exactly what was written, clean", async () => {
+      singleTab({ ...doc([{ ...chunk("h1", "一枚目"), metadata: { chunkType: "heading", level: 1, linkedChunks: [] } }]), mode: "slide" }, "/tmp/a.aix", false);
+      st().updateChunkNotes("h1", "a");
+      st().updateChunkNotes("h1", "ab");
+      const written = st().doc;
+      const g = gate();
+      saveDocumentJson.mockImplementation(() => g.p);
+      const run = saveNative();
+      st().updateChunkNotes("h1", "abc");
+      g.release();
+      expect(await run).toBe(true);
+      st().updateChunkNotes("h1", "abcd");
+      st().undo();
+      expect(st().doc.chunks[0].metadata.notes).toBe("abc");
+      st().undo();
+      expect(st().doc).toBe(written);
+      expect(st().doc.chunks[0].metadata.notes).toBe("ab");
+      expect(st().dirty).toBe(false);
+    });
+
+    it("Save As (session ended after the dialog, at the capture): undo → exactly what was written, clean", async () => {
+      singleTab(doc([chunk("c1", "本文")]), null, false);
+      st().updateChunkContent("c1", "本文に");
+      st().updateChunkContent("c1", "本文に追記");
+      const written = st().doc;
+      dialogSave.mockResolvedValue("/tmp/new.aix");
+      const g = gate();
+      saveDocumentJson.mockImplementation(() => g.p);
+      const run = saveNativeAs();
+      await vi.waitFor(() => expect(saveDocumentJson).toHaveBeenCalled());
+      st().updateChunkContent("c1", "本文に追記中");
+      g.release();
+      expect(await run).toBe(true);
+      expect(st().savedDoc).toBe(written);
+      st().undo();
+      expect(st().doc).toBe(written);
+      expect(st().dirty).toBe(false);
+    });
+
+    // Fails if saveNativeAs ends the session of whichever tab is active after
+    // the dialog: tab B's open typing session would be split by A's save.
+    it("Save As whose dialog outlives a tab switch leaves the other tab's session alone", async () => {
+      const a = singleTab(doc([chunk("c1", "A")]), null, true);
+      useStore.getState().newTab();
+      useStore.getState().loadDocument(doc([chunk("c2", "B")]), "/tmp/b.aix", { dirty: false });
+      const b = st().activeTabId;
+      st().updateChunkContent("c2", "B typed");
+      st().switchTab(a);
+      let pick!: (p: string) => void;
+      dialogSave.mockImplementation(() => new Promise<string>((r) => (pick = r)));
+      saveDocumentJson.mockResolvedValue(undefined);
+      const run = saveNativeAs();
+      st().switchTab(b);
+      expect(st().lastEditChunkId).toBe("c2");
+      pick("/tmp/new.aix");
+      expect(await run).toBe(true);
+      expect(st().activeTabId).toBe(b);
+      expect(st().lastEditChunkId).toBe("c2");
+    });
   });
 
   it("a tab closed (or reloaded) during the write is not marked, and the save reports false", async () => {

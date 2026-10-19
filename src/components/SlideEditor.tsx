@@ -38,7 +38,9 @@ import {
   slideOverflows,
   slideParagraphs,
   slideSubtitle,
+  slideBodyFieldValue,
   slideTitle,
+  speakerNotesFieldValue,
   splitImageRegion,
   type SlideGroup,
 } from "../slides";
@@ -116,7 +118,7 @@ export default function SlideEditor() {
 
   const openPresentation = useStore((s) => s.openPresentation);
 
-  const [view, setView] = useState<"edit" | "preview">("edit");
+  const [view, setView] = useState<SlideView>("edit");
   const [anchor, setAnchor] = useState<string | null>(null);
   const dragFrom = useRef<number | null>(null);
   const thumbRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -234,7 +236,7 @@ export default function SlideEditor() {
                     {diagramCount > 0 && (
                       <span
                         className="absolute bottom-0.5 right-0.5 flex items-center gap-0.5 rounded bg-warn-tint/90 px-1 text-[9px] font-medium text-warn-strong"
-                        title={translateWith("{n} diagram(s) on this slide are not yet exported to .pptx", lang, { n: diagramCount })}
+                        title={translateWith("{n} diagram(s) on this slide — not drawn in the slide preview; the .pptx export includes them only when the slide uses an image layout (Image right, left or top)", lang, { n: diagramCount })}
                       >
                         <FlowIcon className="h-2.5 w-2.5" /> {diagramCount}
                       </span>
@@ -376,32 +378,7 @@ export default function SlideEditor() {
           >
             {t("Merge into previous")}
           </button>
-          {/* MISS-09: this slide's own view switch — an underline tab pair,
-              deliberately unlike the toolbar's filled Editor/Markdown/Slides
-              segment, and labelled with its scope. */}
-          <div
-            role="tablist"
-            aria-label={t("Edit or preview this slide (the Editor / Markdown / Slides switch is in the toolbar)")}
-            title={t("Edit or preview this slide (the Editor / Markdown / Slides switch is in the toolbar)")}
-            className="flex shrink-0 items-center gap-3 text-sm"
-          >
-            {(["edit", "preview"] as const).map((m) => (
-              <button
-                key={m}
-                role="tab"
-                aria-selected={view === m}
-                aria-controls="slide-canvas-panel"
-                onClick={() => setView(m)}
-                className={`px-1 py-1 ${
-                  view === m
-                    ? "border-b-2 border-accent text-accent"
-                    : "border-b-2 border-transparent text-ink-faint hover:text-ink-soft"
-                }`}
-              >
-                {m === "edit" ? t("Edit slide") : t("Preview slide")}
-              </button>
-            ))}
-          </div>
+          <SlideViewTabs view={view} onSelect={setView} />
           <button
             onClick={startPresent}
             title={t("Present in this window (Esc to exit)")}
@@ -411,8 +388,9 @@ export default function SlideEditor() {
         </div>
 
         <div
-          id="slide-canvas-panel"
+          id={SLIDE_CANVAS_PANEL_ID}
           role="tabpanel"
+          aria-labelledby={slideViewTabId(view)}
           className="min-h-0 flex-1 overflow-y-auto bg-chrome-hairline p-6"
         >
           <div className="mx-auto w-full max-w-[900px]">
@@ -484,6 +462,58 @@ export default function SlideEditor() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+type SlideView = "edit" | "preview";
+
+/** The canvas tabpanel (both views render into it) and each view's tab. */
+const SLIDE_CANVAS_PANEL_ID = "slide-canvas-panel";
+const slideViewTabId = (m: SlideView) => `slide-view-tab-${m}`;
+
+/**
+ * The slide's own Edit / Preview switch (MISS-09): an underline tab pair,
+ * deliberately unlike the toolbar's filled Editor/Markdown/Slides segment, and
+ * labelled with its scope. One canvas tabpanel shows the selected view and is
+ * aria-labelledby the selected tab.
+ *
+ * Only the SELECTED tab aria-controls the panel (BUG-003, QA 20261003 — the
+ * other view has no content in the DOM). Both tabs used to control the shared
+ * panel, and WebKit exposes a tab as selected whenever a tabpanel it controls
+ * holds the keyboard focus (AccessibilityObject::isTabItemSelected), not only
+ * when aria-selected="true": in Edit the focused paragraph's ChunkView mounts
+ * inside the panel and takes the focus, so VoiceOver saw both tabs selected.
+ *
+ * Known limit: no arrow-key roving between the two tabs — both stay in the
+ * Tab order and are pressed with Return/Space like any button.
+ */
+export function SlideViewTabs({ view, onSelect }: { view: SlideView; onSelect: (view: SlideView) => void }) {
+  const t = useT();
+  return (
+    <div
+      role="tablist"
+      aria-label={t("Edit or preview this slide (the Editor / Markdown / Slides switch is in the toolbar)")}
+      title={t("Edit or preview this slide (the Editor / Markdown / Slides switch is in the toolbar)")}
+      className="flex shrink-0 items-center gap-3 text-sm"
+    >
+      {(["edit", "preview"] as const).map((m) => (
+        <button
+          key={m}
+          id={slideViewTabId(m)}
+          role="tab"
+          aria-selected={view === m}
+          aria-controls={view === m ? SLIDE_CANVAS_PANEL_ID : undefined}
+          onClick={() => onSelect(m)}
+          className={`px-1 py-1 ${
+            view === m
+              ? "border-b-2 border-accent text-accent"
+              : "border-b-2 border-transparent text-ink-faint hover:text-ink-soft"
+          }`}
+        >
+          {m === "edit" ? t("Edit slide") : t("Preview slide")}
+        </button>
+      ))}
     </div>
   );
 }
@@ -667,28 +697,22 @@ function LayoutGlyph({ kind }: { kind: SlideLayout | "auto" }) {
 }
 
 /**
- * Editor for a "detached" slide (Req 2): its title plus its own summary bullets,
- * edited independently of the document prose. The bullet textarea is uncommitted
- * while typing and saved on blur (so it doesn't spam undo history); its `key`
- * is the current body so a re-summarize replaces the text.
+ * Undo-step boundaries (BUG-002) and IME composition state (state-async-1) for
+ * ONE live document field: native beforeinput / compositionstart listeners
+ * (bound through `bind`) record `startsNewUndoStep` with the PRE-mutation
+ * selection, and `take()` hands the next change `{ newUndoStep, composing }`
+ * for the store's coalescing writers (updateChunkContent / updateChunkNotes /
+ * updateSlideBody) — the same rules as ChunkView's textareas. Each call owns
+ * its refs, so a boundary recorded in one field is never consumed by another
+ * (the detached title and bullets are separate instances). `resetKey` is the
+ * field's host chunk: a boundary recorded on one slide never leaks into the
+ * next. Real-IME event order in WKWebView is checked manually; the decisions
+ * are unit-tested in undoBoundary.test.ts.
  */
-function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
-  const t = useT();
-  const setSlideBody = useStore((s) => s.setSlideBody);
-  const updateChunkContent = useStore((s) => s.updateChunkContent);
-  const heading = headingOf(slide);
-  const lead = heading ?? slide.items[0];
-  const leadId = lead?.id;
-  const body = lead?.metadata.slideBody ?? [];
-
-  // BUG-002: the title writes the document per keystroke, so it records undo
-  // boundaries exactly like ChunkView's textareas (native beforeinput /
-  // compositionstart → startsNewUndoStep, pre-mutation selection), consumed
-  // by the next change as updateChunkContent's `newUndoStep`.
+function useUndoBoundaries(resetKey: string | undefined) {
   const pendingNewStep = useRef(false);
-  // state-async-1: IME composition state for the store's idle rule.
   const composition = useRef(createCompositionTracker());
-  const bindTitleInput = useCallback((el: HTMLInputElement | null) => {
+  const bind = useCallback((el: HTMLInputElement | HTMLTextAreaElement | null) => {
     if (!el) return;
     const onBeforeInput = (e: Event) => {
       const ie = e as InputEvent;
@@ -720,26 +744,57 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
       el.removeEventListener("compositionend", onCompositionEnd);
     };
   }, []);
-  const takeUndoBoundary = () => {
+  const take = useCallback(() => {
     const newUndoStep = pendingNewStep.current;
     pendingNewStep.current = false;
     return { newUndoStep, composing: composition.current.take() };
-  };
-  // A boundary recorded for another slide's title never leaks into this one.
+  }, []);
   useEffect(() => {
     pendingNewStep.current = false;
     composition.current.reset();
-  }, [heading?.id]);
+  }, [resetKey]);
+  return { bind, take };
+}
+
+/**
+ * Editor for a "detached" slide (Req 2): its title plus its own summary
+ * bullets, edited independently of the document prose. Both fields are live
+ * document-history fields (data-doc-history), each with its own
+ * useUndoBoundaries instance: the title writes updateChunkContent, the
+ * bullets write updateSlideBody on every change (QA 20261003 follow-up — the
+ * bullets used to commit only on blur, the BUG-007 class: no dirty mark or
+ * 元に戻す while typing, and the blur commit swallowed the first tab-close
+ * click). The store keeps normalised lines (slideBodyLines: trimmed, blanks
+ * dropped), so the field shows `bodyDraft` — the text last typed here, kept
+ * per slide lead — while it means the same lines, and the stored lines after
+ * any outside change (undo/redo, Re-link, AI re-summarize); see
+ * slideBodyFieldValue. Keyed by the lead, never by the body, so a live commit
+ * does not remount the field and drop the caret. States: synchronous
+ * in-memory fields — no loading/error state; an empty body shows the
+ * placeholder.
+ */
+function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
+  const t = useT();
+  const updateSlideBody = useStore((s) => s.updateSlideBody);
+  const updateChunkContent = useStore((s) => s.updateChunkContent);
+  const heading = headingOf(slide);
+  const lead = heading ?? slide.items[0];
+  const leadId = lead?.id;
+  const body = lead?.metadata.slideBody ?? [];
+  const [bodyDraft, setBodyDraft] = useState<{ leadId: string; text: string } | null>(null);
+  const shownBody = slideBodyFieldValue(body, bodyDraft && bodyDraft.leadId === leadId ? bodyDraft.text : null);
+  const titleBoundaries = useUndoBoundaries(leadId);
+  const bodyBoundaries = useUndoBoundaries(leadId);
 
   if (!leadId) return null;
   return (
     <div className="flex h-full flex-col gap-3 px-12 py-8">
       {heading ? (
         <input
-          ref={bindTitleInput}
+          ref={titleBoundaries.bind}
           data-doc-history="true"
           value={heading.content}
-          onChange={(e) => updateChunkContent(heading.id, e.target.value, takeUndoBoundary())}
+          onChange={(e) => updateChunkContent(heading.id, e.target.value, titleBoundaries.take())}
           placeholder={t("Slide title")}
           aria-label={t("Slide title")}
           className="w-full bg-transparent text-2xl font-bold text-ink outline-none placeholder:text-ink-faint/40"
@@ -748,14 +803,14 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
         <div className="text-2xl font-bold text-ink-faint">{t("Untitled slide")}</div>
       )}
       <textarea
-        key={body.join("|")}
-        defaultValue={body.join("\n")}
-        onBlur={(e) =>
-          setSlideBody(
-            leadId,
-            e.target.value.split("\n").map((l) => l.trim()).filter(Boolean)
-          )
-        }
+        key={leadId}
+        ref={bodyBoundaries.bind}
+        data-doc-history="true"
+        value={shownBody}
+        onChange={(e) => {
+          setBodyDraft({ leadId, text: e.target.value });
+          updateSlideBody(leadId, e.target.value, bodyBoundaries.take());
+        }}
         placeholder={t("One bullet per line…")}
         aria-label={t("Slide bullets (one per line)")}
         className="min-h-0 w-full flex-1 resize-none rounded-md border border-chrome-line bg-chrome/60 p-3 font-serif text-[1.05rem] leading-8 text-ink-soft outline-none focus:border-accent/40"
@@ -773,11 +828,28 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
  * Speaker notes for the current slide (item 1-1): a labeled textarea bound to
  * the slide's LEAD chunk's `metadata.notes` (its heading, or the first chunk
  * of a heading-less leading slide — the same host as layout/slideBody) via
- * `slideNotes`/`setChunkNotes`, mirroring deck.rs so Present and the PPTX
- * notesSlide show the same text (BUG-007). Uncommitted while typing and saved
- * on blur (same pattern as `DetachedSlideBody`'s bullet textarea), so it
- * doesn't spam undo history. Notes are kept in .aix files; writing them into
- * a .md file is planned (a notes-only edit leaves the Markdown unchanged).
+ * `slideNotes`/`updateChunkNotes`, mirroring deck.rs so Present and the PPTX
+ * notesSlide show the same text (BUG-007). Notes are kept in .aix files;
+ * writing them into a .md file is planned (a notes-only edit leaves the
+ * Markdown unchanged).
+ *
+ * Live and store-bound (BUG-007, QA 20261003 — it used to commit on blur):
+ * every change writes the store through updateChunkNotes (one undo step per
+ * typing session; boundaries and IME composition recorded by its own
+ * useUndoBoundaries, like DetachedSlideBody's fields), and the value is
+ * rendered from the store. So
+ * the dirty mark and 元に戻す update while typing, a tab-close click is never
+ * spent on a blur commit, a document undo shows at once, and a mode switch
+ * cannot change what is shown. `draft` (the last text typed here) is shown
+ * only while it means the same as the stored notes — see
+ * speakerNotesFieldValue (a typed leading space must not vanish).
+ *
+ * Undo: a document-history field (data-doc-history), like ChunkView's
+ * textareas. ⌘Z / ⇧⌘Z in it and the menu's 元に戻す / やり直す all run the
+ * DOCUMENT history, so field, model and dirty flag always agree; there is no
+ * separate field undo (execCommand on a controlled textarea would record a
+ * new edit rather than revert one). The blur-before-undo flush in
+ * shortcuts.ts is for contentEditable blocks only — nothing is pending here.
  *
  * States: a synchronous text field over in-memory document state — no async
  * load, so no loading/error state. Empty shows the placeholder. A slide with
@@ -786,9 +858,16 @@ function DetachedSlideBody({ slide }: { slide: SlideGroup }) {
  */
 function SpeakerNotes({ slide }: { slide: SlideGroup }) {
   const t = useT();
-  const setChunkNotes = useStore((s) => s.setChunkNotes);
+  const updateChunkNotes = useStore((s) => s.updateChunkNotes);
   const host = slideLead(slide);
   const notes = slideNotes(slide);
+  const [draft, setDraft] = useState<{ hostId: string; text: string } | null>(null);
+  const shown = speakerNotesFieldValue(notes, draft && draft.hostId === host?.id ? draft.text : null);
+
+  // BUG-002 boundaries + state-async-1 composition (its own instance), reset
+  // per notes host so a boundary never leaks into another slide's notes.
+  const notesBoundaries = useUndoBoundaries(host?.id);
+
   return (
     <div className="mt-3 rounded-lg border border-ink-faint/30 p-3 shadow-sm">
       <label
@@ -801,8 +880,13 @@ function SpeakerNotes({ slide }: { slide: SlideGroup }) {
         <textarea
           id="speaker-notes"
           key={host.id}
-          defaultValue={notes}
-          onBlur={(e) => setChunkNotes(host.id, e.target.value)}
+          ref={notesBoundaries.bind}
+          data-doc-history="true"
+          value={shown}
+          onChange={(e) => {
+            setDraft({ hostId: host.id, text: e.target.value });
+            updateChunkNotes(host.id, e.target.value, notesBoundaries.take());
+          }}
           placeholder={t("Add speaker notes…")}
           rows={3}
           className="w-full resize-y rounded-md border border-ink-faint/30 bg-accent/5 p-2 font-serif text-sm leading-6 text-ink-soft outline-none placeholder:text-ink-faint focus:border-accent/40"
@@ -910,12 +994,17 @@ export function SlideContent({ slide, layout, docTitle, placeholders }: StagePro
   const soft = "#3e4c59";
   const accent = "#2563eb";
 
-  // D3: diagrams aren't rendered into the slide canvas (or .pptx) yet — show a
-  // note so they don't silently vanish from Preview/Present.
+  // D3: diagrams aren't drawn on the slide canvas (slideImages excludes them),
+  // so a note keeps them from silently vanishing from Preview/Present. The
+  // in-app .pptx export embeds a diagram's rendered snapshot only when the
+  // slide's layout has an image area; auto layout picks one for IMAGE chunks
+  // only, so a diagram-only slide drops it with an export warning (QA 20261003
+  // follow-up — guarded by pptx.rs diagram_snapshot_reaches_pptx_only_on_an_image_layout
+  // and slides.test.ts "diagrams on slides").
   const diagramNote =
     diagramCount > 0 ? (
       <div style={{ marginTop: 20, fontSize: 18, color: soft, fontStyle: "italic" }}>
-        {translateWith("{n} diagram(s) in the editor — not yet shown on slides or exported to .pptx.", lang, {
+        {translateWith("{n} diagram(s) in the editor — not drawn on slides in the app. The .pptx export includes them only when the slide uses an image layout.", lang, {
           n: diagramCount,
         })}
       </div>

@@ -14,7 +14,7 @@
 
 <br/>
 
-[![Version](https://img.shields.io/badge/🚀_v1.4.0-Release-0078D4?style=for-the-badge&logoColor=white)](https://github.com/kumeS/NurumayuEditor/releases)
+[![Version](https://img.shields.io/badge/🚀_v1.5.0-Release-0078D4?style=for-the-badge&logoColor=white)](https://github.com/kumeS/NurumayuEditor/releases)
 &nbsp;
 [![License](https://img.shields.io/badge/📜_Artistic--2.0-License-2EA44F?style=for-the-badge)](LICENSE)
 &nbsp;
@@ -75,18 +75,15 @@
 
 <br/>
 
-## 🆕 What's new in v1.4.0
+## 🆕 What's new in v1.5.0
 
-Released 2026-10-02. Full details, **Known Issues** and **Future Release** lists: [release notes (English)](release-notes/v1.4.0.en.md) · [リリースノート（日本語）](release-notes/v1.4.0.md) · [CHANGELOG](CHANGELOG.md).
+Released 2026-10-18 — a fix release for QA run `20261003-computer-use-v1`. Full details, **Known Issues** and **Future Release** lists: [release notes (English)](release-notes/v1.5.0.en.md) · [リリースノート（日本語）](release-notes/v1.5.0.md) · [CHANGELOG](CHANGELOG.md).
 
-- **Find & Replace** — a docked find bar in the paragraph editor and in Markdown source (`⌘F`, `⌥⌘F`, `⌘G` / `⇧⌘G`, `⌘L` Go to Line), with Replace All as one undo step.
-- **OpenRouter model catalog** — browse the current model list in Settings, search it, show free models only, compare prices, and pick text and image models.
-- **Direct PDF export** — Export as PDF opens a save dialog and writes the file; anything left out is counted in the health bar.
-- **Safer tabs** — unsaved changes now offer **Save / Don't Save / Cancel**, the last tab can be closed, and **Save As…** is in the toolbar, the palette and on `⇧⌘S`.
-- **Data integrity** — AI results land only in the document and paragraph they were requested for; switching Markdown / Editor / Slides never rewrites or dirties the Markdown source.
-- **Slides** — bold, links, lists and code blocks render as formatting in the preview, Presentation mode and PPTX; speaker notes work on the title slide; PPTX embeds images stored next to the document.
-- **Keyboard & accessibility** — dialogs close with `Esc` and keep focus inside; undo in text fields undoes the field.
-- **Japanese UI** — the remaining English strings, AI errors and export warnings are translated; Japanese length is counted in characters.
+- **One rule for "unsaved"** — the footer, the tab marker and the changes label agree (two blank-Markdown-tab edge cases are listed as KI-49 and KI-50). Undo or retyping back to the saved state reads **Saved** again, including title edits, Markdown preview edits and speaker notes. A change that only touches the Markdown source is named **Markdown source changed**.
+- **Live speaker notes and slide bullets** — they write to the document as you type, with Undo and the unsaved marker working immediately. One click on a tab's close button asks to save.
+- **Esc closes panels and popovers** — Review, the relationship graph, the changes panel, the status-bar popovers and the Review criteria / Personal library / Citations panels. One Esc closes one panel — the one you are in, else the most recently opened — and if focus was in it, focus goes back to where it was before the panel opened (or to the panel's button).
+- **Find & Replace** — the find bar stays correct after Undo / Redo of a replace. **Go to Line** accepts only line numbers that exist. Clicking **Replace** while typing in the Markdown preview no longer loses the typed text.
+- **Slides** — leaving a presentation selects the slide you ended on. The Edit / Preview tabs are announced correctly by screen readers. Help lists PowerPoint (.pptx) export.
 
 <br/>
 
@@ -135,7 +132,7 @@ Released 2026-10-02. Full details, **Known Issues** and **Future Release** lists
   <img src="img/02.png" alt="The in-app Help guide explaining the recommended writing workflow and API-key setup" width="330" />
 </div>
 
-> **Help is always one click away.** The **Help** button (toolbar or native Help menu) opens a step-by-step guide to the recommended workflow, plus a one-time **API-key setup** walkthrough. The guide is available in **five languages — English, 日本語, 中文, Español, Français** — chosen from the selector beside the title, and it follows your **Default language** in Settings automatically. The footer shows the version and build id (for example _Version 1.4.0 (abc1234)_), so a bug report can name the exact build.
+> **Help is always one click away.** The **Help** button (toolbar or native Help menu) opens a step-by-step guide to the recommended workflow, plus a one-time **API-key setup** walkthrough. The guide is available in **five languages — English, 日本語, 中文, Español, Français** — chosen from the selector beside the title, and it follows your **Default language** in Settings automatically. The footer shows the version and build id (for example _Version 1.5.0 (abc1234)_), so a bug report can name the exact build.
 
 **Before your first AI action**
 
@@ -180,7 +177,7 @@ Released 2026-10-02. Full details, **Known Issues** and **Future Release** lists
 | **Review comments** | Per-paragraph comments in a right-docked panel (add/edit/resolve/delete, persisted in `.aix`). **AI review** writes targeted comments; **Map logic** _(optional)_ uses the relationship graph to surface the model's opinion on possibly-unsupported claims and contradictions — not a verified audit. |
 | **Read aloud** | Read one paragraph, a selection, or the whole document from the cursor (toolbar **Read/Stop**); the voice follows your default output language. macOS `say`-based. |
 | **Command palette** | `⌘/Ctrl+K` — search and run every major action (save as, find & replace, export, analyze, review, read aloud, tabs, slide commands, model catalog, settings…). |
-| **Keyboard & dialogs** | Dialogs close with `Esc` (ignored while a Japanese IME is converting), keep keyboard focus inside until they close, and block the window behind them. `⌘/Ctrl+Z` in a text field such as the title or a dialog input undoes that field, not the document. |
+| **Keyboard & dialogs** | Dialogs close with `Esc` (ignored while a Japanese IME is converting), keep keyboard focus inside until they close, and block the window behind them. Docked panels and status-bar popovers close with `Esc` too, one per press, unless the caret is in a field that uses `Esc` itself (Markdown source, title, dialog, find bar, a field inside the panel). `⌘/Ctrl+Z` in a text field such as the title or a dialog input undoes that field, not the document; in speaker notes and slide bullets it is the document's Undo. |
 | **Health bar** | A persistent status strip: save state, document length (characters for mostly Japanese text, words otherwise — the tooltip shows both), AI freshness, stale-summary count, a model-unavailable chip when needed, and the last export or draft report (kept reviewable, not just a toast). |
 | **Editor font** | Serif / Sans / Mono and 12–28px body size (Settings → Editor font). |
 | **Slides** | Slide mode with 5 layouts (auto or manual, incl. **AI layout** suggestion), multi-image grids (up to 6 per slide, preview = export), placeholder slots, split/merge slides, overflow badges, and PPTX export with a warning report. Slide bodies render Markdown formatting — bold, italics, links, inline code, bullet and numbered lists, code blocks and quotes — the same way in the preview, Presentation mode and PPTX. Speaker notes work on every slide, including the first slide made from the document title, and the slide commands are in the palette in Slides mode. |
@@ -215,9 +212,9 @@ Open with the gear icon or `⌘/Ctrl+,`:
 | `⌘/Ctrl + L` | Go to line (Markdown source) |
 | `⌘/Ctrl + Shift + O` | Open a folder in the files sidebar |
 | `⌘/Ctrl + +` / `−` / `0` | Markdown preview: zoom in / out / reset |
-| `⌘/Ctrl + Z` / `Shift+Z` | Undo / Redo (in a text field, that field's own undo) |
+| `⌘/Ctrl + Z` / `Shift+Z` | Undo / Redo (in a text field such as the title, a dialog or panel field or the find bar, that field's own undo; in speaker notes and slide bullets, the document's Undo; in the Markdown source, the source's own history) |
 | `Tab` / `Esc` | Accept / dismiss a ghost-text suggestion |
-| `Esc` | Close a dialog or the find bar |
+| `Esc` | Close a dialog, the find bar, a docked panel or a status-bar popover |
 | `⌘/Ctrl + ,` | Settings |
 | `⌘/Ctrl + K` | Command palette |
 
@@ -329,8 +326,9 @@ Every update bumps the version (in `package.json`, `src-tauri/tauri.conf.json` a
 
 ## Notes & limitations
 
-- The full **Known Issues** and **Future Release** lists for this version are in the release notes: [English](release-notes/v1.4.0.en.md) · [日本語](release-notes/v1.4.0.md). The most visible ones are below.
+- The full **Known Issues** and **Future Release** lists for this version are in the release notes: [English](release-notes/v1.5.0.en.md) · [日本語](release-notes/v1.5.0.md). The most visible ones are below.
 - Find & Replace is not yet available in Slides, and Go to Line works in Markdown source only.
+- In the Markdown source, `⌘Z` follows the source editor's own history. Right after the document changes elsewhere (Edit → Undo, undoing a replace from the find bar, a Preview edit) it does nothing until you type there — use **Edit → Undo** (KI-44, KI-45 in the release notes).
 - Speaker notes are saved in `.aix` only. A `.pptx` with speaker notes has no notes master, so some versions of PowerPoint may offer to repair it (Keynote opens it without a warning).
 - Images a document points to are read with extension, size (25 MB) and content checks, and symbolic links are refused, but reads are not confined to the document's folder.
 - AI features need an OpenRouter API key (or a local endpoint); image generation also needs an **image-capable** model. Free OpenRouter models share tight rate limits — if you hit 429 repeatedly, switch models, wait a minute, or add credit.

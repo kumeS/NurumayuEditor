@@ -12,21 +12,26 @@
 // this reason (a fixed-position, self-hiding panel keeps this feature's
 // changes confined to its own owned files instead of touching the shared
 // App.tsx docked-panel layout). It owns its own open/closed state via the
-// tiny store below, just like CriteriaPanel's.
+// tiny store below, just like CriteriaPanel's. HealthBar.tsx mounts it once.
 //
-// NOTE for the next integration step: mounting `<PersonalLibraryPanel />`
-// once (e.g. alongside `<CriteriaPanel />` in HealthBar.tsx) is required for
-// this panel to ever be visible — HealthBar.tsx is outside this feature's
-// owned-files list, so that one-line mount is left for whoever next touches
-// HealthBar.tsx (see this task's final report).
+// Esc closes it (review follow-up, QA 20261003): the always-mounted wrapper
+// keeps the panel's state (source list, search query and results, in-flight
+// add/remove) and renders PersonalLibraryPanelFrame only while open — the
+// frame registers usePanelEscape("personal-library") (mount = open; never
+// called conditionally), carries data-docked-panel, and its ✕ shares the
+// hook's closer. Esc inside the search field stays with the field. Wiring
+// guarded in panelEscapeContract.test.ts; real key/focus routing by the manual
+// QA run.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { create } from "zustand";
 import { api } from "../api";
 import { tf, translateWith, useLang, useT } from "../i18n";
 import { useStore } from "../store";
 import type { RagSearchHit, RagSourceInfo } from "../types";
+import { usePanelEscape } from "../usePanelEscape";
+import { closeOtherCornerPanels, registerCornerPanel } from "../cornerPanels";
 import { CloseIcon, FolderIcon, PlusIcon, SpinnerIcon, TrashIcon } from "./icons";
 
 interface PersonalLibraryPanelStore {
@@ -37,12 +42,18 @@ interface PersonalLibraryPanelStore {
 
 /** Standalone panel-visibility store — see the module doc comment above. */
 export const usePersonalLibraryPanelStore = create<PersonalLibraryPanelStore>(
-  (set) => ({
+  (set, get) => ({
     open: false,
-    setOpen: (open) => set({ open }),
-    toggle: () => set((s) => ({ open: !s.open })),
+    // The corner shows one panel at a time (cornerPanels.ts).
+    setOpen: (open) => {
+      if (open) closeOtherCornerPanels("library");
+      set({ open });
+    },
+    toggle: () => get().setOpen(!get().open),
   })
 );
+
+registerCornerPanel("library", () => usePersonalLibraryPanelStore.setState({ open: false }));
 
 /** Imperative helper for callers outside React (CommandPalette, Settings). */
 export function openPersonalLibraryPanel(): void {
@@ -55,6 +66,34 @@ function fileName(path: string): string {
 
 function message(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+}
+
+/** The open panel's root, header and ✕ — mounted only while open (mount = open). */
+function PersonalLibraryPanelFrame({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  const t = useT();
+  const closePanel = usePanelEscape("personal-library", onClose);
+  return (
+    <div
+      data-docked-panel="personal-library"
+      className="fixed bottom-9 right-2 z-40 w-96 rounded-lg border border-chrome-line bg-white p-3 shadow-2xl"
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
+          <FolderIcon className="h-4 w-4" />
+          {t("Personal library")}
+        </div>
+        <button
+          onClick={closePanel}
+          className="text-ink-faint hover:text-ink"
+          aria-label={t("Close personal library panel")}
+          title={t("Close (Esc)")}
+        >
+          <CloseIcon className="h-4 w-4" />
+        </button>
+      </div>
+      {children}
+    </div>
+  );
 }
 
 export default function PersonalLibraryPanel() {
@@ -166,22 +205,7 @@ export default function PersonalLibraryPanel() {
   };
 
   return (
-    <div className="fixed bottom-9 right-2 z-40 w-96 rounded-lg border border-gray-200 bg-white p-3 shadow-2xl">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-          <FolderIcon className="h-4 w-4" />
-          {t("Personal library")}
-        </div>
-        <button
-          onClick={() => setOpen(false)}
-          className="text-ink-faint hover:text-ink"
-          aria-label={t("Close personal library panel")}
-          title={t("Close")}
-        >
-          <CloseIcon className="h-4 w-4" />
-        </button>
-      </div>
-
+    <PersonalLibraryPanelFrame onClose={() => setOpen(false)}>
       <p className="mb-2 text-xs text-ink-faint">
         {t(
           "Add your own past papers/notes so AI actions can optionally ground writing in them — fully on-device (embedding, indexing, and search all run locally; only a one-time embedding-model download touches the network)."
@@ -314,6 +338,6 @@ export default function PersonalLibraryPanel() {
           </div>
         </>
       )}
-    </div>
+    </PersonalLibraryPanelFrame>
   );
 }

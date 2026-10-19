@@ -1,4 +1,7 @@
-// Esc-to-close for the right-docked side panels (BUG-006, QA 20261003).
+// Esc-to-close for docked panels and popovers (BUG-006, QA 20261003): the
+// right-docked Review and graph panels, the changes panel, the status-bar
+// popovers (KI-35) and the Criteria, Personal library and Citations panels
+// (review follow-up, QA 20261003).
 // Decisions are the pure helpers in ./panelEscape.ts; this hook only wires
 // them to the DOM (guarded by panelEscapeContract.test.ts).
 //
@@ -11,6 +14,9 @@
 //   dropdowns); the modal layer's capture listener stops the key before it
 //   gets here. It acts — preventDefault + close — only when
 //   panelEscapeTarget names this panel.
+// - Every compositionend (document, capture phase) is timestamped, so the
+//   decision can ignore WebKit's late Esc that cancels a conversion after the
+//   composition ended (review follow-up, QA 20261003).
 // - The returned closer is THE close path: the panel's ✕ button and Esc both
 //   call it. It reads where focus is before closing (the panel unmounts) and
 //   hands focus back to the opener, else the toolbar toggle
@@ -26,6 +32,7 @@ import {
   panelEscapeTarget,
   panelFocusReturnIndex,
   shouldReturnPanelFocus,
+  unsentFocusAllowed,
   type PanelFocusCandidate,
 } from "./panelEscape";
 import { shortcutTargetKind } from "./shortcuts";
@@ -34,6 +41,8 @@ import { useModalStack } from "./components/Modal";
 
 /** Open docked panels, oldest first (the modal stack helpers are generic). */
 let openPanels: string[] = [];
+/** Date.now() of the last compositionend in the document (isImeKeyEventSince). */
+let lastCompositionEnd = 0;
 
 function captureOpener(): HTMLElement | null {
   if (typeof document === "undefined") return null;
@@ -64,14 +73,25 @@ function returnFocus(opener: HTMLElement | null, name: string) {
 /**
  * Register a docked panel for Esc-to-close. Returns the panel's one closer —
  * use it for the ✕ button too, so both paths behave the same.
+ *
+ * `unsentInput` (optional) returns a field holding text that closing would
+ * drop (e.g. an unsent Review comment). While it returns one, Esc still
+ * claims the key but keeps the panel open and focuses that field instead —
+ * Esc never discards typed text (review follow-up, QA 20261003).
  */
-export function usePanelEscape(name: string, onClose: () => void): () => void {
+export function usePanelEscape(
+  name: string,
+  onClose: () => void,
+  options?: { unsentInput?: () => HTMLElement | null }
+): () => void {
   const onCloseRef = useRef(onClose);
+  const optionsRef = useRef(options);
   // Captured during the first render, i.e. before any child's autoFocus.
   const [opener] = useState(captureOpener);
 
   useLayoutEffect(() => {
     onCloseRef.current = onClose;
+    optionsRef.current = options;
   });
 
   useLayoutEffect(() => {
@@ -93,20 +113,37 @@ export function usePanelEscape(name: string, onClose: () => void): () => void {
   }, [name, opener]);
 
   useEffect(() => {
+    const onCompositionEnd = () => {
+      lastCompositionEnd = Date.now();
+    };
     const onKey = (e: KeyboardEvent) => {
-      const target = panelEscapeTarget(e, {
+      const ctx = {
         panels: openPanels,
         targetPanel: dockedPanelOf(e.target),
         targetKind: shortcutTargetKind(e.target),
         modalOpen: useModalStack.getState().stack.length > 0,
         presenting: useStore.getState().presentationOpen,
-      });
+        lastCompositionEnd,
+        now: Date.now(),
+      };
+      const target = panelEscapeTarget(e, ctx);
       if (target !== name) return;
       e.preventDefault();
+      const unsent = optionsRef.current?.unsentInput?.();
+      if (unsent) {
+        if (unsentFocusAllowed(name, ctx)) unsent.focus();
+        return;
+      }
       close();
     };
+    // Capture phase: a stopPropagation on the way (a portal's isolation)
+    // must not hide the end of a composition.
+    document.addEventListener("compositionend", onCompositionEnd, true);
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("compositionend", onCompositionEnd, true);
+      window.removeEventListener("keydown", onKey);
+    };
   }, [name, close]);
 
   return close;

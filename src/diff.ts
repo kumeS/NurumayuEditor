@@ -140,19 +140,28 @@ export function documentDiff(
  *   of the paragraphs both versions share, or any chunk's `order` or metadata
  *   (notes, comments, links, summaries, confirmed, layout…) differs.
  * - `sourceChanged` (BUG-005, QA 20261003): nothing above differs but the
- *   Markdown text does — frontmatter, blank-line runs, line endings, an H1's
- *   marker style live only in `markdownSource`. Optional so older literals
- *   type-check; absent means false.
+ *   Markdown source does, by more than view switches rewrite. Examples (not
+ *   a complete list, review follow-up C20): frontmatter, blank-line runs,
+ *   trailing spaces, indentation, line endings, heading or fence marker style
+ *   — bytes the chunk parse drops, kept only in `markdownSource`. Optional so
+ *   older literals type-check; absent = false.
  *
  * Contract (one equality notion, CLAUDE.md invariant 3): `hasChanges(summary)`
  * is false exactly when `sameAsSaved(saved, current)` — the predicate the
  * store's dirty flag uses — is true, for any non-null baseline. diff.test.ts
- * and store.test.ts assert it, so the UI can never show 未保存 + 保存時と同じ内容
- * for a clean baseline (only for an unsaved one, MISS-12).
+ * and store.test.ts assert it. The store derives `dirty` from it on every
+ * edit, undo, redo and save, but not on a view switch (BUG-019a), so 未保存 +
+ * 保存時と同じ内容 shows for an unsaved baseline (MISS-12) and, for a saved
+ * one, only after a switch stores a blank tab's "\n" (healthLabels.ts lists
+ * the known cases).
  *
- * Not compared: `mode` (a view switch is view-only, BUG-019a), the raw
- * `markdownSource` beyond the Markdown text it yields (see sourceDiffers),
- * `metadata.contentHistory` and the export-only `metadata.renderedImage`.
+ * Not compared: `mode` (a view switch is view-only, BUG-019a), source
+ * rewrites a view switch alone produces (see viewSwitchSources), and the
+ * export-only `metadata.renderedImage` (set only on fileActions' export
+ * clone; no store action writes it). `metadata.contentHistory` IS compared
+ * (QA 20261003 follow-up): .aix persists it (models.rs content_history), so
+ * an AI version swapped back to the saved text is still unsaved data. An
+ * empty list equals an absent one — Rust never writes an empty list.
  * Unchanged chunks keep their object identity through store edits, so the
  * reference checks make the common case cheap; still memoize the caller.
  */
@@ -168,10 +177,19 @@ export function hasChanges(s: ChangeSummary): boolean {
   return s.paragraphs > 0 || s.titleChanged || s.otherChanged || !!s.sourceChanged;
 }
 
-const IGNORED_METADATA_KEYS = new Set(["contentHistory", "renderedImage"]);
+/**
+ * Chunk-metadata entries that never decide "changed": the export-only
+ * `renderedImage`, and an empty `contentHistory` (Rust's
+ * `skip_serializing_if = "Vec::is_empty"` writes it exactly like an absent
+ * one, while the store writes `[]` on some paths). A non-empty
+ * contentHistory counts (QA 20261003 follow-up).
+ */
+function skipMetadataEntry(key: string, value: unknown): boolean {
+  return key === "renderedImage" || (key === "contentHistory" && Array.isArray(value) && value.length === 0);
+}
 
 /** Structural equality, independent of key order; `undefined` keys are absent. */
-function sameValue(a: unknown, b: unknown, ignore?: Set<string>): boolean {
+function sameValue(a: unknown, b: unknown, skip?: (key: string, value: unknown) => boolean): boolean {
   if (a === b) return true;
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
@@ -181,7 +199,7 @@ function sameValue(a: unknown, b: unknown, ignore?: Set<string>): boolean {
   const ra = a as Record<string, unknown>;
   const rb = b as Record<string, unknown>;
   const keys = (r: Record<string, unknown>) =>
-    Object.keys(r).filter((k) => r[k] !== undefined && !ignore?.has(k));
+    Object.keys(r).filter((k) => r[k] !== undefined && !skip?.(k, r[k]));
   const ka = keys(ra);
   const kb = keys(rb);
   return ka.length === kb.length && ka.every((k) => Object.prototype.hasOwnProperty.call(rb, k) && sameValue(ra[k], rb[k]));
@@ -189,50 +207,85 @@ function sameValue(a: unknown, b: unknown, ignore?: Set<string>): boolean {
 
 /** Everything but the chunks, the title and the view-related fields. */
 function otherFields(doc: Document): Record<string, unknown> {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { chunks: _c, title: _t, mode: _m, markdownSource: _s, ...rest } = doc;
   return rest;
 }
 
-/** A chunk's non-content data matches (order + metadata, minus the ignored keys). */
+/** A chunk's non-content data matches (order + metadata, minus skipMetadataEntry). */
 function sameChunkData(a: Chunk, b: Chunk): boolean {
-  return a.order === b.order && (a.metadata === b.metadata || sameValue(a.metadata, b.metadata, IGNORED_METADATA_KEYS));
-}
-
-// documentToMarkdown per document object: documents are immutable in the
-// store, so the saved baseline is serialized at most once (typing path).
-const markdownCache = new WeakMap<Document, string>();
-function markdownOf(doc: Document): string {
-  let md = markdownCache.get(doc);
-  if (md === undefined) {
-    md = documentToMarkdown(doc);
-    markdownCache.set(doc, md);
-  }
-  return md;
+  return a.order === b.order && (a.metadata === b.metadata || sameValue(a.metadata, b.metadata, skipMetadataEntry));
 }
 
 /**
- * Whether the Markdown text the two documents stand for differs, given that
- * their chunks and titles already match. The text is `documentToMarkdown`:
- * the source verbatim in Markdown mode, else the chunks merged into the
- * baseline (or serialized when there is none), so a missing source equals the
- * derived serialization and a mode switch — which only ever stores that text
- * — never counts. Two whitespace-only texts are the same: an all-blank
- * document has no content, and Editor/Slide mode reads every blank source as
- * the serialized chunks ("" in Markdown mode, "\n" after a switch). Any
- * other byte difference counts, so a frontmatter-only or whitespace-only edit
- * of a non-blank source stays dirty.
+ * The sources a document with these chunks can reach from `source` by view
+ * switches alone: entering Markdown mode stores `documentToMarkdown` of the
+ * Editor/Slide view (setMode), leaving it keeps the source. So the chain is
+ * `source`, then the chunks merged into it (serialized when it is missing or
+ * blank), repeated until it stops changing — the merge is not always a fixed
+ * point on the first pass (an empty slide heading serializes as "#" but
+ * merges as "# "). Bounded at four steps. Pure; `source` undefined is a
+ * document with no Markdown source yet.
+ *
+ * One step is cut (review follow-up C1, QA 20261003): a Markdown-mode doc
+ * whose source is blank does not reach a NON-blank serialization (its
+ * "# <title>\n"). It is written verbatim, so that text is bytes it would only
+ * have after a view switch it has not had — counting it let a select-all
+ * delete on a title-only .md, or "# <stem>⏎" typed into an empty one, read
+ * clean. Kept: the untitled fresh-tab "" ↔ "\n" (the serialization is blank).
+ * Known limit: an empty titled .md switched Editor → Markdown stores that
+ * heading without an edit; it stays clean (setMode never sets dirty) while
+ * the summary reports a source change.
+ */
+export function viewSwitchSources(doc: Document, source: string | undefined): (string | undefined)[] {
+  const out: (string | undefined)[] = [source];
+  const verbatim = (doc.mode ?? "editor") === "markdown";
+  let cur = source;
+  for (let i = 0; i < 4; i += 1) {
+    const next = documentToMarkdown({ ...doc, mode: "editor", markdownSource: cur });
+    if (out.includes(next)) break;
+    if (verbatim && cur !== undefined && !cur.trim() && next.trim()) break;
+    out.push(next);
+    cur = next;
+  }
+  return out;
+}
+
+/**
+ * Whether the two sources differ by more than view switches can explain,
+ * given that chunks and title already match (so either side's chunks stand
+ * for both). A missing source counts as its derived serialization; a mode
+ * switch — which only ever stores that derived text — never counts. Any other
+ * byte difference does: for example a frontmatter-only, blank-line, spacing,
+ * line-ending, or heading/fence marker edit stays dirty.
+ *
+ * Two directions: the saved bytes reach the current ones (the user switched
+ * views since the save), or the current doc reaches the saved bytes (an undo
+ * back to a snapshot from before a switch). The second is skipped when the
+ * current doc is in Markdown mode (review follow-up C1, QA 20261003): its
+ * source is what a save writes, verbatim, so a switch it has not had cannot
+ * excuse its bytes.
  */
 function sourceDiffers(saved: Document, current: Document): boolean {
-  if (
-    saved.markdownSource === current.markdownSource &&
-    (saved.mode === "markdown") === (current.mode === "markdown")
-  ) {
-    return false; // same text read the same way, over matching chunks
+  const a = saved.markdownSource;
+  const b = current.markdownSource;
+  if (a === b) return false; // same bytes: at most the view differs
+  // Each side's own chunks stand in (they match here); cached per document,
+  // so the store's check and the health bar's summary of the same doc — and
+  // every check against the same saved baseline — merge at most once.
+  if (reachOf(saved).includes(b)) return false;
+  if ((current.mode ?? "editor") === "markdown") return true;
+  return !reachOf(current).includes(a);
+}
+
+// Documents are immutable in the store, so a per-object cache stays valid.
+const reachCache = new WeakMap<Document, (string | undefined)[]>();
+function reachOf(doc: Document): (string | undefined)[] {
+  let reach = reachCache.get(doc);
+  if (!reach) {
+    reach = viewSwitchSources(doc, doc.markdownSource);
+    reachCache.set(doc, reach);
   }
-  const a = markdownOf(saved);
-  const b = markdownOf(current);
-  return a !== b && !(a.trim() === "" && b.trim() === "");
+  return reach;
 }
 
 /**
@@ -244,32 +297,23 @@ function sourceDiffers(saved: Document, current: Document): boolean {
  * (e.g. a merge baseline rewritten to the same text), never "same" for
  * different data — a false "same" would let a tab close without the save
  * prompt. A null baseline is never the same. Identity shortcuts first, so the
- * typing path costs a few reference checks; Markdown is serialized only once
- * chunks, title and other fields all match.
+ * typing path costs a few reference/string checks; Markdown is serialized only
+ * once chunks, title and other fields all match AND the raw sources differ.
  */
 export function sameAsSaved(saved: Document | null, current: Document): boolean {
   if (saved === current) return true;
   if (!saved) return false;
   if (saved.title !== current.title) return false;
-  // Both read their source verbatim: a differing source is a change (cheap
-  // early exit for Markdown typing, before comparing re-parsed chunks).
-  if (
-    saved.mode === "markdown" &&
-    current.mode === "markdown" &&
-    saved.markdownSource !== undefined &&
-    current.markdownSource !== undefined &&
-    saved.markdownSource !== current.markdownSource &&
-    !(saved.markdownSource.trim() === "" && current.markdownSource.trim() === "")
-  ) {
-    return false;
-  }
-  if (saved.chunks !== current.chunks) {
-    if (saved.chunks.length !== current.chunks.length) return false;
-    for (let i = 0; i < saved.chunks.length; i += 1) {
-      const a = saved.chunks[i];
-      const b = current.chunks[i];
-      if (a === b) continue;
-      if (a.id !== b.id || a.content !== b.content || !sameChunkData(a, b)) return false;
+  const sc = saved.chunks;
+  const cc = current.chunks;
+  if (sc !== cc) {
+    if (sc.length !== cc.length) return false;
+    // Ids and text first (a typed character fails here), metadata after.
+    for (let i = 0; i < sc.length; i += 1) {
+      if (sc[i] !== cc[i] && (sc[i].id !== cc[i].id || sc[i].content !== cc[i].content)) return false;
+    }
+    for (let i = 0; i < sc.length; i += 1) {
+      if (sc[i] !== cc[i] && !sameChunkData(sc[i], cc[i])) return false;
     }
   }
   if (!sameValue(otherFields(saved), otherFields(current))) return false;

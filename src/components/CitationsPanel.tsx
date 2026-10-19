@@ -19,15 +19,17 @@
 // Mount point: opened via the command palette (and rendered unconditionally,
 // self-hiding, from HealthBar.tsx — the SAME pattern PersonalLibraryPanel.tsx
 // and CriteriaPanel.tsx already use for exactly this reason). It owns its own
-// open/closed state via the tiny store below.
+// open/closed state via the tiny store below. HealthBar.tsx mounts it once.
 //
-// NOTE for the next integration step: mounting `<CitationsPanel />` once
-// (e.g. alongside `<PersonalLibraryPanel />` in HealthBar.tsx) is required
-// for this panel to ever be visible — HealthBar.tsx is outside this
-// feature's owned-files list, so that one-line mount is left for whoever
-// next touches HealthBar.tsx.
+// Esc closes it (review follow-up, QA 20261003): the always-mounted wrapper
+// keeps the panel's state (tab, style, this session's cited entries, lookup
+// query and result) and renders CitationsPanelFrame only while open — the
+// frame registers usePanelEscape("citations") (mount = open; never called
+// conditionally), carries data-docked-panel, and its ✕ shares the hook's
+// closer. Esc inside the lookup field stays with the field. Wiring guarded in
+// panelEscapeContract.test.ts; real key/focus routing by the manual QA run.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { create } from "zustand";
 import { api } from "../api";
@@ -39,6 +41,8 @@ import type {
   CitationLookupResult,
   CitationStyleName,
 } from "../types";
+import { usePanelEscape } from "../usePanelEscape";
+import { closeOtherCornerPanels, registerCornerPanel } from "../cornerPanels";
 import {
   CloseIcon,
   FileIcon,
@@ -55,11 +59,17 @@ interface CitationsPanelStore {
 }
 
 /** Standalone panel-visibility store — see the module doc comment above. */
-export const useCitationsPanelStore = create<CitationsPanelStore>((set) => ({
+export const useCitationsPanelStore = create<CitationsPanelStore>((set, get) => ({
   open: false,
-  setOpen: (open) => set({ open }),
-  toggle: () => set((s) => ({ open: !s.open })),
+  // The corner shows one panel at a time (cornerPanels.ts).
+  setOpen: (open) => {
+    if (open) closeOtherCornerPanels("citations");
+    set({ open });
+  },
+  toggle: () => get().setOpen(!get().open),
 }));
+
+registerCornerPanel("citations", () => useCitationsPanelStore.setState({ open: false }));
 
 /** Imperative helper for callers outside React (CommandPalette). */
 export function openCitationsPanel(): void {
@@ -107,6 +117,34 @@ function insertAtCursor(citationText: string): boolean {
 }
 
 type Tab = "library" | "lookup";
+
+/** The open panel's root, header and ✕ — mounted only while open (mount = open). */
+function CitationsPanelFrame({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  const t = useT();
+  const closePanel = usePanelEscape("citations", onClose);
+  return (
+    <div
+      data-docked-panel="citations"
+      className="fixed bottom-9 right-2 z-40 w-[26rem] rounded-lg border border-chrome-line bg-white p-3 shadow-2xl"
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
+          <FileIcon className="h-4 w-4" />
+          {t("Citations")}
+        </div>
+        <button
+          onClick={closePanel}
+          className="text-ink-faint hover:text-ink"
+          aria-label={t("Close citations panel")}
+          title={t("Close (Esc)")}
+        >
+          <CloseIcon className="h-4 w-4" />
+        </button>
+      </div>
+      {children}
+    </div>
+  );
+}
 
 export default function CitationsPanel() {
   const t = useT();
@@ -296,22 +334,7 @@ export default function CitationsPanel() {
   };
 
   return (
-    <div className="fixed bottom-9 right-2 z-40 w-[26rem] rounded-lg border border-gray-200 bg-white p-3 shadow-2xl">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-          <FileIcon className="h-4 w-4" />
-          {t("Citations")}
-        </div>
-        <button
-          onClick={() => setOpen(false)}
-          className="text-ink-faint hover:text-ink"
-          aria-label={t("Close citations panel")}
-          title={t("Close")}
-        >
-          <CloseIcon className="h-4 w-4" />
-        </button>
-      </div>
-
+    <CitationsPanelFrame onClose={() => setOpen(false)}>
       <p className="mb-2 text-xs text-ink-faint">
         {t(
           "Import your own BibTeX library (from Zotero or any reference manager), or look up a DOI/arXiv id — this is not a literature search engine, it only formats references you already have. Supported styles: APA (7th ed.) and IEEE."
@@ -546,6 +569,6 @@ export default function CitationsPanel() {
           )}
         </>
       )}
-    </div>
+    </CitationsPanelFrame>
   );
 }

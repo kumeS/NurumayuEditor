@@ -13,6 +13,7 @@ import {
   applyChanges,
   chunkSearchText,
   freshReplaceReport,
+  isNoOpChange,
   parseLineNumber,
 } from "./findReplace";
 import type { Chunk, ChunkType } from "./types";
@@ -126,6 +127,31 @@ describe("replaceAll / replacementChanges", () => {
   it("replaces CJK text and honours whole word / case", () => {
     expect(replaceAll("猫と猫", "猫", "犬", opts)).toEqual({ output: "犬と犬", count: 2 });
     expect(replaceAll("concat cat Cat", "cat", "dog", word)).toEqual({ output: "concat dog Cat", count: 1 });
+  });
+
+  // C12 (review follow-up, QA 20261003). Fails if a match that already reads
+  // the replacement becomes a change again: CodeMirror then reports a doc
+  // change, the store sees identical text (no undo step), yet the bar said
+  // "Replaced 2." and ⌘Z in it undid an unrelated earlier edit.
+  it("drops matches that already read the replacement (an all-identity replace is no change)", () => {
+    const text = "GitHub で管理、GitHub へ push";
+    expect(findMatches(text, "github", opts)).toHaveLength(2);
+    expect(replacementChanges(text, "github", "GitHub", opts)).toEqual([]);
+    expect(replaceAll(text, "github", "GitHub", opts)).toEqual({ output: text, count: 0 });
+    // Mixed: only the match that differs is a change (and is what gets counted).
+    const mixed = "github と GitHub";
+    expect(replacementChanges(mixed, "github", "GitHub", opts)).toEqual([{ from: 0, to: 6, insert: "GitHub" }]);
+    expect(replaceAll(mixed, "github", "GitHub", opts)).toEqual({ output: "GitHub と GitHub", count: 1 });
+    // A case change IS a change; CJK identity is not.
+    expect(replaceAll("Cat", "cat", "cat", opts)).toEqual({ output: "cat", count: 1 });
+    expect(replaceAll("猫と猫", "猫", "猫", opts)).toEqual({ output: "猫と猫", count: 0 });
+  });
+
+  it("isNoOpChange: a change whose insert equals the span it replaces", () => {
+    expect(isNoOpChange("猫と犬", { from: 0, to: 1, insert: "猫" })).toBe(true);
+    expect(isNoOpChange("猫と犬", { from: 0, to: 1, insert: "犬" })).toBe(false);
+    expect(isNoOpChange("abc", { from: 1, to: 1, insert: "" })).toBe(true);
+    expect(isNoOpChange("abc", { from: 1, to: 1, insert: "x" })).toBe(false);
   });
 
   it("the change list applied to the text equals replaceAll (one implementation for CodeMirror and the store)", () => {
@@ -295,12 +321,33 @@ describe("BUG-002 (QA 20261003) — a Replace All report is shown only for the t
   // kept saying "3 件を置換しました" over a document with 3 matches again.
   it("replace → undo makes the report stale; redo does not revive a cleared report", () => {
     const after = "犬 犬\n犬";
-    const report = { count: 3, text: after };
-    expect(freshReplaceReport(report, after)).toBe(report); // right after Replace All
-    expect(freshReplaceReport(report, "猫 猫\n猫")).toBeNull(); // after undo
-    expect(freshReplaceReport(report, "犬 犬\n犬!")).toBeNull(); // after typing
+    const report = { count: 3, text: after, ...opts };
+    expect(freshReplaceReport(report, after, opts)).toBe(report); // right after Replace All
+    expect(freshReplaceReport(report, "猫 猫\n猫", opts)).toBeNull(); // after undo
+    expect(freshReplaceReport(report, "犬 犬\n犬!", opts)).toBeNull(); // after typing
     // The bar stores the null (one-shot), so a later redo back to `after` shows matches, not "Replaced".
-    expect(freshReplaceReport(null, after)).toBeNull();
+    expect(freshReplaceReport(null, after, opts)).toBeNull();
+  });
+
+  // C13 (review follow-up, QA 20261003). Fails if freshReplaceReport stops
+  // comparing either option: toggling Match case off after "a A" → "A A"
+  // kept "Replaced 1." while 2 live matches enabled ↑ ↓ / Replace.
+  it("flipping Match case or Whole word makes the report stale (same text)", () => {
+    const r = replaceAll("a A", "a", "A", exact);
+    expect(r).toEqual({ output: "A A", count: 1 });
+    const report = { count: r.count, text: r.output, ...exact };
+    expect(freshReplaceReport(report, "A A", exact)).toBe(report);
+    const caseOff = { ...exact, caseSensitive: false };
+    expect(findMatches("A A", "a", caseOff)).toHaveLength(2); // what the bar shows instead
+    expect(freshReplaceReport(report, "A A", caseOff)).toBeNull();
+    // Whole word: "cat catalog" → "dog catalog"; turning it off finds "catalog".
+    const w = replaceAll("cat catalog", "cat", "dog", word);
+    const wordReport = { count: w.count, text: w.output, ...word };
+    expect(freshReplaceReport(wordReport, "dog catalog", word)).toBe(wordReport);
+    expect(freshReplaceReport(wordReport, "dog catalog", { ...word, wholeWord: false })).toBeNull();
+    // 猫 (CJK): the same rule, whatever the script.
+    const cjk = { count: 2, text: "犬と犬", ...opts };
+    expect(freshReplaceReport(cjk, "犬と犬", { ...opts, wholeWord: true })).toBeNull();
   });
 });
 

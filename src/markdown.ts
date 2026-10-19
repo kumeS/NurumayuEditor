@@ -20,7 +20,9 @@
  *   never a chunk. The prefix is kept verbatim unless the title changes, and
  *   then only the H1 line changes. A source without an H1 never gains one
  *   in the merge; `withMarkdownTitle` (called from setTitle) is the only
- *   place a title line is inserted.
+ *   place a title line is inserted. It is not byte-reversible (canonical
+ *   `# title`, a cleared H1 drops its blank lines), so setTitle restores the
+ *   source from the start of a run of title edits when the title is set back.
  *
  * Known limits:
  * - Headings #### to ###### are projected as level-3 heading chunks (the

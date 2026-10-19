@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { changeSummary, documentDiff, hasChanges, sameAsSaved } from "./diff";
 import { documentToMarkdown, eolOf, markdownToDocument, normalizeEol, restoreEol } from "./markdown";
 import { draftToMarkdown } from "./previewEditing";
-import { groupSlides, hasLayoutOverride, resolveLayout, slideLead, slideNotes } from "./slides";
+import { changesLabel } from "./healthLabels";
+import { groupSlides, hasLayoutOverride, resolveLayout, slideBodyFieldValue, slideLead, slideNotes } from "./slides";
+import { currentSlideIndex } from "./slideCommands";
 import {
   AI_OP_LOG_MAX,
   FIND_INITIAL,
@@ -944,6 +946,61 @@ describe("item 1-3 — presentation mode", () => {
       st().newTab();
       expect(st().presentationOpen).toBe(true);
     });
+
+    // BUG-009 (QA 20261003): Esc on slide 2 left the Slides editor on slide 1
+    // and the next Present started on slide 1. PresentationMode passes the
+    // exit slide's lead chunk (presentationExitFocus); the store focuses it.
+    describe("BUG-009 (QA 20261003) — exiting selects the slide that was on screen", () => {
+      const deck = () => [
+        chunk("h1", "heading", "はじめに"),
+        chunk("p1", "text", "背景"),
+        chunk("h2", "heading", "結果"),
+        chunk("p2", "text", "観察"),
+      ];
+
+      // Fails if closePresentation ignores the exit slide (the bug: focus
+      // stays on slide 1, so the rail and the next Present stay there too).
+      it("focuses the given lead chunk: the editor and the next Present are on that slide", () => {
+        reset(deck());
+        st().setFocused("h1");
+        st().openPresentation();
+        st().closePresentation("h2");
+        expect(st().presentationOpen).toBe(false);
+        expect(st().focusedChunkId).toBe("h2");
+        const slides = groupSlides(st().doc.chunks);
+        expect(slides[currentSlideIndex(slides, st().focusedChunkId, "h1")].items[0].id).toBe("h2");
+      });
+
+      // Fails if the exit is recorded as an edit (undo step / dirty mark).
+      it("is a selection change only: no undo step, not dirty, the document untouched", () => {
+        reset(deck());
+        st().openPresentation();
+        const before = { doc: st().doc, past: st().past.length, future: st().future.length };
+        st().closePresentation("h2");
+        expect(st().doc).toBe(before.doc);
+        expect(st().past.length).toBe(before.past);
+        expect(st().future.length).toBe(before.future);
+        expect(st().dirty).toBe(false);
+      });
+
+      // Fails if an exit target is applied without checking it still exists
+      // (the deck changed while presenting) — focus would point at nothing.
+      it("no target, or one no longer in the document: just closes, focus kept", () => {
+        reset(deck());
+        st().setFocused("p1");
+        st().openPresentation();
+        st().closePresentation();
+        expect(st().presentationOpen).toBe(false);
+        expect(st().focusedChunkId).toBe("p1");
+        st().openPresentation();
+        st().closePresentation(null);
+        expect(st().focusedChunkId).toBe("p1");
+        st().openPresentation();
+        st().closePresentation("gone");
+        expect(st().presentationOpen).toBe(false);
+        expect(st().focusedChunkId).toBe("p1");
+      });
+    });
   });
 });
 
@@ -1084,8 +1141,9 @@ describe("item 1-2 — savedDoc baseline lifecycle", () => {
 
   it("does not touch ChunkMetadata.contentHistory — an unrelated, independent mechanism", () => {
     // contentHistory is the per-chunk AI-version-swap history (replaceChunkContent
-    // / selectChunkVersion); the diff-since-last-save feature must never read or
-    // write it — the two mechanisms are independent by design.
+    // / selectChunkVersion); saving must never write it. (The dirty check DOES
+    // read it since QA 20261003 follow-up — .aix persists it; see the
+    // "contentHistory is unsaved data" block below.)
     reset([chunk("a", "text", "hello")]);
     st().replaceChunkContent("a", "hello, ai-edited");
     const histAfterAiEdit = st().doc.chunks[0].metadata.contentHistory;
@@ -1687,6 +1745,29 @@ describe("MISS-12 — undo/redo recompute dirty against the saved baseline", () 
     expect(st().dirty).toBe(false);
   });
 
+  // Review follow-up C4 (QA 20261003): the save paths call endEditSession in
+  // the same tick they capture the document to write, so a keystroke during
+  // the async write opens a NEW undo step whose snapshot is exactly what was
+  // written. Fails if endEditSession leaves the session open (the next
+  // keystroke would coalesce: no new step) or touches the document state.
+  it("endEditSession ends the typing session and changes nothing else", () => {
+    reset([chunk("a", "text", "本文")]);
+    st().updateChunkContent("a", "本文。");
+    st().updateChunkContent("a", "本文。追記");
+    expect(st().past).toHaveLength(1); // one coalesced session
+    const before = { doc: st().doc, past: st().past, future: st().future, dirty: st().dirty, savedDoc: st().savedDoc };
+    st().endEditSession();
+    expect(st().lastEditChunkId).toBeNull();
+    expect(st().doc).toBe(before.doc);
+    expect(st().past).toBe(before.past);
+    expect(st().future).toBe(before.future);
+    expect(st().dirty).toBe(before.dirty);
+    expect(st().savedDoc).toBe(before.savedDoc);
+    st().updateChunkContent("a", "本文。追記2");
+    expect(st().past).toHaveLength(2);
+    expect(st().past[1]).toBe(before.doc);
+  });
+
   it("a structurally identical (but not identical-object) restored doc is clean", () => {
     reset([chunk("a", "text", "hello")]);
     st().updateChunkContent("a", "hello!");
@@ -1799,6 +1880,24 @@ describe("BUG-005b — commitDraftToTab routes a finished draft to its owning ta
     reset([chunk("a", "text", "")]);
     st().setStreamingDocument(doc([chunk("draft-0", "text", "partial")]));
     expect(st().dirty).toBe(true);
+  });
+});
+
+// Review follow-up (QA 20261003): Analyze records its own undo step, so it
+// must also END the typing session — otherwise keystrokes typed after a
+// background Analyze coalesce into it, and one ⌘Z drops both the typing and
+// the analysis. Fails if applyAnalysis stops clearing lastEditChunkId.
+describe("applyAnalysis ends the typing session", () => {
+  it("typing after Analyze is its own undo step; ⌘Z keeps the analysis", () => {
+    reset([chunk("a", "text", "A"), chunk("b", "text", "B")]);
+    st().updateChunkContent("a", "A1");
+    st().applyAnalysis({ nodes: [node("a"), node("b")], edges: [] });
+    const depth = st().past.length;
+    st().updateChunkContent("a", "A12"); // same chunk, well within UNDO_IDLE_MS
+    expect(st().past.length).toBe(depth + 1);
+    st().undo();
+    expect(st().doc.chunks[0].content).toBe("A1");
+    expect(st().doc.analysis?.nodes.map((n) => n.id)).toEqual(["a", "b"]);
   });
 });
 
@@ -2240,6 +2339,164 @@ describe("QA 20261003 — dirty agrees with the change summary", () => {
       expect(changeSummary(st().savedDoc, st().doc).sourceChanged).toBe(true);
       expectConsistent();
     });
+
+    // Review follow-up: the restore used to infer "only title edits happened"
+    // from the bytes, so source edits a clear+retype could also produce were
+    // silently reverted and the tab read clean (no save prompt). The restore
+    // is now anchored to the run of title edits itself: each case below keeps
+    // the user's source edit and stays dirty. Fails if setTitle goes back to
+    // matching the saved bytes instead of the source at the start of the run.
+    const SOURCE_EDITS: [string, string, string][] = [
+      ["a blank line added under the H1 (0 → 1)", "# T\nBody\n", "# T\n\nBody\n"],
+      ["a whitespace-only gap line emptied", "# T\n  \nBody\n", "# T\n\nBody\n"],
+      ["the closing # run removed", "# T #\n\nBody\n", "# T\n\nBody\n"],
+      ["the frontmatter → H1 gap removed", "---\nk: v\n---\n\n\n# T\n\nBody\n", "---\nk: v\n---\n# T\n\nBody\n"],
+      ["an H1 equal to the stem typed into a file without one", "Body\n", "# stem\n\nBody\n"],
+    ];
+
+    it.each(SOURCE_EDITS)("keeps a user's own source edit through a title round trip: %s", (_n, saved, edited) => {
+      openMd(saved);
+      st().setMarkdownSource(edited);
+      expect(st().dirty).toBe(true);
+      st().setMode("editor");
+      const title = st().doc.title;
+      for (const v of [`${title}x`, title]) st().setTitle(v);
+      expect(st().doc.markdownSource).toBe(edited);
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+      // …and through a clear-and-retype of the title.
+      for (const v of ["", title.slice(0, 1), title]) st().setTitle(v);
+      expect(st().doc.markdownSource).toBe(edited);
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    it("an H1 typed into a file without one, then retitled to the stem, stays an edit (no silent deletion)", () => {
+      openMd("Body\n");
+      st().setMarkdownSource("# Hello\n\nBody\n");
+      st().setMode("editor");
+      expect(st().doc.title).toBe("Hello");
+      st().setTitle("stem");
+      expect(st().doc.markdownSource).toBe("# stem\n\nBody\n");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    // Review follow-up (C20): deleting the H1 line in the source keeps the
+    // in-memory title (markdownToDocument falls back to it), so the change is
+    // source-only — which is why the changes panel names "the title line" among
+    // its examples and never claims the title text is unchanged. Fails if a
+    // dropped H1 stops counting as a change.
+    it("deleting the H1 line in the source is a source-only change, and dirty", () => {
+      openMd("# 研究会メモ\n\n本文\n");
+      st().setMarkdownSource("本文\n");
+      expect(st().dirty).toBe(true);
+      expect(changeSummary(st().savedDoc, st().doc)).toMatchObject({ paragraphs: 0, titleChanged: false, sourceChanged: true });
+      expectConsistent();
+    });
+
+    it("a run of title edits ends at any other write: a body edit in between is never rolled back", () => {
+      const S = "# 見出し\n\n本文です。\n";
+      openMd(S);
+      st().setMode("editor");
+      st().setTitle("見出しX");
+      const body = st().doc.chunks.find((c) => c.content === "本文です。");
+      expect(body).toBeDefined();
+      st().updateChunkContent(body!.id, "本文を直した。");
+      st().setTitle("見出し");
+      expect(st().doc.chunks.some((c) => c.content === "本文を直した。")).toBe(true);
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    // The run continues only while the live doc IS the object the last
+    // setTitle produced. Here the edit in between is source-only (frontmatter
+    // added in the Markdown view): same doc id, same title, same chunks — only
+    // the object differs. Fails if the continuation is keyed on anything but
+    // doc identity (doc id, title, chunks): the run's start source would come
+    // back and silently drop the frontmatter.
+    it("a run of title edits ends at a source-only write: frontmatter added in between survives the revert", () => {
+      openMd("#  見出し  ##\n\n\n本文です。\n");
+      st().setMode("editor");
+      st().setTitle("見出しX");
+      st().setMode("markdown");
+      st().setMarkdownSource(`---\nk: v\n---\n${st().doc.markdownSource}`);
+      st().setMode("editor");
+      expect(st().doc.title).toBe("見出しX");
+      st().setTitle("見出し");
+      expect(st().doc.markdownSource!.startsWith("---\nk: v\n---\n")).toBe(true);
+      expect(documentToMarkdown(st().doc)).toContain("k: v");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    // The run follows the doc OBJECT (store.ts titleRun comment), not the tab
+    // or the history position: Documents are immutable, so landing back on
+    // the object the last title edit produced is landing back in the run.
+    // Without the run, the revert canonicalises the H1 ("# 見出し") and the
+    // tab reads dirty. Fails if switchTab/newTab or undo ends the run.
+    const RUN_S = "#  見出し  ##\n\n\n本文です。\n";
+    it("switching to another tab and back resumes the run: the revert restores the bytes, clean", () => {
+      openMd(RUN_S);
+      st().setMode("editor");
+      st().setTitle("見出しX");
+      st().newTab("editor");
+      st().switchTab("tab-1");
+      st().setTitle("見出し");
+      expect(st().doc.markdownSource).toBe(RUN_S);
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it("undo back onto the doc the last title edit produced resumes the run", () => {
+      openMd(RUN_S);
+      st().setMode("editor");
+      st().setTitle("見出しX");
+      const afterTitle = st().doc;
+      const body = st().doc.chunks.find((c) => c.content === "本文です。");
+      st().updateChunkContent(body!.id, "本文を直した。");
+      st().undo();
+      expect(st().doc).toBe(afterTitle);
+      st().setTitle("見出し");
+      expect(st().doc.markdownSource).toBe(RUN_S);
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+    });
+
+    it("redo back onto the doc the last title edit produced resumes the run", () => {
+      openMd(RUN_S);
+      st().setMode("editor");
+      const body = st().doc.chunks.find((c) => c.content === "本文です。");
+      st().updateChunkContent(body!.id, "本文を直した。");
+      const sourceBeforeRun = st().doc.markdownSource;
+      st().setTitle("見出しX");
+      const afterTitle = st().doc;
+      st().undo(); // back before the body edit; the title doc goes to `future`
+      st().redo();
+      expect(st().doc).toBe(afterTitle);
+      st().setTitle("見出し");
+      expect(st().doc.markdownSource).toBe(sourceBeforeRun);
+      expect(st().doc.chunks.some((c) => c.content === "本文を直した。")).toBe(true);
+      expect(st().dirty).toBe(true); // the body edit is still unsaved
+      expectConsistent();
+    });
+
+    // Known limit (store.ts titleRun comment): the run is global, so a title
+    // edit in ANOTHER tab ends this tab's run. Conservative: the revert keeps
+    // the canonical H1 and stays dirty — nothing is lost. Fails if the run
+    // becomes per-tab (then update the comment with it).
+    it("known limit: a title edit in another tab ends the run (the revert stays dirty)", () => {
+      openMd(RUN_S);
+      st().setMode("editor");
+      st().setTitle("見出しX");
+      st().newTab("editor");
+      st().setTitle("別");
+      st().switchTab("tab-1");
+      st().setTitle("見出し");
+      expect(st().doc.markdownSource).toBe("# 見出し\n\n\n本文です。\n");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
   });
 
   describe("BUG-005 — undo after a Markdown-mode edit lands on clean", () => {
@@ -2356,6 +2613,118 @@ describe("QA 20261003 — dirty agrees with the change summary", () => {
         expectConsistent();
       }
     });
+  });
+
+  // Review follow-up C1 (QA 20261003): a Markdown-mode buffer is written
+  // verbatim, so the serialization a view switch WOULD store never excuses
+  // its bytes. Before the fix, a blank source reached "# <title>\n" through
+  // that step, so these edits read clean (no close prompt, edit lost) or
+  // "Unsaved (matches last save)" against a saved baseline.
+  describe("C1 — a blank Markdown source is compared verbatim (review follow-up)", () => {
+    it("select-all delete on a title-only .md is dirty and named (the deletion is not lost on close)", () => {
+      openMd("# Meeting notes\n");
+      expect(st().doc.mode).toBe("markdown");
+      st().setMarkdownSource("");
+      expect(st().doc.title).toBe("Meeting notes");
+      expect(st().dirty).toBe(true);
+      expect(changeSummary(st().savedDoc, st().doc)).toEqual({
+        paragraphs: 0,
+        titleChanged: false,
+        otherChanged: false,
+        sourceChanged: true,
+      });
+      expectConsistent();
+    });
+
+    it("\"# <stem>⏎\" typed into an empty .md stays dirty", () => {
+      openMd("");
+      expect(st().doc.title).toBe("stem");
+      st().setMarkdownSource("# stem");
+      expect(st().dirty).toBe(true);
+      st().setMarkdownSource("# stem\n");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+    });
+
+    it("Enter, Enter → Editor → Markdown on an empty .md never reads 'Unsaved (matches last save)'", () => {
+      openMd("");
+      st().setMarkdownSource("\n");
+      st().setMarkdownSource("\n\n");
+      st().setMode("editor");
+      st().setMode("markdown");
+      // The switch stores the serialization; the buffer differs from disk ("").
+      expect(st().doc.markdownSource).toBe("# stem\n");
+      expect(st().dirty).toBe(true);
+      expect(changesLabel(changeSummary(st().savedDoc, st().doc), st().dirty, "en")).toBe("Markdown source changed");
+      expectConsistent();
+    });
+
+    // Known limit of the fix (diff.ts viewSwitchSources): Editor → Markdown on
+    // an empty titled .md stores "# stem\n" with no edit. That pair is the
+    // same one "# stem⏎" typed by hand gives, so the predicate calls it a
+    // source change; setMode never sets dirty (BUG-019a), so the tab stays
+    // clean — nothing typed is at stake — while the label names the change.
+    // Fails if a view switch starts dirtying the tab, or if the summary stops
+    // naming the stored heading (the typed case above would then read clean).
+    it("known limit: a view round trip on an empty titled .md stays clean, the label names the stored heading", () => {
+      openMd("");
+      st().setMode("editor");
+      expect(st().dirty).toBe(false);
+      expectConsistent();
+      st().setMode("markdown");
+      expect(st().doc.markdownSource).toBe("# stem\n");
+      expect(st().dirty).toBe(false);
+      const summary = changeSummary(st().savedDoc, st().doc);
+      expect(summary).toEqual({ paragraphs: 0, titleChanged: false, otherChanged: false, sourceChanged: true });
+      expect(changesLabel(summary, st().dirty, "en")).toBe("Markdown source changed");
+    });
+
+    // The one saved-baseline case where the health bar can still pair 未保存
+    // with 保存時と同じ内容 (healthLabels.ts names it): an UNTITLED blank
+    // Markdown tab, whitespace typed, then a view round trip stores "\n" —
+    // equivalent to the saved "" (the fresh-tab rule), while dirty (set by
+    // the typing, byte-correct: "\n" is not "") stays. Fails if the fresh-tab
+    // "" ↔ "\n" rule is dropped (the label would read "Markdown source
+    // changed") or if the blank-source cut stops at untitled docs too.
+    it("an untitled blank Markdown tab: whitespace + a view round trip reads 'Unsaved (matches last save)'", () => {
+      blankTab("markdown");
+      expect(st().doc.title).toBe("");
+      st().setMarkdownSource("  ");
+      expect(st().dirty).toBe(true);
+      expectConsistent();
+      st().setMode("editor");
+      st().setMode("markdown");
+      expect(st().doc.markdownSource).toBe("\n");
+      expect(st().dirty).toBe(true);
+      expect(sameAsSaved(st().savedDoc, st().doc)).toBe(true);
+      expect(changesLabel(changeSummary(st().savedDoc, st().doc), st().dirty, "en")).toBe("Unsaved (matches last save)");
+    });
+  });
+
+  // Review follow-up C18 (QA 20261003): the CURRENT side reaching the saved
+  // bytes. An undo after a save lands on a Slides-view snapshot whose source
+  // a view switch merges into exactly the saved text. Fails with sourceDiffers
+  // reduced to `!reachOf(saved).includes(b)` (false dirty, "Markdown source
+  // changed" with nothing changed).
+  it("C18 — Slides → Markdown → edit + erase → Markdown → save → undo is clean", () => {
+    blankTab("slide");
+    st().setMode("markdown");
+    const src1 = st().doc.markdownSource;
+    st().setMode("slide");
+    const lead = st().doc.chunks[0].id;
+    st().updateChunkContent(lead, "x");
+    st().updateChunkContent(lead, "");
+    st().setMode("markdown");
+    const src2 = st().doc.markdownSource;
+    // The two switches stored different bytes for the same empty heading.
+    expect(src2).not.toBe(src1);
+    st().markClean("/x.md", st().doc);
+    expect(st().dirty).toBe(false);
+    st().undo();
+    expect(st().doc.markdownSource).toBe(src1);
+    expect(st().doc.mode).toBe("slide");
+    expect(st().dirty).toBe(false);
+    expectConsistent();
   });
 
   describe("BUG-007 — speaker notes are live document edits", () => {
@@ -2492,5 +2861,251 @@ describe("QA 20261003 — dirty agrees with the change summary", () => {
       step();
       expectConsistent();
     }
+  });
+});
+
+// QA 20261003 follow-up (data safety): .aix persists contentHistory
+// (models.rs content_history), so a tab whose only difference from the saved
+// file is a new AI version must stay dirty — round 1 ignored it, and an AI
+// rewrite swapped back to the saved text read clean and closed without the
+// save prompt, losing that version.
+describe("QA 20261003 follow-up — contentHistory is unsaved data", () => {
+  const expectConsistent = () => {
+    expect(st().savedDocIsClean).toBe(true);
+    expect(st().dirty).toBe(hasChanges(changeSummary(st().savedDoc, st().doc)));
+    expect(st().dirty).toBe(!sameAsSaved(st().savedDoc, st().doc));
+  };
+  const SAVED = "保存済みの段落です。";
+
+  it("AI rewrite → swap back to the saved text stays dirty (an 'other' change); undo past the rewrite is clean", () => {
+    reset([chunk("a", "text", SAVED)]);
+    expect(st().dirty).toBe(false);
+    st().replaceChunkContent("a", "AIが書き換えた段落です。");
+    expect(st().dirty).toBe(true);
+    expectConsistent();
+    // Swap back: the text equals the saved one, but the AI version now lives
+    // in contentHistory — which the .aix would persist.
+    st().selectChunkVersion("a", SAVED);
+    expect(st().doc.chunks[0].content).toBe(SAVED);
+    expect(st().doc.chunks[0].metadata.contentHistory).toEqual([SAVED, "AIが書き換えた段落です。"]);
+    expect(st().dirty).toBe(true);
+    expect(changeSummary(st().savedDoc, st().doc)).toEqual({
+      paragraphs: 0,
+      titleChanged: false,
+      otherChanged: true,
+      sourceChanged: false,
+    });
+    expectConsistent();
+    st().undo(); // back to the AI text
+    expect(st().dirty).toBe(true);
+    expectConsistent();
+    st().undo(); // back past the rewrite: the opened document
+    expect(st().doc.chunks[0].metadata.contentHistory).toBeUndefined();
+    expect(st().dirty).toBe(false);
+    expectConsistent();
+  });
+
+  it("after saving the swapped-back doc, swapping to the AI version and back is clean (swaps don't append duplicate versions)", () => {
+    reset([chunk("a", "text", SAVED)]);
+    st().replaceChunkContent("a", "AI版");
+    st().selectChunkVersion("a", SAVED);
+    st().markClean("/d.aix");
+    expect(st().dirty).toBe(false);
+    expectConsistent();
+    st().selectChunkVersion("a", "AI版"); // the AI version again (history unchanged: it already holds SAVED)
+    expect(st().dirty).toBe(true);
+    st().selectChunkVersion("a", SAVED); // text back; history unchanged → same as saved
+    // Fails if a swap appended a version already in the history.
+    expect(st().doc.chunks[0].metadata.contentHistory).toEqual([SAVED, "AI版"]);
+    expect(st().dirty).toBe(false);
+    expectConsistent();
+  });
+
+  it("an AI fill of an EMPTY paragraph, typed back to empty, is clean ([] history = no history)", () => {
+    // replaceChunkContent records `contentHistory: []` when the old text is
+    // blank; Rust writes [] exactly like an absent list, so nothing unsaved.
+    reset([chunk("a", "text", "")]);
+    st().replaceChunkContent("a", "AIの文章");
+    expect(st().doc.chunks[0].metadata.contentHistory).toEqual([]);
+    st().updateChunkContent("a", "");
+    expect(st().dirty).toBe(false);
+    expectConsistent();
+  });
+});
+
+// QA 20261003 follow-up (BUG-007 class): the detached-slide bullet field used
+// to commit only on blur (setSlideBody) — typing left the tab 保存済み with
+// Undo disabled and the first tab-close click was spent on the blur commit.
+// It now writes through updateSlideBody on every change (wiring:
+// slideEditorWiring.test.ts; close path: speakerNotesClose.test.ts).
+describe("QA 20261003 follow-up — detached-slide bullets are live document edits", () => {
+  const expectConsistent = () => {
+    expect(st().savedDocIsClean).toBe(true);
+    expect(st().dirty).toBe(hasChanges(changeSummary(st().savedDoc, st().doc)));
+    expect(st().dirty).toBe(!sameAsSaved(st().savedDoc, st().doc));
+  };
+  const detached = (id: string, content: string, body: string[]): Chunk => ({
+    ...chunk(id, "heading", content),
+    metadata: { chunkType: "heading", level: 1, linkedChunks: [], slideBody: body },
+  });
+  /** Two detached slides (h1, h2) and one linked slide (h3), opened clean. */
+  const deck = () => {
+    reset([
+      detached("h1", "一枚目", ["要点"]),
+      chunk("a", "text", "本文"),
+      detached("h2", "二枚目", []),
+      chunk("h3", "heading", "三枚目"),
+    ]);
+    st().setMode("slide");
+    expect(st().dirty).toBe(false);
+  };
+  const bodyOf = (id: string) => st().doc.chunks.find((c) => c.id === id)!.metadata.slideBody;
+  afterEach(() => vi.useRealTimers());
+
+  it("the first keystroke marks the tab dirty and is undoable at once", () => {
+    deck();
+    const depth = st().past.length;
+    st().updateSlideBody("h1", "要点\n追");
+    expect(bodyOf("h1")).toEqual(["要点", "追"]);
+    expect(st().dirty).toBe(true);
+    expect(st().past.length).toBe(depth + 1);
+    expectConsistent();
+  });
+
+  it("continuous typing is ONE undo step; undo restores the saved bullets (shown at once) and is clean; redo is dirty", () => {
+    deck();
+    const depth = st().past.length;
+    let draft = "";
+    for (const v of ["要点\n", "要点\n追", "要点\n追加", "要点\n追加 ", "要点\n追加 point"]) {
+      draft = v;
+      st().updateSlideBody("h1", v);
+    }
+    expect(st().past.length).toBe(depth + 1);
+    expect(bodyOf("h1")).toEqual(["要点", "追加 point"]);
+    st().undo();
+    expect(bodyOf("h1")).toEqual(["要点"]);
+    // What the field shows after 元に戻す: the stored lines, not the stale draft.
+    expect(slideBodyFieldValue(bodyOf("h1")!, draft)).toBe("要点");
+    expect(st().dirty).toBe(false);
+    expectConsistent();
+    st().redo();
+    expect(bodyOf("h1")).toEqual(["要点", "追加 point"]);
+    expect(st().dirty).toBe(true);
+    expectConsistent();
+  });
+
+  it("a typed empty line or trailing space records nothing (no step, same doc, stays clean)", () => {
+    deck();
+    const before = st().doc;
+    const depth = st().past.length;
+    for (const v of ["要点\n", "要点 ", "要点\n\n", " 要点"]) st().updateSlideBody("h1", v);
+    expect(st().doc).toBe(before);
+    expect(st().past.length).toBe(depth);
+    expect(st().dirty).toBe(false);
+  });
+
+  it("emptying the field keeps the slide detached with no bullets ([] — only Re-link re-attaches)", () => {
+    deck();
+    st().updateSlideBody("h1", "");
+    expect(bodyOf("h1")).toEqual([]);
+    expect(st().dirty).toBe(true);
+    expectConsistent();
+  });
+
+  it("typing back to the saved bullets (no undo) is clean", () => {
+    deck();
+    st().updateSlideBody("h1", "要点X");
+    expect(st().dirty).toBe(true);
+    st().updateSlideBody("h1", "要点");
+    expect(st().dirty).toBe(false);
+    expectConsistent();
+  });
+
+  it("another slide's bullets, an explicit boundary, the slide title or its notes start a new step", () => {
+    deck();
+    const depth = st().past.length;
+    st().updateSlideBody("h1", "要点\na");
+    st().updateSlideBody("h2", "b"); // different slide
+    expect(st().past.length).toBe(depth + 2);
+    st().updateSlideBody("h2", "bc", { newUndoStep: true }); // paste / selection replace
+    expect(st().past.length).toBe(depth + 3);
+    st().updateChunkContent("h2", "二枚目!"); // the same chunk's TITLE is its own step
+    expect(st().past.length).toBe(depth + 4);
+    st().updateSlideBody("h2", "bcd"); // …and back to its bullets, another
+    expect(st().past.length).toBe(depth + 5);
+    st().updateChunkNotes("h2", "ノート"); // its notes are their own step
+    st().updateSlideBody("h2", "bcde");
+    expect(st().past.length).toBe(depth + 7);
+  });
+
+  it("an idle gap > UNDO_IDLE_MS splits, except inside an IME composition", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    deck();
+    const depth = st().past.length;
+    st().updateSlideBody("h1", "要点\nよ");
+    vi.setSystemTime(10_000 + UNDO_IDLE_MS + 1);
+    st().updateSlideBody("h1", "要点\nよう", { composing: true }); // choosing a candidate
+    expect(st().past.length).toBe(depth + 1);
+    vi.setSystemTime(10_000 + 2 * (UNDO_IDLE_MS + 1));
+    st().updateSlideBody("h1", "要点\n要約"); // a real pause, not composing
+    expect(st().past.length).toBe(depth + 2);
+  });
+
+  // Review follow-up: a keystroke the store ignores (the space between two
+  // words, a fresh empty line) is still typing — it must keep the session's
+  // idle window open, or slow typing splits into one undo step per word.
+  // Fails if the no-op path stops refreshing lastEditAt.
+  it("a keystroke that stores nothing still keeps the typing session open", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    deck();
+    const depth = st().past.length;
+    const step = UNDO_IDLE_MS - 200; // each keystroke within the window…
+    st().updateSlideBody("h1", "要点\nfoo");
+    vi.setSystemTime(10_000 + step);
+    st().updateSlideBody("h1", "要点\nfoo "); // trailing space: nothing stored
+    vi.setSystemTime(10_000 + 2 * step); // …but > UNDO_IDLE_MS since the last stored change
+    st().updateSlideBody("h1", "要点\nfoo b");
+    expect(bodyOf("h1")).toEqual(["要点", "foo b"]);
+    expect(st().past.length).toBe(depth + 1);
+    // The same rule for speaker notes: whitespace typed into an empty field.
+    st().updateChunkNotes("h2", "メモ");
+    const notesDepth = st().past.length;
+    vi.setSystemTime(10_000 + 3 * step);
+    st().updateChunkNotes("h2", "メモ\n"); // stored as typed — a real change
+    vi.setSystemTime(10_000 + 4 * step);
+    st().updateChunkNotes("h2", "メモ\n次");
+    expect(st().past.length).toBe(notesDepth);
+  });
+
+  it("a no-op keystroke never extends ANOTHER field's session", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    deck();
+    st().updateSlideBody("h1", "要点\nfoo");
+    const at = st().lastEditAt;
+    st().updateSlideBody("h2", " "); // h2 is empty and stays empty: nothing stored
+    expect(st().lastEditChunkId).toBe("__slideBody__:h1");
+    vi.setSystemTime(10_000 + 50);
+    st().updateSlideBody("h2", "");
+    expect(st().lastEditAt).toBe(at);
+  });
+
+  it("never detaches a linked slide, and an unknown id is a no-op", () => {
+    deck();
+    const before = st().doc;
+    st().updateSlideBody("h3", "勝手な要約"); // h3 is linked to its prose
+    st().updateSlideBody("nope", "x");
+    expect(st().doc).toBe(before);
+    expect(bodyOf("h3")).toBeUndefined();
+    expect(st().dirty).toBe(false);
+  });
+
+  it("does not mark the relationship graph stale (presentation-only, like setSlideBody)", () => {
+    deck();
+    useStore.setState({ analysisStale: false });
+    st().updateSlideBody("h1", "要点\n追加");
+    expect(st().analysisStale).toBe(false);
   });
 });

@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useT } from "../i18n";
 import { PREVIEW_SCOPE_NOTE } from "../markdownSurfaceHelp";
+import { isImeKeyEvent } from "../modalBehavior";
 import {
   PREVIEW_BACKGROUNDS,
   PREVIEW_BACKGROUND_LABELS,
@@ -24,14 +25,23 @@ export default function PreviewBackgroundPicker() {
     const onDown = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
+    // One Esc, one effect (QA 20261003 follow-up): a document bubble-phase
+    // listener runs before usePanelEscape's window listener, and claiming the
+    // key (preventDefault) keeps an open docked panel from closing on the same
+    // press. Same shape as Toolbar's useDropdownDismiss; an IME key, or an Esc
+    // a field already claimed (find bar), is left alone.
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (isImeKeyEvent(e) || e.defaultPrevented) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+      }
     };
     document.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
+    document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("keydown", onKey);
     };
   }, [open]);
 

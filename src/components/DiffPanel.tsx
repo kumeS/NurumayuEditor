@@ -9,11 +9,24 @@
 // States: when no paragraph or title differs, the empty state shows
 // changesLabel() for the same changeSummary() the health bar uses, so the
 // panel never says "No changes" while the document is dirty (BUG-015b): it
-// names an order/analysis/metadata change, or "Unsaved (matches last save)".
+// names an order/analysis/metadata change, a Markdown-source-only change
+// (with a one-line explanation whose causes are examples, QA 20261003), or
+// "Unsaved (matches last save)" — for an unsaved baseline (MISS-12), and for
+// a saved one only in the view-switch cases healthLabels.ts lists, since
+// `dirty` derives from the same predicate (diff.ts sameAsSaved) on every
+// edit, undo, redo and save.
 // No loading state:
 // documentDiff() is a synchronous in-memory computation over already-loaded
 // state, nothing to await. No error state: a pure function over validated
 // in-memory Documents cannot fail (no I/O, no parsing of untrusted input).
+//
+// Esc closes it (KI-35, QA 20261003 follow-up): HealthBar mounts it only while
+// open, so it registers usePanelEscape("diff") itself (mount = open); the ✕
+// button and Esc share the hook's closer. As for every docked panel
+// (panelEscape.ts), an unclaimed Esc in a paragraph closes it, while Esc in
+// the Markdown source, the find bar, the title or a dialog field stays with
+// that field — wiring guarded in panelEscapeContract.test.ts, real key/focus
+// routing by the manual QA run.
 
 import { useMemo } from "react";
 import { changeSummary, documentDiff, wordDiff, type ChangedChunk } from "../diff";
@@ -21,6 +34,7 @@ import { changesLabel } from "../healthLabels";
 import { translateWith, useLang, useT } from "../i18n";
 import { useStore } from "../store";
 import type { Chunk } from "../types";
+import { usePanelEscape } from "../usePanelEscape";
 import { CloseIcon, HistoryIcon } from "./icons";
 
 /** Short single-line preview of a chunk's content for the Added/Removed lists. */
@@ -62,32 +76,41 @@ export default function DiffPanel({ onClose }: DiffPanelProps) {
   const savedDoc = useStore((s) => s.savedDoc);
   const dirty = useStore((s) => s.dirty);
   const lang = useLang();
+  const closePanel = usePanelEscape("diff", onClose);
 
   const diff = useMemo(() => documentDiff(savedDoc, doc), [savedDoc, doc]);
   const summary = useMemo(() => changeSummary(savedDoc, doc), [savedDoc, doc]);
   const isEmpty = summary.paragraphs === 0 && !summary.titleChanged;
 
   return (
-    <div className="w-96 rounded-lg border border-chrome-line bg-white p-3 shadow-xl">
+    <div data-docked-panel="diff" className="w-96 rounded-lg border border-chrome-line bg-white p-3 shadow-xl">
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <HistoryIcon className="h-4 w-4" />
           {t("Changes since last save")}
         </div>
         <button
-          onClick={onClose}
+          onClick={closePanel}
           className="text-ink-faint hover:text-ink"
           aria-label={t("Close changes panel")}
-          title={t("Close")}
+          title={t("Close panel (Esc)")}
         >
           <CloseIcon className="h-4 w-4" />
         </button>
       </div>
 
       {isEmpty ? (
-        <p className="px-1 py-4 text-center text-xs text-ink-faint">
-          {changesLabel(summary, dirty, lang)}
-        </p>
+        <div className="px-1 py-4 text-center text-xs text-ink-faint">
+          <p>{changesLabel(summary, dirty, lang)}</p>
+          {/* QA 20261003: a source-only change has no paragraph or title row
+              to show — say what kind of bytes moved. The causes are examples,
+              not a closed list (review follow-up C20, QA 20261003). */}
+          {summary.sourceChanged && (
+            <p className="mt-1">
+              {t("Only the Markdown text differs (for example front matter, blank lines, spacing, line endings, heading or fence markers, or the title line); the paragraphs in the editor are unchanged.")}
+            </p>
+          )}
+        </div>
       ) : (
         <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
           {summary.titleChanged && (

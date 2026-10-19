@@ -13,10 +13,14 @@
 //   heading (a heading-less leading slide has no delimiter), Merge is never
 //   offered for slide 1, and Split here needs a focused chunk that is not the
 //   slide's first item.
+// - Leaving the presentation selects the slide that was on screen
+//   (`presentationExitFocus`, BUG-009): its lead chunk becomes the focused
+//   chunk unless the focused chunk is already on it; both this rule and
+//   PresentationMode's start slide follow the focused chunk.
 // Known limit: the Edit/Preview slide-view switch is SlideEditor-local state,
 // so it has no palette entry.
 
-import { groupSlides, headingOf, layoutHost, isSlideDetached, type SlideGroup } from "./slides";
+import { groupSlides, headingOf, layoutHost, isSlideDetached, slideLead, type SlideGroup } from "./slides";
 import type { Chunk } from "./types";
 
 /** Index of the current slide (see header). */
@@ -28,6 +32,28 @@ export function currentSlideIndex(
   let i = slides.findIndex((s) => s.items.some((c) => c.id === focusedChunkId));
   if (i < 0) i = slides.findIndex((s) => s.items[0]?.id === anchor);
   return i < 0 ? 0 : i;
+}
+
+/**
+ * The chunk to focus when the presentation exits on slide `at` (BUG-009, QA
+ * 20261003): that slide's lead chunk (`slideLead` — its heading, or the first
+ * chunk of the heading-less title slide the document title heads), so the
+ * Slides rail shows the slide that was on screen and the next Present starts
+ * there. `at` is clamped to the deck (it may have shrunk while presenting).
+ * null when the focused chunk is already on that slide (it already selects
+ * the slide, so the focused chunk stays as it is) or the deck is empty. This
+ * decides the store's selection only; putting the DOM caret back is
+ * PresentationMode's `exit` (review follow-up C16, QA 20261003).
+ */
+export function presentationExitFocus(
+  slides: SlideGroup[],
+  at: number,
+  focusedChunkId: string | null
+): string | null {
+  if (slides.length === 0) return null;
+  const slide = slides[Math.min(Math.max(at, 0), slides.length - 1)];
+  if (slide.items.some((c) => c.id === focusedChunkId)) return null;
+  return slideLead(slide)?.id ?? null;
 }
 
 export interface SlideCommandTarget {

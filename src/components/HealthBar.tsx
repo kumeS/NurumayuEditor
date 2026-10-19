@@ -6,15 +6,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { analyzeDocument, hasAnalyzableContent } from "../aiActions";
 import { api } from "../api";
-import { chunksOverCharLimit } from "../charLimitWarnings";
-import { changeSummary } from "../diff";
+import { chunksOverCharLimit, type OverLimitChunk } from "../charLimitWarnings";
+import { changeSummary, hasChanges } from "../diff";
 import { localizeExportWarning } from "../exportWarnings";
 import { changesLabel, reportLabels } from "../healthLabels";
 import { sameNetworkStats } from "../healthBarStats";
 import { translateWith, useLang, useT } from "../i18n";
 import { staleSummaryChunkIds, useStore } from "../store";
 import { documentTextStats, formatLengthDetail, formatLengthLabel } from "../textStats";
-import type { NetworkStats } from "../types";
+import type { Chunk, NetworkStats } from "../types";
+import { usePanelEscape } from "../usePanelEscape";
 import CitationsPanel from "./CitationsPanel";
 import CriteriaPanel from "./CriteriaPanel";
 import DiffPanel from "./DiffPanel";
@@ -33,6 +34,124 @@ function relative(ts: number, ja = false): string {
     return ja ? `${h}時間前` : `${h} h ago`;
   }
   return new Date(ts).toLocaleDateString(ja ? "ja-JP" : undefined);
+}
+
+// KI-35 (QA 20261003 follow-up): the two status-bar popovers close on Esc.
+// usePanelEscape assumes mount = open and must not be called conditionally,
+// so each popover is its own component that the bar mounts only while open;
+// its ✕ and Esc share the hook's closer, which hands focus back to the bar's
+// toggle ([data-panel-opener]). Which Esc qualifies (bare, unclaimed, not in a
+// panel's field; outside the panels only from a non-editable target or a
+// document-history field — paragraph textarea, preview block, slide field —
+// review follow-up, QA 20261003; the Markdown source keeps Esc for
+// CodeMirror's Esc-then-Tab way out, and the find bar and other text fields
+// keep it too) is decided in panelEscape.ts. Wiring guarded in
+// panelEscapeContract.test.ts; real key/focus routing by the manual QA run.
+
+/** Paragraphs over the configured character limit, with a jump to each. */
+function CharLimitPopover({
+  limit,
+  items,
+  chunks,
+  onClose,
+  onJump,
+}: {
+  limit: number | undefined;
+  items: OverLimitChunk[];
+  chunks: Chunk[];
+  onClose: () => void;
+  onJump: (id: string) => void;
+}) {
+  const t = useT();
+  const ja = useLang() === "ja";
+  const closePanel = usePanelEscape("char-limit", onClose);
+  return (
+    <div
+      data-docked-panel="char-limit"
+      className="absolute bottom-8 left-2 z-40 w-80 rounded-lg border border-chrome-line bg-white p-3 shadow-xl"
+    >
+      <div className="mb-1 flex items-center justify-between text-xs font-semibold text-ink">
+        <span>{ja ? `${limit}文字の上限を超過` : `Over the ${limit}-character limit`}</span>
+        <button
+          onClick={closePanel}
+          className="text-ink-faint hover:text-ink"
+          aria-label={t("Close over-limit paragraph list")}
+          title={t("Close (Esc)")}
+        >
+          ×
+        </button>
+      </div>
+      <ul className="max-h-56 space-y-1 overflow-y-auto pr-1">
+        {items.map((oc) => {
+          const c = chunks.find((x) => x.id === oc.id);
+          const preview = (c?.content.trim().replace(/\s+/g, " ") || t("(empty)")).slice(0, 60);
+          return (
+            <li key={oc.id}>
+              {/* Jumping moves focus to the paragraph on purpose, so this
+                  closes with the raw onClose: the hook's deferred focus
+                  return must not race the caret placement. */}
+              <button
+                onClick={() => {
+                  onJump(oc.id);
+                  onClose();
+                }}
+                className="w-full rounded px-2 py-1 text-left text-xs text-ink-soft hover:bg-warn-wash"
+                title={t("Jump to this paragraph")}
+              >
+                <span className="font-medium text-warn">{ja ? `${oc.count}文字` : `${oc.count} chars`}</span> —{" "}
+                {preview}
+                {(c?.content.trim().length ?? 0) > 60 ? "…" : ""}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+/** The last export (or draft) report: its omission warnings, localized. */
+function ExportReportPopover({
+  lastExportReport,
+  heading,
+  onClose,
+}: {
+  lastExportReport: { warnings: string[]; at: number };
+  heading: string;
+  onClose: () => void;
+}) {
+  const t = useT();
+  const lang = useLang();
+  const closePanel = usePanelEscape("report", onClose);
+  return (
+    <div
+      data-docked-panel="report"
+      className="absolute bottom-8 right-2 z-40 w-96 rounded-lg border border-chrome-line bg-white p-3 shadow-xl"
+    >
+      <div className="mb-1 flex items-center justify-between text-xs font-semibold text-ink">
+        <span>
+          {heading} ({relative(lastExportReport.at, lang === "ja")})
+        </span>
+        <button
+          onClick={closePanel}
+          className="text-ink-faint hover:text-ink"
+          aria-label={t("Close")}
+          title={t("Close (Esc)")}
+        >
+          ×
+        </button>
+      </div>
+      {lastExportReport.warnings.length === 0 ? (
+        <p className="text-xs text-ink-soft">{t("No warnings — nothing was omitted.")}</p>
+      ) : (
+        <ul className="list-disc space-y-1 pl-4 text-xs text-ink-soft">
+          {lastExportReport.warnings.map((w, i) => (
+            <li key={i}>{localizeExportWarning(w, lang)}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 export default function HealthBar() {
@@ -103,7 +222,7 @@ export default function HealthBar() {
     }),
     [chunks, doc, savedDoc]
   );
-  const hasChanges = changes.paragraphs > 0 || changes.titleChanged || changes.otherChanged;
+  const anyChange = hasChanges(changes);
   const report = lastExportReport ? reportLabels(lastExportReport.format, lang) : null;
 
   // Grant-application beachhead (開発.txt Stage 2, item 2-1), Part A: which
@@ -144,7 +263,8 @@ export default function HealthBar() {
       <button
         onClick={() => toggleDiffPanel()}
         aria-expanded={diffPanelOpen}
-        className={`${item} rounded hover:bg-chrome-line/70 ${hasChanges ? "text-warn" : ""}`}
+        data-panel-opener="diff"
+        className={`${item} rounded hover:bg-chrome-line/70 ${anyChange ? "text-warn" : ""}`}
         title={t("Show paragraphs added, removed, or changed since the document was last saved")}
       >
         <HistoryIcon className="h-3 w-3" />
@@ -215,6 +335,7 @@ export default function HealthBar() {
         <button
           onClick={() => setShowCharLimit((v) => !v)}
           aria-expanded={showCharLimit}
+          data-panel-opener="char-limit"
           className={`${item} rounded text-warn hover:bg-chrome-line/70`}
           title={translateWith(
             "{n} paragraph(s) over the {limit}-character limit set in Settings — click to list them",
@@ -228,46 +349,16 @@ export default function HealthBar() {
         </button>
       )}
       {showCharLimit && overLimitChunks.length > 0 && (
-        <div className="absolute bottom-8 left-2 z-40 w-80 rounded-lg border border-chrome-line bg-white p-3 shadow-xl">
-          <div className="mb-1 flex items-center justify-between text-xs font-semibold text-ink">
-            <span>
-              {ja
-                ? `${settings?.charLimitWarning}文字の上限を超過`
-                : `Over the ${settings?.charLimitWarning}-character limit`}
-            </span>
-            <button
-              onClick={() => setShowCharLimit(false)}
-              className="text-ink-faint hover:text-ink"
-              aria-label={t("Close over-limit paragraph list")}
-              title={t("Close")}
-            >
-              ×
-            </button>
-          </div>
-          <ul className="max-h-56 space-y-1 overflow-y-auto pr-1">
-            {overLimitChunks.map((oc) => {
-              const c = chunks.find((x) => x.id === oc.id);
-              const preview = (c?.content.trim().replace(/\s+/g, " ") || t("(empty)")).slice(0, 60);
-              return (
-                <li key={oc.id}>
-                  <button
-                    onClick={() => {
-                      setFocused(oc.id);
-                      flashChunk(oc.id);
-                      setShowCharLimit(false);
-                    }}
-                    className="w-full rounded px-2 py-1 text-left text-xs text-ink-soft hover:bg-warn-wash"
-                    title={t("Jump to this paragraph")}
-                  >
-                    <span className="font-medium text-warn">{ja ? `${oc.count}文字` : `${oc.count} chars`}</span> —{" "}
-                    {preview}
-                    {(c?.content.trim().length ?? 0) > 60 ? "…" : ""}
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
+        <CharLimitPopover
+          limit={settings?.charLimitWarning}
+          items={overLimitChunks}
+          chunks={chunks}
+          onClose={() => setShowCharLimit(false)}
+          onJump={(id) => {
+            setFocused(id);
+            flashChunk(id);
+          }}
+        />
       )}
 
       {/* "Zero external transmission" visibility (開発.txt Stage 2, item 2-2):
@@ -310,6 +401,7 @@ export default function HealthBar() {
             setShowWarnings((v) => !v);
           }}
           aria-expanded={showWarnings}
+          data-panel-opener="report"
           className={`${item} rounded hover:bg-chrome-line/70 ${
             lastExportReport.warnings.length ? "text-warn" : ""
           }`}
@@ -326,37 +418,20 @@ export default function HealthBar() {
         </button>
       )}
       {showWarnings && lastExportReport && report && (
-        <div className="absolute bottom-8 right-2 z-40 w-96 rounded-lg border border-chrome-line bg-white p-3 shadow-xl">
-          <div className="mb-1 flex items-center justify-between text-xs font-semibold text-ink">
-            <span>
-              {report.heading} ({relative(lastExportReport.at, ja)})
-            </span>
-            <button
-              onClick={() => setShowWarnings(false)}
-              className="text-ink-faint hover:text-ink"
-              aria-label={t("Close")}
-              title={t("Close")}
-            >
-              ×
-            </button>
-          </div>
-          {lastExportReport.warnings.length === 0 ? (
-            <p className="text-xs text-ink-soft">{t("No warnings — nothing was omitted.")}</p>
-          ) : (
-            <ul className="list-disc space-y-1 pl-4 text-xs text-ink-soft">
-              {lastExportReport.warnings.map((w, i) => (
-                <li key={i}>{localizeExportWarning(w, lang)}</li>
-              ))}
-            </ul>
-          )}
-        </div>
+        <ExportReportPopover
+          lastExportReport={lastExportReport}
+          heading={report.heading}
+          onClose={() => setShowWarnings(false)}
+        />
       )}
 
       {/* Review-criteria coverage panel (開発.txt Stage 2, item 2-1, Part B):
           opened via the command palette; this is its only mount point (it's
           `fixed`-positioned and self-hides when closed via its own store),
           since App.tsx's docked-panel layout is outside this feature's owned
-          files. */}
+          files. Always mounted so its state survives a close; each of these
+          three registers Esc-to-close itself, only while open, through its
+          own frame component (review follow-up, QA 20261003). */}
       <CriteriaPanel />
       {/* Personal RAG library panel (開発.txt Stage 3, item 3-1): same
           self-contained, fixed-positioned, self-hiding pattern as

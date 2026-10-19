@@ -94,6 +94,17 @@ describe("shouldRestoreFocus", () => {
     expect(shouldRestoreFocus(["draft"], "draft")).toBe(true);
     expect(shouldRestoreFocus(["draft", "settings"], "draft")).toBe(false);
   });
+
+  // Review follow-up (QA 20261003): ⌘K → "Start presentation" — the overlay
+  // takes focus, and the palette's deferred restore then pulled it back into
+  // the hidden slide field, so typed keys edited the document behind the
+  // presentation. A focus something else placed since the close is kept.
+  // Fails if the third argument is ignored.
+  it("never takes back a focus that something else placed since the close", () => {
+    expect(shouldRestoreFocus([], null, true)).toBe(false);
+    expect(shouldRestoreFocus(["draft"], "draft", true)).toBe(false);
+    expect(shouldRestoreFocus([], null, false)).toBe(true);
+  });
 });
 
 describe("isImeKeyEventSince (ux-a11y-i18n-2)", () => {

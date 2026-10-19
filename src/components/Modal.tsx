@@ -84,7 +84,11 @@ function restoreFocus(opener: Opener, retry = true) {
   const candidate = [opener, opener.fallback].find((o) => o?.el?.isConnected) ?? null;
   const el = candidate?.el;
   if (!candidate || !el) return;
-  if (!shouldRestoreFocus(useModalStack.getState().stack, candidate.owner)) return;
+  // Focus inside the closed dialog is gone (body); anything else was placed
+  // since the close and is kept.
+  const active = document.activeElement;
+  const elsewhere = !!active && active !== document.body && active.isConnected;
+  if (!shouldRestoreFocus(useModalStack.getState().stack, candidate.owner, elsewhere)) return;
   if (el.closest("[inert]")) {
     // App has not re-rendered without `inert` yet — try once more next frame.
     if (retry) requestAnimationFrame(() => restoreFocus(opener, false));

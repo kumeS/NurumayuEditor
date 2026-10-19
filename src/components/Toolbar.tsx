@@ -68,7 +68,9 @@ function ToolButton({
 
 /**
  * Close a toolbar dropdown on an outside mousedown or on Escape. Escape that
- * commits an IME conversion is ignored (KBD-IME-ENTER).
+ * commits an IME conversion is ignored (KBD-IME-ENTER), and so is an Escape
+ * another handler already claimed (e.g. the find bar's), so one key never
+ * closes two surfaces (QA 20261003 follow-up).
  */
 function useDropdownDismiss(
   open: boolean,
@@ -81,7 +83,7 @@ function useDropdownDismiss(
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (isImeKeyEvent(e)) return;
+      if (isImeKeyEvent(e) || e.defaultPrevented) return;
       if (e.key === "Escape") {
         e.preventDefault();
         setOpen(false);

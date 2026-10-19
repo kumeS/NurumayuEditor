@@ -29,22 +29,35 @@
 // slide shrinks instead of pushing the notes and the control bar off-screen.
 // Notes keep their line breaks and scroll past 30vh.
 //
+// Start and exit (BUG-009, QA 20261003): Present starts on the focused chunk's
+// slide (`currentSlideIndex`, the rail's rule), and every way out — Esc, the ×,
+// "Esc to exit", the empty deck's button — goes through `exit`, which focuses
+// the lead chunk of the slide on screen (`presentationExitFocus`). So the
+// Slides editor shows that slide afterwards and the next Present resumes there.
+// `exit` also hands DOM focus back to the focused chunk's field when one is
+// mounted (review follow-up C16, QA 20261003), whichever slide it exits on.
+//
 // Testing: this is a highly interactive, highly visual surface (window-filling
 // keyboard-driven slideshow) — full keyboard + rendering integration testing
 // here is disproportionate to the value it adds over the existing SlideStage/
 // slides.ts unit coverage, so it is deliberately not attempted. The PURE logic
-// this component is built on (next/previous slide index math, clamped at the
-// deck's bounds) is extracted into `clampPresentIndex` in store.ts and has a
-// direct unit test in store.test.ts, since "arrow-key navigation never goes
-// out of bounds" is exactly the kind of user-visible claim this project's
-// testing rules require a guard for.
+// this component is built on is extracted and unit-tested: the next/previous
+// index math, clamped at the deck's bounds (`clampPresentIndex`, store.test.ts
+// — "arrow-key navigation never goes out of bounds" is exactly the kind of
+// user-visible claim this project's testing rules require a guard for), and
+// the start/exit slide rules (slideCommands.test.ts, store.test.ts). That
+// every exit control uses `exit` is a source-contract guard
+// (slidePresentPolish.test.ts).
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "../i18n";
 import { clampPresentIndex, useStore } from "../store";
 import { groupSlides, resolveLayout, slideNotes } from "../slides";
+import { currentSlideIndex, presentationExitFocus } from "../slideCommands";
+import { focusChunkRange } from "./ChunkView";
 import { SlideStage } from "./SlideEditor";
 import { CloseIcon } from "./icons";
+import { useModalStack } from "./Modal";
 
 export default function PresentationMode() {
   const t = useT();
@@ -55,14 +68,48 @@ export default function PresentationMode() {
 
   const slides = groupSlides(chunks);
 
-  // Resume on whichever slide holds the currently-focused chunk (mirrors
-  // SlideEditor's own "selected" derivation), else the first slide.
-  const initialIdx = Math.max(
-    0,
-    slides.findIndex((s) => s.items.some((c) => c.id === focusedChunkId))
-  );
+  // Resume on whichever slide holds the currently-focused chunk (the rail's
+  // own rule; the rail's local anchor is not visible here), else the first.
+  const initialIdx = currentSlideIndex(slides, focusedChunkId, null);
   const [idx, setIdx] = useState(initialIdx);
   const [notesOpen, setNotesOpen] = useState(false);
+
+  // BUG-009: leave on the slide on screen. The deck and focus are read at exit
+  // time — the deck may have changed while presenting (presentationExitFocus
+  // clamps `idx`). Every exit control and Esc call this, never
+  // closePresentation directly.
+  // Then hand the caret back (review follow-up C16, QA 20261003): the overlay
+  // holds DOM focus, so without this an exit on the slide that already held
+  // the focused chunk left focus on body. focusChunkRange runs the chunk's
+  // registered focuser when it is mounted (even for an unchanged id); a lead
+  // not mounted yet (another slide in the Slides editor) mounts after this
+  // and its own focus effect places the caret. No caret in the Slides Preview
+  // sub-view, on a detached slide or in the Markdown view (no chunk field is
+  // mounted there).
+  const exit = useCallback(() => {
+    const st = useStore.getState();
+    const id = presentationExitFocus(groupSlides(st.doc.chunks), idx, st.focusedChunkId);
+    closePresentation(id);
+    const target = id ?? st.focusedChunkId;
+    if (target) focusChunkRange(target);
+  }, [idx, closePresentation]);
+
+  // Take keyboard focus when the overlay opens (review follow-up, QA
+  // 20261003): started from the palette, focus otherwise returned to a hidden
+  // editor field underneath, so typed keys edited the document behind the
+  // overlay. Not while a modal is open: the overlay mounts in the same commit
+  // that closes the palette, under an `inert` ancestor where focus() is a
+  // no-op — the effect re-runs once the modal stack is empty (and Modal keeps
+  // a focus placed since its close). Focus already inside the overlay is left
+  // alone. The Tab order still reaches controls behind it (KI-34).
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const modalOpen = useModalStack((s) => s.stack.length > 0);
+  const hasSlide = idx < slides.length;
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el || modalOpen) return;
+    if (!el.contains(document.activeElement)) el.focus({ preventScroll: true });
+  }, [modalOpen, hasSlide]);
 
   // B6-style re-clamp: if the deck shrinks while presenting (e.g. an undo),
   // don't leave the index pointing past the end.
@@ -83,7 +130,7 @@ export default function PresentationMode() {
         setIdx((i) => clampPresentIndex(i, -1, slides.length));
       } else if (e.key === "Escape") {
         e.preventDefault();
-        closePresentation();
+        exit();
       } else if (e.key === "n" || e.key === "N") {
         e.preventDefault();
         setNotesOpen((v) => !v);
@@ -91,7 +138,7 @@ export default function PresentationMode() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [slides.length, closePresentation]);
+  }, [slides.length, exit]);
 
   const current = slides[idx];
 
@@ -100,13 +147,13 @@ export default function PresentationMode() {
   // empty state needs a visible way out too.
   if (!current) {
     return (
-      <div className="fixed inset-0 z-[200] flex flex-col items-center justify-center gap-4 bg-black text-white">
+      <div ref={rootRef} tabIndex={-1} className="fixed inset-0 z-[200] flex flex-col items-center justify-center gap-4 bg-black text-white outline-none">
         <div className="text-lg font-medium">{t("This deck has no slides yet")}</div>
         <div className="text-sm text-white/60">
           {t("Add a slide in the Slides view, then present again.")}
         </div>
         <button
-          onClick={closePresentation}
+          onClick={exit}
           title={t("Exit presentation")}
           className="mt-2 rounded-md border border-white/30 px-4 py-1.5 text-sm text-white hover:bg-white/10"
         >
@@ -119,9 +166,9 @@ export default function PresentationMode() {
   const notes = slideNotes(current);
 
   return (
-    <div className="fixed inset-0 z-[200] flex flex-col bg-black">
+    <div ref={rootRef} tabIndex={-1} className="fixed inset-0 z-[200] flex flex-col bg-black outline-none">
       <button
-        onClick={closePresentation}
+        onClick={exit}
         title={t("Exit presentation (Esc)")}
         aria-label={t("Exit presentation")}
         className="absolute right-4 top-4 z-10 rounded-md p-1.5 text-white/50 hover:bg-white/10 hover:text-white"
@@ -173,7 +220,7 @@ export default function PresentationMode() {
         >
           {t("Notes (N)")}
         </button>
-        <button onClick={closePresentation} title={t("Exit presentation")} className="hover:text-white">
+        <button onClick={exit} title={t("Exit presentation")} className="hover:text-white">
           {t("Esc to exit")}
         </button>
       </div>

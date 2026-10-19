@@ -48,7 +48,8 @@ const IMAGE_GRID_GAP: i64 = 114_300;
 const MAX_VISUALS: usize = 6;
 
 /// Outcome of an export: how many slides were written and any non-fatal notes
-/// (e.g. images that couldn't be embedded, diagram chunks not yet supported).
+/// (e.g. images that couldn't be embedded, diagrams with no rendered snapshot,
+/// or visuals left out because their slide's layout has no image area).
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PptxReport {
@@ -1410,6 +1411,55 @@ mod tests {
             .map(|i| zip.by_index(i).unwrap().name().to_string())
             .collect();
         assert!(parts.iter().any(|n| n == "ppt/media/image1.png"), "snapshot not embedded: {parts:?}");
+    }
+
+    /// QA 20261003 follow-up — guards the Slides diagram notices (the rail
+    /// badge's `title` and `SlideContent`'s `diagramNote` in SlideEditor.tsx:
+    /// "the .pptx export includes them only when the slide uses an image
+    /// layout"): a diagram carrying its rendered snapshot reaches the .pptx
+    /// ONLY on a slide whose layout has an image area. deck.rs
+    /// auto-picks an image layout for IMAGE chunks only, so a diagram-only
+    /// slide is title-content and its snapshot is left out under the layout
+    /// warning; picking an image layout embeds it.
+    #[test]
+    fn diagram_snapshot_reaches_pptx_only_on_an_image_layout() {
+        use crate::models::SLIDE_LAYOUT_TITLE_CONTENT;
+        let doc_with = |layout: Option<&str>| {
+            let mut doc = Document::new("D");
+            let mut h = Chunk::new_heading(0, 1, "図の説明");
+            h.metadata.layout = layout.map(str::to_string);
+            doc.chunks.push(h);
+            doc.chunks.push(Chunk::new_text(1, "この図は流れを示す"));
+            let mut d = Chunk::new_diagram(2, "graph TD; A-->B;", "mermaid");
+            d.metadata.rendered_image = Some(data_url("image/png", b"\x89PNG\r\n\x1a\n"));
+            doc.chunks.push(d);
+            doc
+        };
+        let media_parts = |bytes: Vec<u8>| -> usize {
+            let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+            (0..zip.len())
+                .filter(|&i| zip.by_index(i).unwrap().name().starts_with("ppt/media/"))
+                .count()
+        };
+        let dropped = "1 image(s) were left out — their slide's layout has no image area.";
+
+        // Auto layout: the diagram is not an image, so no image area.
+        let deck = document_to_deck(&doc_with(None));
+        assert_eq!(deck.slides[0].layout, SLIDE_LAYOUT_TITLE_CONTENT);
+        let (bytes, warnings) = deck_to_pptx(&deck).expect("build");
+        assert_eq!(media_parts(bytes), 0, "auto layout must not embed the diagram");
+        assert_eq!(warnings, vec![dropped.to_string()]);
+
+        for layout in ["section", "title-content"] {
+            let (bytes, warnings) = deck_to_pptx(&document_to_deck(&doc_with(Some(layout)))).expect("build");
+            assert_eq!(media_parts(bytes), 0, "{layout} has no image area");
+            assert_eq!(warnings, vec![dropped.to_string()], "{layout}");
+        }
+        for layout in ["title-image", "title-image-left", "image-top"] {
+            let (bytes, warnings) = deck_to_pptx(&document_to_deck(&doc_with(Some(layout)))).expect("build");
+            assert_eq!(media_parts(bytes), 1, "{layout} must embed the diagram snapshot");
+            assert!(warnings.is_empty(), "{layout}: {warnings:?}");
+        }
     }
 
     #[test]

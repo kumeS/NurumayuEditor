@@ -141,17 +141,28 @@ describe("changeSummary (BUG-015b: the health bar must not say 'no changes' whil
     expect(changeSummary(saved, current)).toEqual({ ...NONE, otherChanged: true });
   });
 
-  it("metadata key order, undefined keys and contentHistory are not changes", () => {
+  it("metadata key order and undefined keys are not changes", () => {
     const saved = doc([chunk("a", "x")]);
     const current = doc([
       {
         id: "a",
         order: 0,
         content: "x",
-        metadata: { linkedChunks: [], chunkType: "text", summary: undefined, contentHistory: ["old"] },
+        metadata: { linkedChunks: [], chunkType: "text", summary: undefined },
       },
     ]);
     expect(changeSummary(saved, current)).toEqual(NONE);
+  });
+
+  // QA 20261003 follow-up: contentHistory is persisted in .aix (models.rs
+  // content_history), so a new AI version is unsaved data — an "other"
+  // change, never "no changes". Fails if contentHistory is ignored again.
+  it("a new contentHistory entry (AI version) is an 'other' change", () => {
+    const saved = doc([chunk("a", "x")]);
+    const current = doc([
+      { id: "a", order: 0, content: "x", metadata: { chunkType: "text", linkedChunks: [], contentHistory: ["AI版"] } },
+    ]);
+    expect(changeSummary(saved, current)).toEqual({ ...NONE, otherChanged: true });
   });
 
   // Reworded (BUG-005, QA 20261003): mode never counts; a markdownSource
@@ -198,11 +209,26 @@ describe("sameAsSaved ⇔ changeSummary reports nothing (contract)", () => {
   const FM_DOC = md(FM);
   const CRLF_DOC = md(CRLF);
   const H1_DOC = md("# 題名\n\n本文\n");
+  const MERMAID = "# 図\n\n```mermaid\ngraph TD; A-->B\n```\n";
+  // Opened once each: md() mints chunk ids, so the edited side must be
+  // parsed over THIS object (a second md("") would differ by id, not source).
+  const MERMAID_DOC = md(MERMAID);
+  const PARA_DOC = md("# 題名\n\n本文です。\n");
+  const TITLE_ONLY = md("# Meeting notes\n");
+  const EMPTY_MD = md("");
+  const EMPTY_JA = md("", { ...doc([]), title: "題名" });
+  const BLANK_MD: Document = { ...titled([chunk("e", "")], ""), mode: "markdown" };
+  const BLANK_SLIDE: Document = {
+    ...titled([{ id: "h", order: 0, content: "", metadata: meta({ chunkType: "heading", level: 1 }) }], ""),
+    mode: "slide",
+  };
   const base = doc([chunk("a", "これは段落です。", 0), chunk("b", "Second", 1)]);
   const withChunk = (d: Document, i: number, patch: Partial<Chunk>): Document => ({
     ...d,
     chunks: d.chunks.map((c, k) => (k === i ? { ...c, ...patch } : c)),
   });
+  const HIST = withChunk(base, 0, { metadata: meta({ contentHistory: ["これは段落でした。"] }) });
+  const HIST2 = withChunk(base, 0, { metadata: meta({ contentHistory: ["一", "二"] }) });
 
   // [name, saved, current, expectedSame]
   const cases: [string, Document, Document, boolean][] = [
@@ -211,10 +237,45 @@ describe("sameAsSaved ⇔ changeSummary reports nothing (contract)", () => {
     ["mode only (view switch)", base, { ...base, mode: "slide" }, true],
     ["markdownSource = the doc's own serialization", base, { ...base, mode: "markdown", markdownSource: documentToMarkdown(base) }, true],
     ["metadata key order / undefined keys", base, withChunk(base, 0, { metadata: { linkedChunks: [], chunkType: "text", summary: undefined } }), true],
-    ["contentHistory only (ignored)", base, withChunk(base, 0, { metadata: meta({ contentHistory: ["old"] }) }), true],
+    // QA 20261003 follow-up: contentHistory is persisted (.aix content_history),
+    // so a new version is a change; Rust skips an EMPTY list, so [] = absent.
+    ["contentHistory: a version added (persisted in .aix)", base, withChunk(base, 0, { metadata: meta({ contentHistory: ["old"] }) }), false],
+    ["contentHistory: another version appended", HIST, withChunk(HIST, 0, { metadata: meta({ contentHistory: ["これは段落でした。", "AI版"] }) }), false],
+    ["contentHistory: versions reordered", HIST2, withChunk(HIST2, 0, { metadata: meta({ contentHistory: ["二", "一"] }) }), false],
+    ["contentHistory: the same versions (structural copy)", HIST, JSON.parse(JSON.stringify(HIST)), true],
+    ["contentHistory: [] vs absent (Rust never writes an empty list)", base, withChunk(base, 0, { metadata: meta({ contentHistory: [] }) }), true],
+    ["contentHistory: absent vs []", withChunk(base, 0, { metadata: meta({ contentHistory: [] }) }), base, true],
+    ["contentHistory: [] vs a version", withChunk(base, 0, { metadata: meta({ contentHistory: [] }) }), withChunk(base, 0, { metadata: meta({ contentHistory: ["x"] }) }), false],
     ["renderedImage only (export-only, ignored)", base, withChunk(base, 0, { metadata: meta({ renderedImage: "data:x" }) }), true],
     [".md opened in Markdown mode vs the same doc switched to Editor", FM_DOC, { ...FM_DOC, mode: "editor" }, true],
-    ["two all-blank Markdown sources (no content either way)", { ...doc([chunk("e", "")], ""), mode: "markdown", markdownSource: "" }, { ...doc([chunk("e", "")], ""), mode: "markdown", markdownSource: "\n" }, true],
+    ["a fresh Markdown tab's \"\" vs the \"\\n\" an Editor→Markdown switch stores", { ...BLANK_MD, markdownSource: "" }, { ...BLANK_MD, markdownSource: "\n" }, true],
+    ["an empty slide heading: \"#\\n\" (first switch) vs \"# \\n\" (merged on the next)", { ...BLANK_SLIDE, markdownSource: "#\n" }, { ...BLANK_SLIDE, mode: "markdown", markdownSource: "# \n" }, true],
+    ["blank lines typed into an empty Markdown doc", { ...BLANK_MD, markdownSource: "" }, { ...BLANK_MD, markdownSource: "\n\n\n" }, false],
+    // Review follow-up C18 (QA 20261003): the second direction — the CURRENT
+    // (non-Markdown) side reaches the saved bytes, the saved side does not
+    // reach the current ones ("# \n" is a fixed point). An undo after a save
+    // lands here. Fails with sourceDiffers reduced to
+    // `!reachOf(saved).includes(b)`.
+    ["an empty slide heading reversed: saved \"# \\n\" vs an undo back to \"#\\n\" (Slides view)", { ...BLANK_SLIDE, mode: "markdown", markdownSource: "# \n" }, { ...BLANK_SLIDE, markdownSource: "#\n" }, true],
+    // Review follow-up C1 (QA 20261003): a Markdown-mode buffer is written
+    // verbatim, so serializations it has not been through never excuse its
+    // bytes. Each pair is a real .md open + a typed edit; the first fails
+    // with the reverse check applied to a Markdown-mode current, the second
+    // with the blank-source serializer step kept for a titled Markdown doc.
+    // The reverse skip alone (a non-blank source, so the blank-source cut
+    // does not apply): the Markdown view writes "#\n" verbatim although a
+    // switch would merge it into the saved "# \n". Fails if the reverse check
+    // runs for a Markdown-mode current.
+    ["Markdown view \"#\\n\" (written verbatim) vs a saved \"# \\n\" its merge would give", { ...BLANK_SLIDE, mode: "markdown", markdownSource: "# \n" }, { ...BLANK_SLIDE, mode: "markdown", markdownSource: "#\n" }, false],
+    ["select-all delete on a title-only .md (Markdown view)", TITLE_ONLY, md("", TITLE_ONLY), false],
+    ["\"# <stem>⏎\" typed into an empty .md (Markdown view)", EMPTY_MD, md("# stem\n", EMPTY_MD), false],
+    ["\"# 題名⏎\" typed into an empty .md titled 題名 (CJK stem)", EMPTY_JA, md("# 題名\n", EMPTY_JA), false],
+    // Review follow-up C20 (QA 20261003): the DiffPanel note names spacing
+    // and fence markers as examples of a source-only change — these pairs
+    // back that copy (paragraphs are trimmed, a mermaid fence keeps only its
+    // body, so neither edit reaches the chunks).
+    ["trailing spaces after a paragraph's last line (source only)", PARA_DOC, md("# 題名\n\n本文です。   \n", PARA_DOC), false],
+    ["a mermaid fence written with ~~~ instead of ``` (source only)", MERMAID_DOC, md(MERMAID.replace(/```/g, "~~~"), MERMAID_DOC), false],
     ["paragraph text", base, withChunk(base, 0, { content: "これは段落でした。" }), false],
     ["whitespace-only paragraph edit", base, withChunk(base, 1, { content: "Second  " }), false],
     ["title", base, { ...base, title: "T2" }, false],
@@ -248,6 +309,34 @@ describe("sameAsSaved ⇔ changeSummary reports nothing (contract)", () => {
     expect(changeSummary(FM_DOC, md(FM.replace("k: v", "k: w"), FM_DOC))).toEqual({ ...NONE, sourceChanged: true });
     // A paragraph change explains the source change: no extra flag.
     expect(changeSummary(FM_DOC, md(FM.replace("本文です。", "本文でした。"), FM_DOC))).toEqual({ ...NONE, paragraphs: 1 });
+  });
+
+  // Review follow-up C20 (QA 20261003): the DiffPanel note shown for a
+  // source-only change lists spacing and fence markers among its examples.
+  // Fails if either edit stops being classified as source-only (the note
+  // would then never show for it, or a paragraph row would).
+  it("spacing and fence-marker edits are source-only changes (the DiffPanel note's examples)", () => {
+    expect(changeSummary(PARA_DOC, md("# 題名\n\n本文です。   \n", PARA_DOC))).toEqual({ ...NONE, sourceChanged: true });
+    expect(changeSummary(MERMAID_DOC, md(MERMAID.replace(/```/g, "~~~"), MERMAID_DOC))).toEqual({ ...NONE, sourceChanged: true });
+  });
+
+  // Review follow-up C1 (QA 20261003): a blank Markdown-mode source is
+  // compared verbatim, except for the untitled fresh tab ("" ↔ "\n", which
+  // an Editor→Markdown switch of an untitled blank doc stores). Fails if the
+  // blank-source serializer step is cut for untitled docs too (the fresh-tab
+  // row above) or kept for titled ones (the select-all / "# stem⏎" rows).
+  it("an empty titled .md is not 'same' as its own title heading (the source is written verbatim)", () => {
+    expect(EMPTY_MD.title).toBe("stem");
+    expect(EMPTY_MD.mode).toBe("markdown");
+    const typed = md("# stem\n", EMPTY_MD);
+    // Same chunk ids and text, same title: only the bytes differ.
+    expect(typed.chunks.map((c) => [c.id, c.content])).toEqual(EMPTY_MD.chunks.map((c) => [c.id, c.content]));
+    expect(typed.title).toBe(EMPTY_MD.title);
+    expect(changeSummary(EMPTY_MD, typed)).toEqual({ ...NONE, sourceChanged: true });
+    const blanked = md("", TITLE_ONLY);
+    expect(blanked.title).toBe("Meeting notes");
+    expect(blanked.chunks.map((c) => [c.id, c.content])).toEqual(TITLE_ONLY.chunks.map((c) => [c.id, c.content]));
+    expect(changeSummary(TITLE_ONLY, blanked)).toEqual({ ...NONE, sourceChanged: true });
   });
 
   it("a null baseline is never 'same' (a doc with no baseline always needs saving)", () => {

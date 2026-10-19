@@ -320,3 +320,18 @@ describe("document-history inputs are tagged (MISS-03)", () => {
     expect(tag).toMatch(/data-doc-history="true"/);
   });
 });
+
+// Review follow-up (QA 20261003): the deferred restore must not override a
+// focus placed after the close (the presentation overlay opened from the
+// palette). Fails if restoreFocus stops passing where focus is now.
+describe("Modal restores focus only when it would otherwise be lost", () => {
+  const modal = Object.values(
+    import.meta.glob("./components/Modal.tsx", { eager: true, query: "?raw", import: "default" })
+  )[0] as string;
+  it("restoreFocus asks shouldRestoreFocus with whether focus sits elsewhere", () => {
+    const fn = modal.slice(modal.indexOf("function restoreFocus("), modal.indexOf("function focusables("));
+    expect(fn).toMatch(/const active = document\.activeElement;/);
+    expect(fn).toMatch(/const elsewhere = !!active && active !== document\.body && active\.isConnected;/);
+    expect(fn).toMatch(/shouldRestoreFocus\(useModalStack\.getState\(\)\.stack, candidate\.owner, elsewhere\)/);
+  });
+});

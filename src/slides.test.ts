@@ -6,7 +6,10 @@ import {
   isSlideDetached,
   layoutHost,
   resolveLayout,
+  slideBodyFieldValue,
+  slideBodyLines,
   slideBullets,
+  slideDiagrams,
   slideImage,
   slideImages,
   slideMoveBounds,
@@ -396,5 +399,79 @@ describe("slideParagraphs (BUG-020 — Markdown becomes runs and paragraphs)", (
     const items = Array.from({ length: 15 }, (_, i) => `- item ${i}`).join("\n");
     const [s] = groupSlides([chunk("h", "heading", "T"), chunk("a", "text", items)]);
     expect(slideOverflows(s)).toBe(true);
+  });
+});
+
+// QA 20261003 follow-up (BUG-007 class): the detached-slide bullet field now
+// writes the store on every change. The store keeps NORMALISED lines, so the
+// field shows the text typed here while it means the same thing.
+describe("slideBodyLines (the detached-slide bullet normalisation)", () => {
+  it("one bullet per line, each trimmed, blank lines dropped (mixed script)", () => {
+    expect(slideBodyLines("  要点その一  \n\n second point \n\t\n三つ目 third")).toEqual([
+      "要点その一",
+      "second point",
+      "三つ目 third",
+    ]);
+  });
+
+  it("empty or whitespace-only text is no bullets (the slide stays detached with [])", () => {
+    expect(slideBodyLines("")).toEqual([]);
+    expect(slideBodyLines(" \n \n")).toEqual([]);
+  });
+
+  it("CRLF line ends leave no stray carriage return", () => {
+    expect(slideBodyLines("a\r\nb\r\n")).toEqual(["a", "b"]);
+  });
+});
+
+describe("slideBodyFieldValue (what the detached bullet field shows)", () => {
+  it("shows the stored lines, one per line, when nothing was typed here", () => {
+    expect(slideBodyFieldValue(["要点", "point"], null)).toBe("要点\npoint");
+    expect(slideBodyFieldValue([], null)).toBe("");
+  });
+
+  it("keeps a typed trailing space, a fresh empty line and a leading space while they mean the stored lines", () => {
+    // Fails if the field always shows the stored lines: the store trims and
+    // drops blanks, so Return (a new empty line) or a space would vanish.
+    expect(slideBodyFieldValue(["要点"], "要点 ")).toBe("要点 ");
+    expect(slideBodyFieldValue(["要点"], "要点\n")).toBe("要点\n");
+    expect(slideBodyFieldValue(["要点", "二"], "要点\n\n 二")).toBe("要点\n\n 二");
+    expect(slideBodyFieldValue([], "\n ")).toBe("\n ");
+  });
+
+  it("an outside change (undo/redo, Re-link, AI re-summarize) shows the stored lines at once", () => {
+    // Fails if a stale draft wins over the store (the old uncontrolled field
+    // kept the typed text on screen after 元に戻す).
+    expect(slideBodyFieldValue(["要点"], "要点\n追加")).toBe("要点");
+    expect(slideBodyFieldValue([], "消した行")).toBe("");
+    expect(slideBodyFieldValue(["AIの要約", "二行目"], "要点")).toBe("AIの要約\n二行目");
+  });
+
+  it("order matters: the same lines reordered are an outside change", () => {
+    expect(slideBodyFieldValue(["b", "a"], "a\nb")).toBe("b\na");
+  });
+});
+
+// QA 20261003 follow-up — the Slides diagram notices (SlideEditor.tsx) say a
+// diagram is not drawn on the in-app slides and reaches the .pptx only on a
+// slide with an image layout. These guard the TS half of that claim; the
+// export half is pptx.rs `diagram_snapshot_reaches_pptx_only_on_an_image_layout`.
+describe("diagrams on slides (what the diagram notices claim)", () => {
+  const diagram = (id: string, rendered?: string): Chunk => ({
+    ...chunk(id, "diagram", "graph TD; A-->B;"),
+    metadata: { chunkType: "diagram", linkedChunks: [], ...(rendered ? { renderedImage: rendered } : {}) },
+  });
+
+  it("are never a preview visual, even carrying an export snapshot (not drawn on slides)", () => {
+    const [s] = groupSlides([chunk("h", "heading", "図"), diagram("d", "data:image/png;base64,AA=="), chunk("i", "image", "u")]);
+    expect(slideImages(s).map((c) => c.id)).toEqual(["i"]);
+    expect(slideDiagrams(s).map((c) => c.id)).toEqual(["d"]);
+  });
+
+  it("do not make the auto layout an image layout (a diagram-only slide is title-content, like deck.rs)", () => {
+    // Fails if autoLayout starts counting diagrams as images — then a
+    // diagram-only slide WOULD export its diagram and the notice must change.
+    expect(autoLayout([chunk("h", "heading", "図"), diagram("d")])).toBe("title-content");
+    expect(autoLayout([chunk("h", "heading", "図"), diagram("d"), chunk("i", "image", "u")])).toBe("title-image");
   });
 });

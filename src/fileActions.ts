@@ -41,6 +41,24 @@ function markdownSavePayload(doc: Document): Document {
   return { ...doc, mode: "markdown", markdownSource: documentToMarkdown(doc) };
 }
 
+/**
+ * The baseline a .md save leaves behind, such that documentToMarkdown of it
+ * is exactly the bytes that reached disk (review follow-up, QA 20261003).
+ * A Markdown-mode doc already is that (its source, or the serialization
+ * written when it has none), so it is the baseline as is. Saved from the
+ * Editor or Slides view, `written.markdownSource` can be stale (an empty
+ * file written as "# title\n"; a stale baseline let deleting those bytes in
+ * the Markdown view read clean), and re-merging the written bytes into the
+ * chunks is not a fixed point ("Hello " → "Hello  \n"; that made every no-op
+ * ⌘S report "Document saved."), so the baseline is the written doc in
+ * Markdown mode carrying the written bytes. The live view keeps its mode:
+ * the "same as saved" contract (diff.ts sameAsSaved) never compares it.
+ */
+function markdownSavedBaseline(written: Document, payload: Document): Document {
+  if ((written.mode ?? "editor") === "markdown") return written;
+  return { ...written, mode: "markdown", markdownSource: payload.markdownSource };
+}
+
 function message(e: unknown): string {
   return typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
 }
@@ -572,6 +590,12 @@ export async function saveNativeAs(): Promise<boolean> {
     // keystroke) before this resolves. markTabClean anchors the new baseline
     // to what actually reached disk, not to whatever is live when it returns.
     const written = s.doc;
+    // …and end the typing session in the same tick (review follow-up C4, QA
+    // 20261003), after the dialog: a keystroke during the write then starts
+    // a new undo step whose snapshot is `written`, so undo can land on the
+    // saved state (MISS-12). Only while this tab + load is still the active
+    // one — another tab's session is not this save's to end.
+    if (ownsOp(ticket)) useStore.getState().endEditSession();
     // Which format to WRITE is decided by the extension the user actually
     // chose, not by mode — that's what makes Save As able to write .md for a
     // non-Markdown-mode document (rust.md rule 4 / CLAUDE.md invariant 5:
@@ -579,8 +603,11 @@ export async function saveNativeAs(): Promise<boolean> {
     // slide-only metadata don't round-trip — so it's reported as a warning on
     // the persistent health-bar surface, not silently degraded).
     const savingAsMarkdown = isMarkdownPath(path);
+    let baseline = written;
     if (savingAsMarkdown) {
-      await api.exportDocument(markdownSavePayload(written), path, "md");
+      const payload = markdownSavePayload(written);
+      await api.exportDocument(payload, path, "md");
+      baseline = markdownSavedBaseline(written, payload);
       if ((written.mode ?? "editor") !== "markdown") {
         s.setLastExportReport("md", [
           "Saved as Markdown — view mode and any slide-only details won't round-trip; reopening this file will load it as a Markdown document.",
@@ -589,7 +616,7 @@ export async function saveNativeAs(): Promise<boolean> {
     } else {
       await api.saveDocumentJson(written, path);
     }
-    if (!useStore.getState().markTabClean(ticket.tabId, ticket.docNonce, path, written)) return false;
+    if (!useStore.getState().markTabClean(ticket.tabId, ticket.docNonce, path, baseline)) return false;
     saved = true;
     clearSessionIfAllSaved();
     s.notify(tNow("Document saved."), "success");
@@ -626,15 +653,21 @@ export async function saveNative(): Promise<boolean> {
   let saved = false;
   try {
     const written = s.doc;
+    // Same tick as the capture (review follow-up C4, QA 20261003): a
+    // keystroke during the write starts a new undo step from `written`.
+    useStore.getState().endEditSession();
     // Saving again with nothing changed still writes (the file on disk stays
     // authoritative), but quietly: "Document saved." only when it says news.
     const unchanged = unchangedSinceSave(written, s.savedDoc, isMarkdownPath(path));
+    let baseline = written;
     if (isMarkdownPath(path)) {
-      await api.exportDocument(markdownSavePayload(written), path, "md");
+      const payload = markdownSavePayload(written);
+      await api.exportDocument(payload, path, "md");
+      baseline = markdownSavedBaseline(written, payload);
     } else {
       await api.saveDocumentJson(written, path);
     }
-    if (!useStore.getState().markTabClean(ticket.tabId, ticket.docNonce, undefined, written)) return false;
+    if (!useStore.getState().markTabClean(ticket.tabId, ticket.docNonce, undefined, baseline)) return false;
     saved = true;
     clearSessionIfAllSaved();
     if (!unchanged) s.notify(tNow("Document saved."), "success");

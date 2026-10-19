@@ -119,6 +119,7 @@ function CommentRow({ chunkId, comment }: { chunkId: string; comment: ReviewComm
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
+            data-unsent={draft.trim() !== comment.text ? "true" : undefined}
             rows={2}
             autoFocus
             className="w-full resize-none rounded border border-gray-200 bg-white p-1.5 text-xs text-ink-soft outline-none focus:border-accent"
@@ -156,8 +157,13 @@ export default function ReviewPanel() {
   const reviewTargetChunkId = useStore((s) => s.reviewTargetChunkId);
   const setReviewTarget = useStore((s) => s.setReviewTarget);
   const addComment = useStore((s) => s.addComment);
-  // One close path for the ✕ button and Esc (BUG-006, QA 20261003).
-  const closePanel = usePanelEscape("review", () => toggleReviewPanel(false));
+  // One close path for the ✕ button and Esc (BUG-006, QA 20261003). Esc
+  // keeps the panel open while a comment is unsent (the composer, or an edit
+  // that changed the text) and focuses it instead of dropping it.
+  const closePanel = usePanelEscape("review", () => toggleReviewPanel(false), {
+    unsentInput: () =>
+      document.querySelector<HTMLElement>('[data-docked-panel="review"] [data-unsent="true"]'),
+  });
 
   const [composerText, setComposerText] = useState("");
   const [showResolved, setShowResolved] = useState(false);
@@ -192,9 +198,9 @@ export default function ReviewPanel() {
   return (
     <aside
       data-docked-panel="review"
-      className="flex h-full w-80 shrink-0 flex-col border-l border-gray-200 bg-white"
+      className="flex h-full w-80 shrink-0 flex-col border-l border-chrome-line bg-white"
     >
-      <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2">
+      <div className="flex items-center justify-between border-b border-chrome-line px-3 py-2">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
           <CommentIcon />{t("Review")}</div>
         <div className="flex items-center gap-1">
@@ -218,7 +224,7 @@ export default function ReviewPanel() {
           </button>
           <button
             onClick={closePanel}
-            className="rounded p-1 text-ink-faint hover:bg-gray-100 hover:text-ink"
+            className="rounded p-1 text-ink-faint hover:bg-chrome-hairline hover:text-ink"
             aria-label={t("Close panel")}
             title={t("Close panel (Esc)")}
           >
@@ -242,6 +248,7 @@ export default function ReviewPanel() {
             <textarea
               value={composerText}
               onChange={(e) => setComposerText(e.target.value)}
+              data-unsent={composerText.trim() ? "true" : undefined}
               rows={2}
               autoFocus
               placeholder={t("Add a comment…")}

@@ -4,22 +4,27 @@ import {
   panelEscapeTarget,
   panelFocusReturnIndex,
   shouldReturnPanelFocus,
+  unsentFocusAllowed,
   type PanelEscapeContext,
   type PanelFocusCandidate,
 } from "./panelEscape";
 import type { TargetKind } from "./shortcuts";
 
-// Pure half of Esc-to-close for the right-docked side panels (BUG-006, QA
-// 20261003). The wiring guards proving usePanelEscape / ReviewPanel /
-// NetworkPanel actually call these live in panelEscapeContract.test.ts.
+// Pure half of Esc-to-close for the docked panels and popovers (BUG-006, QA
+// 20261003; review follow-up for the editor-focus path and the
+// post-composition Esc). The wiring guards proving usePanelEscape and each
+// panel actually call these live in panelEscapeContract.test.ts.
 
-/** Review panel open alone, Esc pressed with nothing focused (the QA repro). */
+/** Review panel open alone, Esc pressed with nothing focused (the QA repro),
+ *  long after the last IME composition ended. */
 const base: PanelEscapeContext = {
   panels: ["review"],
   targetPanel: null,
   targetKind: "none",
   modalOpen: false,
   presenting: false,
+  lastCompositionEnd: 0,
+  now: 1_000_000,
 };
 const esc = { key: "Escape" };
 
@@ -78,20 +83,85 @@ describe("panelEscapeTarget — every guard returns null", () => {
     expect(panelEscapeTarget(esc, { ...base, presenting: true })).toBeNull();
   });
 
-  it("never acts from an editable target — outside the panel or inside it (unsent comment text)", () => {
+  // Review follow-up (QA 20261003): unsent text lives in a panel's own fields.
+  // Fails if the in-panel editable check is dropped.
+  it("never acts from a text field inside a panel (unsent comment text lives there)", () => {
     const editable: TargetKind[] = ["doc-history", "codemirror", "find-bar", "other-editable"];
     for (const targetKind of editable) {
-      expect(panelEscapeTarget(esc, { ...base, targetKind }), targetKind).toBeNull();
       expect(panelEscapeTarget(esc, { ...base, targetKind, targetPanel: "review" }), `${targetKind} in panel`).toBeNull();
+    }
+  });
+
+  // Fails if the out-of-panel rule allows every editable kind (title input,
+  // dialog fields, the find bar's own Esc).
+  it("never acts from the find bar or another text field outside the panels (title, dialog fields)", () => {
+    for (const targetKind of ["find-bar", "other-editable"] as TargetKind[]) {
+      expect(panelEscapeTarget(esc, { ...base, targetKind }), targetKind).toBeNull();
+    }
+    // Allow-list, not deny-list: a target kind added later refuses by default.
+    expect(panelEscapeTarget(esc, { ...base, targetKind: "some-new-kind" as TargetKind })).toBeNull();
+  });
+
+  // Fails if the decision checks only isImeKeyEvent (no post-composition
+  // window) or ignores ctx.lastCompositionEnd.
+  it("never acts on WebKit's late Esc that ends a composition (within 80 ms of compositionend)", () => {
+    for (const targetKind of ["none", "doc-history"] as TargetKind[]) {
+      const just = { ...base, targetKind, lastCompositionEnd: base.now - 10 };
+      expect(panelEscapeTarget(esc, just), `${targetKind} 10 ms after`).toBeNull();
+      expect(panelEscapeTarget(esc, { ...just, lastCompositionEnd: base.now - 79 }), `${targetKind} 79 ms after`).toBeNull();
+      expect(panelEscapeTarget(esc, { ...just, lastCompositionEnd: base.now - 80 }), `${targetKind} 80 ms after`).toBe("review");
+    }
+  });
+
+  // The out-of-panel rule is safe only because local Esc users claim the key:
+  // ghost text / DraftBlock (doc-history), CodeMirror's simplifySelection.
+  it("never acts on an Esc the editor already claimed (ghost text, DraftBlock, CodeMirror selection)", () => {
+    for (const targetKind of ["doc-history", "codemirror"] as TargetKind[]) {
+      expect(panelEscapeTarget({ ...esc, defaultPrevented: true }, { ...base, targetKind }), targetKind).toBeNull();
     }
   });
 
   it("does nothing when no panel is open", () => {
     expect(panelEscapeTarget(esc, { ...base, panels: [] })).toBeNull();
+    expect(panelEscapeTarget(esc, { ...base, panels: [], targetKind: "doc-history" })).toBeNull();
   });
 
-  it("leaves focus inside a docked surface that is not registered for Esc alone", () => {
-    expect(panelEscapeTarget(esc, { ...base, targetPanel: "diff" })).toBeNull();
+  // Defensive: panelEscapeContract.test.ts keeps every tagged surface
+  // registered, so this covers only a surface missing from the open stack
+  // (e.g. between its unmount and the next key).
+  it("leaves focus inside a tagged surface that is not on the open stack alone", () => {
+    expect(panelEscapeTarget(esc, { ...base, targetPanel: "not-on-the-stack" })).toBeNull();
+  });
+});
+
+// Review follow-up (QA 20261003, BUG-006 keyboard path): after ⌘K → "Show
+// review comments" the palette puts focus back in the paragraph, and the
+// native Analyze menu leaves it in the editor. Esc there must close the panel.
+describe("panelEscapeTarget — Esc from the editor outside any panel", () => {
+  // Fails on the old rule `if (ctx.targetKind !== "none") return null;`.
+  it("closes the most recently opened panel from a paragraph (document-history field)", () => {
+    for (const targetKind of ["doc-history"] as TargetKind[]) {
+      expect(panelEscapeTarget(esc, { ...base, targetKind }), targetKind).toBe("review");
+      expect(panelEscapeTarget(esc, { ...base, targetKind, panels: ["review", "network"] }), targetKind).toBe("network");
+      expect(panelEscapeTarget(esc, { ...base, targetKind, panels: ["network", "review"] }), targetKind).toBe("review");
+    }
+  });
+
+  // Review follow-up: CodeMirror uses an unclaimed Esc itself — it turns on
+  // its Tab-focus mode for two seconds (Esc, then Tab leaves the source, the
+  // only keyboard way out since Tab indents). Fails if "codemirror" is put
+  // back on the allow-list.
+  it("leaves an Esc in the Markdown source to CodeMirror (its Esc-then-Tab way out)", () => {
+    expect(panelEscapeTarget(esc, { ...base, targetKind: "codemirror" })).toBeNull();
+    expect(panelEscapeTarget(esc, { ...base, targetKind: "codemirror", panels: ["review", "network"] })).toBeNull();
+  });
+
+  it("still ignores IME keys and modified Esc there", () => {
+    for (const targetKind of ["doc-history", "codemirror"] as TargetKind[]) {
+      expect(panelEscapeTarget({ ...esc, isComposing: true }, { ...base, targetKind }), targetKind).toBeNull();
+      expect(panelEscapeTarget({ ...esc, keyCode: 229 }, { ...base, targetKind }), targetKind).toBeNull();
+      expect(panelEscapeTarget({ ...esc, shiftKey: true }, { ...base, targetKind }), targetKind).toBeNull();
+    }
   });
 });
 
@@ -152,5 +222,18 @@ describe("panelFocusReturnIndex — opener first, then the panel's toolbar toggl
     expect(panelFocusReturnIndex([{ ...ok, isBody: true }, { ...ok, disabled: true }])).toBe(-1);
     expect(panelFocusReturnIndex([null, null])).toBe(-1);
     expect(panelFocusReturnIndex([])).toBe(-1);
+  });
+});
+
+// Review follow-up (QA 20261003): with an unsent Review comment, Esc keeps the
+// panel open and shows the comment — but an Esc typed in the document must not
+// pull the caret out of the paragraph into the composer.
+describe("unsentFocusAllowed — where an Esc may move focus to unsent text", () => {
+  it("from inside the closing panel or a non-editable target only", () => {
+    expect(unsentFocusAllowed("review", { targetPanel: "review", targetKind: "none" })).toBe(true);
+    expect(unsentFocusAllowed("review", { targetPanel: null, targetKind: "none" })).toBe(true);
+    // Fails if the rule ignores where the Esc came from.
+    expect(unsentFocusAllowed("review", { targetPanel: null, targetKind: "doc-history" })).toBe(false);
+    expect(unsentFocusAllowed("review", { targetPanel: "network", targetKind: "none" })).toBe(false);
   });
 });

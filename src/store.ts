@@ -8,8 +8,9 @@
 import { create } from "zustand";
 import { PREVIEW_ZOOM_MAX, PREVIEW_ZOOM_MIN } from "./previewViewport";
 import { documentToMarkdown, markdownToDocument, withMarkdownTitle } from "./markdown";
+import { sameAsSaved } from "./diff";
 import { type FindOptions, isSearchableChunk, replaceAll } from "./findReplace";
-import { groupSlides } from "./slides";
+import { groupSlides, sameSlideBodyLines, slideBodyLines } from "./slides";
 // i18n imports this module too; tNow only reads the store when CALLED (never
 // at module init), so the cycle is safe.
 import { tNow } from "./i18n";
@@ -341,21 +342,31 @@ function nextDocNonce(): number {
 }
 let opCounter = 0;
 
+/** The run of consecutive setTitle calls in progress (see setTitle). UI-only,
+ *  never persisted; `after` is the doc the last call produced. The run
+ *  continues exactly while the live doc IS that object: switching to another
+ *  tab and back, or undo/redo onto it, resumes the run (safe: Documents are
+ *  immutable, so the same object is the same content). Any other write that
+ *  produces a new doc ends it — an edit, a view switch, and (one variable for
+ *  all tabs) a title edit in another tab. Pinned in store.test.ts (BUG-001). */
+let titleRun: { title: string; markdownSource: string | undefined; after: Document } | null = null;
+
 /**
- * Whether two documents hold the same content (MISS-12: undo back to the
- * saved state is clean). Reference equality first (the common case: undo
- * restores the exact snapshot object), then a structural fallback that
- * reuses unchanged chunk identity and JSON-compares the rest. Conservative:
- * it may report "different" for equal data with reordered keys (→ dirty,
- * safe), never "same" for different data.
+ * `dirty` for `doc` against the tab's baseline — the ONE rule every edit,
+ * undo/redo and save mark derives it with (BUG-001/005/007, QA 20261003):
+ * clean only when the baseline needs no saving (MISS-12: AI drafts, repaired
+ * files and dirty restored tabs stay dirty) and `doc` matches it by
+ * diff.ts `sameAsSaved` — the predicate the health bar's changeSummary
+ * agrees with, so after any of those 未保存 never sits next to
+ * 保存時と同じ内容 for a clean baseline. (The old JSON comparison counted
+ * `mode`/`markdownSource`, so undo after a view switch could never land on
+ * clean.) setMode alone keeps `dirty` as is (BUG-019a): sameAsSaved ignores
+ * what a view switch changes, except where a blank Markdown source gets a
+ * stored serialization — the two known cases listed in healthLabels.ts
+ * (review follow-up C1, QA 20261003), pinned in store.test.ts.
  */
-function sameDocument(a: Document, b: Document | null): boolean {
-  if (a === b) return true;
-  if (!b || a.chunks.length !== b.chunks.length) return false;
-  const { chunks: ac, ...aRest } = a;
-  const { chunks: bc, ...bRest } = b;
-  if (JSON.stringify(aRest) !== JSON.stringify(bRest)) return false;
-  return ac.every((c, i) => c === bc[i] || JSON.stringify(c) === JSON.stringify(bc[i]));
+function dirtyAgainst(s: { savedDoc: Document | null; savedDocIsClean: boolean }, doc: Document): boolean {
+  return !(s.savedDocIsClean && sameAsSaved(s.savedDoc, doc));
 }
 
 /**
@@ -651,7 +662,24 @@ interface AppActions {
   // library — see fileActions.ts's save flow for what a confirmed chunk does.
   setChunkConfirmed: (id: string, confirmed: boolean) => void;
   setSlideBody: (leadId: string, body: string[] | null) => void;
+  /** Live detached-slide bullet typing (QA 20261003 follow-up, the BUG-007
+   *  class): `text` is the field's raw value, stored as slideBodyLines(text)
+   *  on a DETACHED lead only, coalesced into one undo step per typing
+   *  session — same boundary rules as updateChunkNotes. */
+  updateSlideBody: (
+    leadId: string,
+    text: string,
+    options?: { newUndoStep?: boolean; composing?: boolean }
+  ) => void;
   setChunkNotes: (id: string, notes: string) => void;
+  /** Live speaker-notes typing (BUG-007, QA 20261003): writes on every
+   *  keystroke, coalesced into one undo step per typing session on that
+   *  chunk's notes — same boundary rules as updateChunkContent. */
+  updateChunkNotes: (
+    id: string,
+    notes: string,
+    options?: { newUndoStep?: boolean; composing?: boolean }
+  ) => void;
   replaceChunksWithTexts: (ids: string[], texts: string[]) => void;
   splitSlideBefore: (chunkId: string) => string | null;
   mergeSlideIntoPrevious: (headingChunkId: string) => string | null;
@@ -749,7 +777,8 @@ interface AppActions {
   setReviewTarget: (id: string | null) => void;
   toggleDiffPanel: (open?: boolean) => void;
   openPresentation: () => void;
-  closePresentation: () => void;
+  /** Close the overlay, focusing `focusChunkId` — the exit slide's lead (BUG-009). */
+  closePresentation: (focusChunkId?: string | null) => void;
 
   // Review comments (per-chunk, persisted in metadata.comments). All undoable;
   // comments never invalidate the relationship graph (marksStale:false).
@@ -800,6 +829,15 @@ interface AppActions {
     filePath: string | undefined,
     savedDocument: Document
   ) => boolean;
+  /**
+   * End the active tab's typing session (review follow-up C4, QA 20261003):
+   * the next keystroke starts a new undo step. The save paths call it in the
+   * same tick they capture the document to write, so a keystroke during the
+   * async write gets a step whose snapshot is exactly what was written and
+   * undo can land on the saved state (MISS-12). Touches nothing else — not
+   * the document, history or dirty flag. markTabClean still resets it too.
+   */
+  endEditSession: () => void;
 }
 
 const MAX_HISTORY = 100;
@@ -977,7 +1015,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         doc: next,
         past,
         future: [],
-        dirty: true,
+        dirty: dirtyAgainst(state, next),
         lastEditChunkId: null,
         analysisStale: (opts?.marksStale ?? true) ? true : state.analysisStale,
       };
@@ -1270,18 +1308,40 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     },
 
     // The Markdown baseline keeps everything but its title line (BUG-019b).
+    // Title edits are field edits, outside the document history (KI-06), so
+    // ⌘Z in the title field reverts the value through here. Once the title is
+    // back to the saved one and only title rewrites separate the baseline
+    // from the saved source, the saved bytes come back exactly (H1 marker
+    // style, cleared blank lines, an H1 the .md never had) and `dirty` is
+    // recomputed rather than forced — so a reverted title is clean (BUG-001,
+    // QA 20261003).
+    // BUG-001 (QA 20261003): a title typed and then undone in the field
+    // (execCommand("undo") → onChange) must leave the document exactly as it
+    // was. withMarkdownTitle canonicalises the H1, so returning to the run's
+    // starting title restores the Markdown bytes from the START OF THE RUN —
+    // provenance, not a guess from the bytes, so a source edit the user made
+    // before the run is never rolled back. A run continues exactly while the
+    // live doc is the object the last setTitle produced (see titleRun):
+    // switching tabs away and back, or undo/redo onto that object, resumes
+    // it; any other write that produces a new doc — an edit, a view switch, a
+    // title edit in another tab (titleRun is global) — ends it. Title edits
+    // stay outside the undo history (KI-06).
     setTitle: (title) =>
-      set((s) => ({
-        doc: {
-          ...s.doc,
-          title,
-          markdownSource:
-            s.doc.markdownSource === undefined
-              ? undefined
-              : withMarkdownTitle(s.doc.markdownSource, title),
-        },
-        dirty: true,
-      })),
+      set((s) => {
+        const run =
+          titleRun && titleRun.after === s.doc
+            ? titleRun
+            : { title: s.doc.title, markdownSource: s.doc.markdownSource };
+        const markdownSource =
+          s.doc.markdownSource === undefined
+            ? undefined
+            : title === run.title
+              ? run.markdownSource
+              : withMarkdownTitle(s.doc.markdownSource, title);
+        const doc = { ...s.doc, title, markdownSource };
+        titleRun = { title: run.title, markdownSource: run.markdownSource, after: doc };
+        return { doc, dirty: dirtyAgainst(s, doc) };
+      }),
 
     // Switch the current document between the "editor", "slide" and
     // "markdown" views. All render the SAME chunk model, so this only flips
@@ -1319,13 +1379,14 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         const marker = "__markdown__";
         const startNewUndoStep =
           options?.newUndoStep || state.past.length === 0 || state.lastEditChunkId !== marker;
+        const doc = markdownToDocument(state.doc, source);
         return {
-          doc: markdownToDocument(state.doc, source),
+          doc,
           past: startNewUndoStep
             ? [...state.past, state.doc].slice(-MAX_HISTORY)
             : state.past,
           future: [],
-          dirty: true,
+          dirty: dirtyAgainst(state, doc),
           lastEditChunkId: options?.newUndoStep ? "__markdown_preview__" : marker,
           lastAiEditChunkId: null,
           analysis: null,
@@ -1352,13 +1413,14 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         const past = startNewUndoStep
           ? [...state.past, state.doc].slice(-MAX_HISTORY)
           : state.past;
+        const doc = mapChunks(state.doc, (chunks) =>
+          chunks.map((c) => (c.id === id ? { ...c, content } : c))
+        );
         return {
-          doc: mapChunks(state.doc, (chunks) =>
-            chunks.map((c) => (c.id === id ? { ...c, content } : c))
-          ),
+          doc,
           past,
           future: [],
-          dirty: true,
+          dirty: dirtyAgainst(state, doc),
           lastEditChunkId: id,
           lastEditAt: now,
           // Manual typing dismisses any pending AI-change highlight.
@@ -1394,7 +1456,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           doc: next,
           past,
           future: [],
-          dirty: true,
+          dirty: dirtyAgainst(state, next),
           lastEditChunkId: null,
           lastAiEditChunkId: id,
           analysisStale: true, // AI-replaced text → graph is out of date (A3)
@@ -1427,7 +1489,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           doc: next,
           past,
           future: [],
-          dirty: true,
+          dirty: dirtyAgainst(state, next),
           lastEditChunkId: null,
           analysisStale: true, // swapped version → graph is out of date (A3)
         };
@@ -1972,6 +2034,50 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         { marksStale: false }
       ),
 
+    // The detached-slide bullet field's writer (QA 20261003 follow-up, the
+    // BUG-007 class): the field used to commit only on blur, so typing left
+    // the tab 保存済み with Undo disabled and the blur commit swallowed the
+    // first tab-close click. Stores the normalised lines (slideBodyLines —
+    // the normalisation the blur commit applied); a keystroke that changes no
+    // stored line (a trailing space, a fresh empty line) records nothing, so
+    // the field can keep showing it (slideBodyFieldValue). Writes only a lead
+    // that is already detached: typing never detaches or re-links a slide
+    // (setSlideBody does). Session boundaries mirror updateChunkNotes: another
+    // slide, an explicit `newUndoStep`, or an idle gap > UNDO_IDLE_MS — never
+    // inside an IME composition (`composing`); the marker differs from the
+    // chunk id and the notes marker, so title, notes and bullets are separate
+    // steps. Presentation-only, like setSlideBody: the graph stays fresh.
+    updateSlideBody: (leadId, text, options) =>
+      set((state) => {
+        const target = state.doc.chunks.find((c) => c.id === leadId);
+        const stored = target?.metadata.slideBody;
+        if (!target || stored === undefined) return state;
+        const now = Date.now();
+        const marker = `__slideBody__:${leadId}`;
+        const body = slideBodyLines(text);
+        // A keystroke that stores nothing (a space between words, a fresh
+        // empty line) is still typing: it keeps THIS field's session open.
+        if (sameSlideBodyLines(stored, body)) {
+          return state.lastEditChunkId === marker ? { lastEditAt: now } : state;
+        }
+        const startNewUndoStep =
+          !!options?.newUndoStep ||
+          state.past.length === 0 ||
+          state.lastEditChunkId !== marker ||
+          (!options?.composing && now - state.lastEditAt > UNDO_IDLE_MS);
+        const doc = mapChunks(state.doc, (chunks) =>
+          chunks.map((c) => (c.id === leadId ? { ...c, metadata: { ...c.metadata, slideBody: body } } : c))
+        );
+        return {
+          doc,
+          past: startNewUndoStep ? [...state.past, state.doc].slice(-MAX_HISTORY) : state.past,
+          future: [],
+          dirty: dirtyAgainst(state, doc),
+          lastEditChunkId: marker,
+          lastEditAt: now,
+        };
+      }),
+
     // Set a slide's speaker notes on its heading chunk (item 1-1). Presentation-
     // only, so it doesn't invalidate the relationship graph — same rationale as
     // setChunkSubtitle/setSlideBody. A blank (after-trim) string is stored as
@@ -1989,6 +2095,45 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           ),
         { marksStale: false }
       ),
+
+    // The SpeakerNotes field's writer (BUG-007, QA 20261003): the old field
+    // committed only on blur, so typing left the tab 保存済み with Undo
+    // disabled, and the blur commit swallowed the first tab-close click. Same
+    // normalisation as setChunkNotes (whitespace-only → undefined); a
+    // keystroke that changes nothing stored (a first space) records nothing.
+    // Session boundaries mirror updateChunkContent: another chunk, an
+    // explicit `newUndoStep`, or an idle gap > UNDO_IDLE_MS — never inside an
+    // IME composition (`composing`). The marker differs from the chunk id, so
+    // a slide's title and its notes are separate steps.
+    updateChunkNotes: (id, notes, options) =>
+      set((state) => {
+        const value = notes.trim() ? notes : undefined;
+        const target = state.doc.chunks.find((c) => c.id === id);
+        const now = Date.now();
+        const marker = `__notes__:${id}`;
+        if (!target) return state;
+        // A keystroke that stores nothing still keeps this field's session open.
+        if (target.metadata.notes === value) {
+          return state.lastEditChunkId === marker ? { lastEditAt: now } : state;
+        }
+        const startNewUndoStep =
+          !!options?.newUndoStep ||
+          state.past.length === 0 ||
+          state.lastEditChunkId !== marker ||
+          (!options?.composing && now - state.lastEditAt > UNDO_IDLE_MS);
+        const doc = mapChunks(state.doc, (chunks) =>
+          chunks.map((c) => (c.id === id ? { ...c, metadata: { ...c.metadata, notes: value } } : c))
+        );
+        return {
+          doc,
+          past: startNewUndoStep ? [...state.past, state.doc].slice(-MAX_HISTORY) : state.past,
+          future: [],
+          dirty: dirtyAgainst(state, doc),
+          lastEditChunkId: marker,
+          lastEditAt: now,
+          // Presentation-only: the relationship graph stays as it was.
+        };
+      }),
 
     // Replace a set of chunks with fresh text chunks (one per string), inserted
     // at the position of the first removed chunk. Used by AI "Bulletize" to turn
@@ -2163,19 +2308,22 @@ export const useStore = create<AppState & AppActions>((set, get) => {
         return false;
       }
       const content = g.prefix + g.text;
-      set((state) => ({
-        doc: mapChunks(state.doc, (chunks) =>
+      set((state) => {
+        const doc = mapChunks(state.doc, (chunks) =>
           chunks.map((c) => (c.id === chunkId ? { ...c, content } : c))
-        ),
-        past: [...state.past, state.doc].slice(-MAX_HISTORY),
-        future: [],
-        dirty: true,
-        // Typing after the accept starts yet another step.
-        lastEditChunkId: null,
-        lastAiEditChunkId: null,
-        analysisStale: true, // edited text → graph is out of date (A3)
-        ...ghostReset(state),
-      }));
+        );
+        return {
+          doc,
+          past: [...state.past, state.doc].slice(-MAX_HISTORY),
+          future: [],
+          dirty: dirtyAgainst(state, doc),
+          // Typing after the accept starts yet another step.
+          lastEditChunkId: null,
+          lastAiEditChunkId: null,
+          analysisStale: true, // edited text → graph is out of date (A3)
+          ...ghostReset(state),
+        };
+      });
       get().logAiOp({ ...log, phase: "commit" });
       return true;
     },
@@ -2421,15 +2569,19 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           !hasGraph(state.doc.analysis) &&
           chunks.every((c, i) => c === state.doc.chunks[i]);
         if (nothingToRecord) return { analysis: stamped, analysisStale: textChanged };
+        const doc = { ...state.doc, chunks, analysis: stamped };
         return {
           // Persist the full graph on the document so it survives save/reopen
           // (single source of truth; also keep linkedChunks for the §5 model).
-          doc: { ...state.doc, chunks, analysis: stamped },
+          doc,
           analysis: stamped,
           // Snapshot so Analyze is a discrete, undoable step (B4)…
           past: [...state.past, state.doc].slice(-MAX_HISTORY),
-          dirty: true,
+          dirty: dirtyAgainst(state, doc),
           future: [],
+          // …that also ends the typing session, so later keystrokes never
+          // coalesce into it (review follow-up, QA 20261003).
+          lastEditChunkId: null,
           // …and the freshly-built graph matches the document (A3) — unless
           // the text moved on while the analysis ran (state-async-4).
           analysisStale: textChanged || structurallyStale({ ...state.doc, chunks, analysis: stamped }),
@@ -2476,7 +2628,17 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     // toggle) so the palette entry and the Slide editor's Present button both
     // read as an unambiguous "start"/"stop", matching openSettings/closeSettings.
     openPresentation: () => set({ presentationOpen: true }),
-    closePresentation: () => set({ presentationOpen: false }),
+    // BUG-009 (QA 20261003): exiting selects the slide that was on screen.
+    // PresentationMode passes its lead chunk (presentationExitFocus); focusing
+    // it moves the Slides rail there and the next Present starts there. A
+    // selection change only — no undo step, no dirty mark. An id no longer in
+    // the document (the deck changed while presenting) just closes.
+    closePresentation: (focusChunkId) =>
+      set((s) =>
+        focusChunkId && s.doc.chunks.some((c) => c.id === focusChunkId)
+          ? { presentationOpen: false, focusedChunkId: focusChunkId }
+          : { presentationOpen: false }
+      ),
 
     // ----- review comments (persisted in chunk metadata; spec mismatch §2) -----
     addComment: (chunkId, text, author = "user", kind) => {
@@ -2617,7 +2779,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           future: [state.doc, ...state.future].slice(0, MAX_HISTORY),
           // Back at the saved state → clean again (MISS-12); an unsaved
           // baseline (AI draft, repaired file) stays dirty.
-          dirty: !(state.savedDocIsClean && sameDocument(previous, state.savedDoc)),
+          dirty: dirtyAgainst(state, previous),
           lastEditChunkId: null,
           // Re-derive the graph for the restored doc so NetworkPanel + the saved
           // .aix don't keep showing the pre-undo relationships (B4); recompute the
@@ -2635,7 +2797,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
           doc: next,
           past: [...state.past, state.doc].slice(-MAX_HISTORY),
           future: rest,
-          dirty: !(state.savedDocIsClean && sameDocument(next, state.savedDoc)),
+          dirty: dirtyAgainst(state, next),
           lastEditChunkId: null,
           analysis: next.analysis ?? rebuildAnalysis(next),
           analysisStale: structurallyStale(next),
@@ -2644,7 +2806,9 @@ export const useStore = create<AppState & AppActions>((set, get) => {
 
     markClean: (filePath, savedDocument) =>
       set((s) => ({
-        dirty: false,
+        // Clean unless the live doc moved past what was written — the same
+        // rule as markTabClean (QA 20261003: one dirty notion).
+        dirty: !sameAsSaved(savedDocument ?? s.doc, s.doc),
         filePath: filePath === undefined ? s.filePath : filePath,
         // The just-saved document IS the new baseline (item 1-2). Callers pass
         // the EXACT doc they wrote so a keystroke can never be silently
@@ -2660,7 +2824,7 @@ export const useStore = create<AppState & AppActions>((set, get) => {
     markTabClean: (tabId, docNonce, filePath, savedDocument) => {
       const s = get();
       const patchFor = (live: Document, path: string | null) => ({
-        dirty: !sameDocument(live, savedDocument),
+        dirty: !sameAsSaved(savedDocument, live),
         filePath: filePath === undefined ? path : filePath,
         savedDoc: savedDocument,
         savedDocIsClean: true,
@@ -2676,6 +2840,8 @@ export const useStore = create<AppState & AppActions>((set, get) => {
       set({ inactiveTabs: { ...s.inactiveTabs, [tabId]: { ...snap, ...patchFor(snap.doc, snap.filePath) } } });
       return true;
     },
+
+    endEditSession: () => set((s) => (s.lastEditChunkId === null ? s : { lastEditChunkId: null })),
   };
 });
 

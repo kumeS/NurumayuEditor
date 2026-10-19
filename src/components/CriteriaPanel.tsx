@@ -15,12 +15,22 @@
 // store.ts. It renders as a non-modal, dismissible, corner-docked panel (UI
 // rule: no new modal when a docked panel suffices) rather than a blocking
 // dialog, since checking criteria coverage never needs to block editing.
+//
+// Esc closes it (review follow-up, QA 20261003): the always-mounted wrapper
+// keeps the typed criteria and the last result, and renders CriteriaPanelFrame
+// only while open — the frame registers usePanelEscape("criteria") (mount =
+// open; never called conditionally), carries data-docked-panel, and its ✕
+// shares the hook's closer. Esc inside the criteria field stays with the
+// field. Wiring guarded in panelEscapeContract.test.ts; real key/focus routing
+// by the manual QA run.
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { create } from "zustand";
 import { checkAgainstCriteria, type CriteriaCheckResult } from "../aiActions";
 import { translateWith, useLang, useT } from "../i18n";
 import { useStore } from "../store";
+import { usePanelEscape } from "../usePanelEscape";
+import { closeOtherCornerPanels, registerCornerPanel } from "../cornerPanels";
 import { CheckSquareIcon, CloseIcon, SquareIcon } from "./icons";
 
 interface CriteriaPanelStore {
@@ -30,11 +40,17 @@ interface CriteriaPanelStore {
 }
 
 /** Standalone panel-visibility store — see the module doc comment above. */
-export const useCriteriaPanelStore = create<CriteriaPanelStore>((set) => ({
+export const useCriteriaPanelStore = create<CriteriaPanelStore>((set, get) => ({
   open: false,
-  setOpen: (open) => set({ open }),
-  toggle: () => set((s) => ({ open: !s.open })),
+  // The corner shows one panel at a time (cornerPanels.ts).
+  setOpen: (open) => {
+    if (open) closeOtherCornerPanels("criteria");
+    set({ open });
+  },
+  toggle: () => get().setOpen(!get().open),
 }));
+
+registerCornerPanel("criteria", () => useCriteriaPanelStore.setState({ open: false }));
 
 /** Imperative helper for callers outside React (e.g. CommandPalette entries). */
 export function openCriteriaPanel(): void {
@@ -46,6 +62,34 @@ function chunkPreview(content: string, max = 60): string {
   const text = content.trim().replace(/\s+/g, " ");
   if (!text) return "(empty paragraph)";
   return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/** The open panel's root, header and ✕ — mounted only while open (mount = open). */
+function CriteriaPanelFrame({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  const t = useT();
+  const closePanel = usePanelEscape("criteria", onClose);
+  return (
+    <div
+      data-docked-panel="criteria"
+      className="fixed bottom-9 right-2 z-40 w-96 rounded-lg border border-chrome-line bg-white p-3 shadow-2xl"
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
+          <CheckSquareIcon className="h-4 w-4" />
+          {t("Review criteria coverage")}
+        </div>
+        <button
+          onClick={closePanel}
+          className="text-ink-faint hover:text-ink"
+          aria-label={t("Close review criteria panel")}
+          title={t("Close (Esc)")}
+        >
+          <CloseIcon className="h-4 w-4" />
+        </button>
+      </div>
+      {children}
+    </div>
+  );
 }
 
 export default function CriteriaPanel() {
@@ -95,22 +139,7 @@ export default function CriteriaPanel() {
   };
 
   return (
-    <div className="fixed bottom-9 right-2 z-40 w-96 rounded-lg border border-gray-200 bg-white p-3 shadow-2xl">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-          <CheckSquareIcon className="h-4 w-4" />
-          {t("Review criteria coverage")}
-        </div>
-        <button
-          onClick={() => setOpen(false)}
-          className="text-ink-faint hover:text-ink"
-          aria-label={t("Close review criteria panel")}
-          title={t("Close")}
-        >
-          <CloseIcon className="h-4 w-4" />
-        </button>
-      </div>
-
+    <CriteriaPanelFrame onClose={() => setOpen(false)}>
       <p className="mb-2 text-xs text-ink-faint">
         {t(
           "Type your own review criteria, one per line (e.g. from a grant's review rubric) — this app has no built-in list. The AI checks whether each one has a supporting paragraph anywhere in the document (run Analyze first)."
@@ -209,6 +238,6 @@ export default function CriteriaPanel() {
           ))}
         </ul>
       )}
-    </div>
+    </CriteriaPanelFrame>
   );
 }

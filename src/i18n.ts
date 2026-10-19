@@ -67,6 +67,9 @@ export const JA: Record<string, string> = {
   "No matches": "一致なし",
   "{n} matches": "{n} 件",
   "Replaced {n}.": "{n} 件を置換しました",
+  // C12 (review follow-up, QA 20261003): Replace All where every match
+  // already reads the replacement.
+  "Nothing to change.": "変更箇所はありません",
   "Line number": "行番号",
   Go: "移動",
   "Lines 1–{total}": "1–{total} 行",
@@ -234,6 +237,8 @@ export const JA: Record<string, string> = {
   Clear: "クリア",
   "Click a paragraph title to jump to it in the editor.": "段落タイトルをクリックすると、エディタの該当箇所へ移動します。",
   Close: "閉じる",
+  // KI-35 (QA 20261003 follow-up): the status-bar popovers' ✕ tooltip.
+  "Close (Esc)": "閉じる (Esc)",
   "Close changes panel": "変更パネルを閉じる",
   "Close citations panel": "文献パネルを閉じる",
   "Close panel": "パネルを閉じる",
@@ -717,6 +722,10 @@ export const JA: Record<string, string> = {
   "{n} changed since last save": "前回保存から{n}件変更",
   "Title changed": "タイトルを変更",
   "Order, analysis or metadata changed": "順序・分析・メタデータを変更",
+  // QA 20261003: a change only the Markdown source carries (BUG-005).
+  "Markdown source changed": "Markdownソースを変更",
+  "Only the Markdown text differs (for example front matter, blank lines, spacing, line endings, heading or fence markers, or the title line); the paragraphs in the editor are unchanged.":
+    "Markdownのテキストだけが異なります(フロントマター・空行・空白・改行コード・見出しやコードフェンスの記号・タイトル行など)。エディタの段落は変わっていません。",
   "Unsaved (matches last save)": "未保存(保存時と同じ内容)",
   "Draft report": "下書きのレポート",
   "Last draft": "直近の下書き",
@@ -879,9 +888,12 @@ export const JA: Record<string, string> = {
   // ReviewPanel empty state (continues "No comments yet. Use a paragraph's" + icon)
   "button to add one, or run “AI review” / “Map logic” above.": "ボタンで追加するか、上の「AIレビュー」/「ロジックを可視化」を実行してください。",
   // SlideEditor
-  "{n} diagram(s) on this slide are not yet exported to .pptx": "このスライドの{n}件の図は、まだ.pptxに書き出されません",
-  "{n} diagram(s) in the editor — not yet shown on slides or exported to .pptx.":
-    "エディタ内の{n}件の図 — スライドにはまだ表示されず、.pptxにも書き出されません。",
+  // Diagram notices (QA 20261003 follow-up): the in-app .pptx export embeds a
+  // diagram only on a slide with an image layout (pptx.rs test guard).
+  "{n} diagram(s) on this slide — not drawn in the slide preview; the .pptx export includes them only when the slide uses an image layout (Image right, left or top)":
+    "このスライドの図{n}件 — スライドのプレビューには描画されません。.pptxへの書き出しには、スライドが画像レイアウト(画像を右に・左に・上に)のときだけ含まれます",
+  "{n} diagram(s) in the editor — not drawn on slides in the app. The .pptx export includes them only when the slide uses an image layout.":
+    "エディタ内の図{n}件 — アプリ内のスライドには描画されません。.pptxへの書き出しには、スライドが画像レイアウトのときだけ含まれます。",
   "May overflow — this slide has more text than fits the exported slide. Consider splitting it (Edit view: “Split slide here”).":
     "はみ出す可能性があります — このスライドは書き出し先に収まらないほどテキストが多いです。分割を検討してください(編集表示の「ここでスライドを分割」)。",
   long: "長い",

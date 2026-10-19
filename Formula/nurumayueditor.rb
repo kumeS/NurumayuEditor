@@ -19,11 +19,11 @@
 class Nurumayueditor < Formula
   desc "Writing app where every document is already a slide deck"
   homepage "https://github.com/kumeS/NurumayuEditor"
-  url "https://github.com/kumeS/NurumayuEditor/archive/refs/tags/v1.4.0.tar.gz"
-  # TODO(release): no v1.4.0 tag exists yet — this placeholder WILL fail
+  url "https://github.com/kumeS/NurumayuEditor/archive/refs/tags/v1.5.0.tar.gz"
+  # TODO(release): no v1.5.0 tag exists yet — this placeholder WILL fail
   # Homebrew's checksum check (intentionally, rather than installing the wrong
   # bytes). After tagging, regenerate with:
-  #   curl -sL https://github.com/kumeS/NurumayuEditor/archive/refs/tags/v1.4.0.tar.gz | shasum -a 256
+  #   curl -sL https://github.com/kumeS/NurumayuEditor/archive/refs/tags/v1.5.0.tar.gz | shasum -a 256
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Artistic-2.0"
   head "https://github.com/kumeS/NurumayuEditor.git", branch: "main"

@@ -97,3 +97,56 @@ describe("preview background contract (TS ⇄ Rust ⇄ CSS)", () => {
     }
   });
 });
+
+// QA 20261003 follow-up (BUG-006 regression): the picker's popover listened on
+// WINDOW for Escape and never claimed the key, so with a docked side panel
+// open one Esc closed both (usePanelEscape's window listener does not see a
+// key nobody claimed). The picker now listens on DOCUMENT — bubble phase,
+// which runs before every window listener — and claims the key, exactly like
+// Toolbar's useDropdownDismiss. Source-text guard (no DOM in this suite);
+// the real key routing in WKWebView is confirmed by the manual QA re-run.
+describe("PreviewBackgroundPicker Esc: one key, one effect (QA 20261003 follow-up)", () => {
+  const picker = Object.values(
+    import.meta.glob("./components/PreviewBackgroundPicker.tsx", { eager: true, query: "?raw", import: "default" })
+  )[0] as string;
+  /** The open-popover dismiss effect, from `if (!open) return;` to its deps. */
+  const effect = () => {
+    const at = picker.indexOf("if (!open) return;");
+    expect(at, "dismiss effect").toBeGreaterThan(-1);
+    return picker.slice(at, picker.indexOf("}, [open]);", at));
+  };
+  /** The keydown handler inside that effect. */
+  const onKey = () => {
+    const e = effect();
+    const at = e.indexOf("const onKey = (e: KeyboardEvent) => {");
+    expect(at, "onKey handler").toBeGreaterThan(-1);
+    return e.slice(at, e.indexOf("\n    };", at));
+  };
+
+  it("ignores IME keys and keys another handler already claimed, before anything else", () => {
+    expect(picker).toMatch(/import \{ isImeKeyEvent \} from "\.\.\/modalBehavior";/);
+    const h = onKey();
+    const guard = h.indexOf("if (isImeKeyEvent(e) || e.defaultPrevented) return;");
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(h.indexOf('e.key === "Escape"'));
+  });
+
+  it("claims the Escape (preventDefault) before closing, so the docked panel's hook leaves it alone", () => {
+    const h = onKey();
+    const esc = h.indexOf('if (e.key === "Escape") {');
+    const claim = h.indexOf("e.preventDefault();", esc);
+    const close = h.indexOf("setOpen(false);", esc);
+    expect(esc).toBeGreaterThan(-1);
+    expect(claim).toBeGreaterThan(esc);
+    expect(close).toBeGreaterThan(claim);
+  });
+
+  it("listens on document in the bubble phase, never on window", () => {
+    const e = effect();
+    expect(e).toContain('document.addEventListener("keydown", onKey);');
+    expect(e).toContain('document.removeEventListener("keydown", onKey);');
+    expect(picker).not.toMatch(/window\.(add|remove)EventListener\("keydown"/);
+    // Capture would run before the find bar / editor handlers could claim it.
+    expect(picker).not.toMatch(/addEventListener\("keydown", onKey, /);
+  });
+});

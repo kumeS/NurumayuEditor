@@ -18,16 +18,19 @@
 // native `beforeinput` / `compositionstart` listener).
 // Wiring: all three ChunkView textareas (heading, body, diagram) call this
 // from native beforeinput/compositionstart listeners and pass the result as
-// `newUndoStep` (guarded by chunkViewWiring.test.ts), and so does the
-// SlideEditor detached-slide title input (guarded by
-// slideEditorWiring.test.ts).
+// `newUndoStep` (guarded by chunkViewWiring.test.ts), and so do SlideEditor's
+// live document fields — the detached-slide title input and bullets
+// textarea and the speaker-notes textarea — each through its own
+// `useUndoBoundaries` instance (guarded by slideEditorWiring.test.ts).
 //
 // The store's idle rule (a pause > UNDO_IDLE_MS starts a step) is the second
 // boundary source; it must not fire inside a composition either (a pause while
 // choosing a candidate would snapshot raw kana as an undo state). The same
-// call sites feed a `createCompositionTracker()` and pass `composing` to
-// updateChunkContent, which then skips ONLY the idle term. The first input of
-// a composition is not a continuation, so an idle gap before it still splits.
+// call sites feed a `createCompositionTracker()` and pass `composing` to the
+// store's coalescing writer (updateChunkContent; updateSlideBody /
+// updateChunkNotes for the slide bullets / notes), which then skips ONLY the
+// idle term. The first input of a composition is not a continuation, so an
+// idle gap before it still splits.
 // Real-IME behaviour is checked manually (Node-only suite); the event orders
 // are simulated in undoBoundary.test.ts.
 

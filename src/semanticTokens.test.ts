@@ -4,7 +4,9 @@ import { describe, expect, it } from "vitest";
 // warn / danger / ok / additive / removed), never raw Tailwind scales, so the
 // palette changes in tailwind.config.js alone. src/healthBarWiring.test.ts
 // guards HealthBar, OpenRouterModelCatalog and NetworkPanel; this file guards
-// the next four surfaces migrated in w4-polish.
+// the next four surfaces migrated in w4-polish, plus the ReviewPanel frame
+// (aside, header, ✕ — the lines the Esc-to-close change touched). The rest of
+// ReviewPanel is not migrated yet, so only those three classes are checked.
 //
 // Allow-list: intentionally empty. The slide canvas's export-parity palette
 // (SlideEditor's SLIDE_CODE_BG, the ink/soft/accent consts in the slide stage,
@@ -17,6 +19,7 @@ const SOURCES = import.meta.glob(
     "./components/Toolbar.tsx",
     "./components/DiffPanel.tsx",
     "./components/SlideEditor.tsx",
+    "./components/ReviewPanel.tsx",
     "../tailwind.config.js",
   ],
   { eager: true, query: "?raw", import: "default" }
@@ -66,5 +69,31 @@ describe("semantic colour tokens in TabBar / Toolbar / DiffPanel / SlideEditor (
     expect(dp).toContain("bg-removed-mark");
     expect(dp).toContain("text-additive");
     expect(dp).toContain("text-removed");
+  });
+});
+
+describe("ReviewPanel frame uses the chrome tokens its sibling NetworkPanel uses (ui.md rule 9)", () => {
+  const rp = () => src("./components/ReviewPanel.tsx");
+  /** The one className captured by `re`, scoped to that element. */
+  function classOf(re: RegExp, what: string): string {
+    const m = rp().match(re);
+    expect(m, what).not.toBeNull();
+    return m![1];
+  }
+  // Each fails if its line goes back to a raw gray (border-gray-200 /
+  // hover:bg-gray-100) or loses the token.
+  const FRAME: [string, RegExp, string][] = [
+    ["the docked aside", /<aside\s+data-docked-panel="review"\s+className="([^"]*)"/, "border-chrome-line"],
+    [
+      "the header row",
+      /<aside\s+data-docked-panel="review"\s+className="[^"]*"\s*>\s*<div className="([^"]*)"/,
+      "border-chrome-line",
+    ],
+    ["the ✕ close button", /onClick=\{closePanel\}\s+className="([^"]*)"/, "hover:bg-chrome-hairline"],
+  ];
+  it.each(FRAME)("%s: no raw scale class, uses the chrome token", (what, re, token) => {
+    const cls = classOf(re, what);
+    expect(cls.match(RAW_SCALE) ?? [], what).toEqual([]);
+    expect(cls.split(/\s+/), what).toContain(token);
   });
 });

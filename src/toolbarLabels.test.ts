@@ -54,6 +54,9 @@ describe("Toolbar wiring", () => {
     expect(escape).toBeGreaterThan(-1);
     const onKey = hook.slice(hook.indexOf("const onKey"), escape);
     expect(onKey).toContain("isImeKeyEvent(e)");
+    // One Esc, one effect (QA 20261003 follow-up): an Esc the find bar (or
+    // any other handler) already claimed must not also close the dropdown.
+    expect(onKey).toMatch(/if \(isImeKeyEvent\(e\) \|\| e\.defaultPrevented\) return;/);
     for (const menu of ["fileMenuOpen", "openMenuOpen", "saveMenuOpen"]) {
       expect(toolbar, menu).toMatch(new RegExp(`useDropdownDismiss\\(${menu},`));
       expect(toolbar, menu).toMatch(new RegExp(`expanded=\\{${menu}\\}`));

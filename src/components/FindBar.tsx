@@ -15,13 +15,22 @@
 //   visible; replaces are ONE isolated CodeMirror transaction that the update
 //   listener commits as its own store undo step. Go to Line works here only,
 //   and only for a line in 1..N (`parseLineNumber`, BUG-004, QA 20261003).
-// - "Replaced N." is shown only while the searched text is the one Replace
-//   All left; any later undo / redo / edit shows the live matches again.
+// - "Replaced N." is shown only while the searched text and the find options
+//   are the ones Replace All left; any later undo / redo / edit, or a Match
+//   case / Whole word toggle, shows the live matches again (BUG-002, C13).
+// - A match that already reads the replacement is not replaced: Replace
+//   moves past it, an all-identity Replace All says "Nothing to change.", and
+//   ⌘Z in the bar is armed only by a replace that changed the store (C12).
 // - Slides mode: planned — the bar says so instead of searching.
 // Focus stays in the bar while stepping (Enter / ⇧Enter, ⌘G / ⇧⌘G); Esc
 // (IME-safe) closes it and returns focus to the editor on the current match.
+// A button press keeps focus where it is only when focus is already in the
+// bar; from a Markdown Preview block it blurs that block first, which commits
+// its typed text before the replace runs (C11). C11–C14: review follow-up,
+// QA 20261003.
 
 import { type MouseEvent, type ReactNode, type Ref, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { EditorState } from "@codemirror/state";
 import {
   applyChanges,
   type ChunkMatch,
@@ -32,6 +41,7 @@ import {
   findMatches,
   findSeed,
   freshReplaceReport,
+  isNoOpChange,
   lineCount,
   lineStartOffset,
   nextMatch,
@@ -62,9 +72,10 @@ const searchedText = (loc: Located): string => (loc.kind === "unavailable" ? "" 
 /** The searchable text of the current view and its matches. Markdown mode
  *  searches the STORE's source, LF-normalized, so offsets are the CodeMirror
  *  positions `select` uses. Never the mounted view's own text: after a store
- *  undo / redo MarkdownEditor syncs the view in an effect, a render after
- *  this bar has re-located, and nothing re-renders the bar once it has — so
- *  reading the view found the pre-undo text (BUG-002, QA 20261003). */
+ *  undo / redo MarkdownEditor syncs the view in a (layout) effect, i.e.
+ *  after this bar has rendered and re-located, and nothing re-renders the bar
+ *  once it has — so reading the view found the pre-undo text (BUG-002, QA
+ *  20261003). */
 export function locate(s: State): Located {
   const mode = s.doc.mode ?? "editor";
   if (findAvailability(mode) !== "available") return { kind: "unavailable" };
@@ -185,9 +196,37 @@ export function findStep(dir: Dir) {
   step(dir);
 }
 
+/** Whether the mounted source view shows `text` (the LF store text a
+ *  location searched): its selection and offsets mean nothing for any other
+ *  text (C11 defense in depth, review follow-up, QA 20261003). */
+function viewShows<V extends { readonly state: EditorState }>(view: V | null, text: string): view is V {
+  return view !== null && view.state.doc.toString() === text;
+}
+
+/** Index of the match the source view's selection is exactly on, or -1 —
+ *  and -1 while the view does not show the searched text yet (C14, review
+ *  follow-up, QA 20261003; the view syncs in a layout effect, see FindBar's
+ *  [loc] effect). */
+export function selectedSourceMatch(
+  view: { readonly state: EditorState } | null,
+  loc: { text: string; matches: readonly TextMatch[] }
+): number {
+  if (!viewShows(view, loc.text)) return -1;
+  const sel = view.state.selection.main;
+  return loc.matches.findIndex((m) => m.from === sel.from && m.to === sel.to);
+}
+
+/** Whether the store's document changed since `before`, i.e. a replace made
+ *  an undo step for ⌘Z in the bar to undo (C12, review follow-up, QA
+ *  20261003). Doc identity, not past.length: that saturates at the history cap. */
+const docChangedSince = (before: State): boolean => useStore.getState().doc !== before.doc;
+
 /** Replace the current match, then move to the next one. With no current
- *  match yet, the first press only selects one. */
-function replaceCurrent() {
+ *  match yet, the first press only selects one. A match that already reads
+ *  the replacement is moved past, not rewritten, and ⌘Z in the bar is armed
+ *  only when the store really changed (C12). Never blurs anything: the press
+ *  already committed a Preview edit (keepFieldFocus, C11). */
+export function replaceCurrent() {
   const s = useStore.getState();
   const loc = locate(s);
   if (loc.kind === "unavailable" || !s.find.query) return;
@@ -199,8 +238,9 @@ function replaceCurrent() {
       step("next");
       return;
     }
-    if (!s.replaceMatchInChunk(live.chunkId, live.from, live.to, replacement)) return;
-    useStore.getState().setFind({ replacePending: true });
+    const noOp = isNoOpChange(loc.text, { from: live.docFrom, to: live.docTo, insert: replacement });
+    if (!noOp && !s.replaceMatchInChunk(live.chunkId, live.from, live.to, replacement)) return;
+    if (docChangedSince(s)) useStore.getState().setFind({ replacePending: true });
     const after = useStore.getState();
     const next = locate(after);
     if (next.kind !== "chunks") return;
@@ -209,48 +249,55 @@ function replaceCurrent() {
     return;
   }
   const view = markdownSourceBridge.view();
-  const sel = view?.state.selection.main;
-  const cur = view
-    ? loc.matches.find((m) => m.from === sel?.from && m.to === sel?.to)
-    : loc.matches[s.find.current];
+  // A view still showing other text has its selection in other offsets (-1).
+  const cur = view ? loc.matches[selectedSourceMatch(view, loc)] : loc.matches[s.find.current];
   if (!cur) {
     step("next");
     return;
   }
   const change = { from: cur.from, to: cur.to, insert: replacement };
-  if (!markdownSourceBridge.replace([change], false)) {
+  if (!isNoOpChange(loc.text, change) && !markdownSourceBridge.replace([change], false)) {
     s.setMarkdownSource(restoreEol(applyChanges(loc.text, [change]), eolOf(documentToMarkdown(s.doc))), {
       newUndoStep: true,
     });
   }
-  useStore.getState().setFind({ replacePending: true });
+  if (docChangedSince(s)) useStore.getState().setFind({ replacePending: true });
   const next = locate(useStore.getState());
   if (next.kind !== "markdown") return;
   goTo(next, nextMatch(next.matches, cur.from + replacement.length, "next"));
 }
 
-/** Replace every match as one undo step; returns the count and the searched
- *  text it leaves (the report is shown only while that text is current). */
-function replaceEverything(): ReplaceReport {
+/** Replace every match as one undo step; returns how many matches it
+ *  changed and the search it leaves (text + options: the report is shown only
+ *  while both are current, BUG-002 / C13). Matches that already read the
+ *  replacement are not changes (`replacementChanges`), so an all-identity
+ *  Replace All changes nothing, reports 0 and does not arm ⌘Z in the bar —
+ *  an earlier replace that armed it stays the latest step (C12, review
+ *  follow-up, QA 20261003). Never blurs anything (C11, see keepFieldFocus). */
+export function replaceEverything(): ReplaceReport {
   const s = useStore.getState();
   const loc = locate(s);
   const { query, replacement, caseSensitive, wholeWord } = s.find;
-  if (loc.kind === "unavailable" || !query) return { count: 0, text: searchedText(loc) };
   const opts = { caseSensitive, wholeWord };
+  if (loc.kind === "unavailable" || !query) return { count: 0, text: searchedText(loc), ...opts };
   let count: number;
   if (loc.kind === "chunks") {
     count = s.replaceAllInChunks(query, replacement, opts);
   } else {
     const changes = replacementChanges(loc.text, query, replacement, opts);
     count = changes.length;
-    if (!markdownSourceBridge.replace(changes, true)) {
+    // The view takes the change list only while it shows the searched text
+    // (else, or with no view, the store applies it; the view then syncs).
+    const view = markdownSourceBridge.view();
+    if (count > 0 && !(viewShows(view, loc.text) && markdownSourceBridge.replace(changes, true))) {
       count = s.replaceAllInMarkdown(query, replacement, opts);
     }
   }
-  s.setFind({ current: -1, hit: null, replacePending: count > 0 });
+  const changed = docChangedSince(s);
+  s.setFind({ current: -1, hit: null, ...(changed ? { replacePending: true } : {}) });
   // Both paths update the store synchronously (CodeMirror's update listener
   // commits the replace), so this is the text the next render searches.
-  return { count, text: searchedText(locate(useStore.getState())) };
+  return { count: changed ? count : 0, text: searchedText(locate(useStore.getState())), ...opts };
 }
 
 /** Close the bar and give focus back to the editor, on the current match. */
@@ -285,9 +332,54 @@ function goToLine(line: number) {
   }
 }
 
-/** Buttons keep focus in the field, so Enter / Esc keep working after a
- *  click (the click itself still fires). */
-const keepFieldFocus = (e: MouseEvent) => e.preventDefault();
+/**
+ * Whether a press on a find-bar button keeps focus where it is (C11, review
+ * follow-up, QA 20261003): only when focus is already in the bar, so Enter /
+ * Esc keep working in the field after a click (the click itself still
+ * fires). A press that starts anywhere else blurs natively: a Markdown
+ * Preview block or draft commits its typed text on that blur, and the store
+ * update, its render and the source view's layout-effect sync all finish
+ * before the click runs the replace. Claiming that press (preventDefault)
+ * kept the block focused and uncommitted, and the replace remounted it —
+ * the typed text was lost. The replace handlers must not blur instead:
+ * React renders only after the click handler returns, so the source view
+ * would still show the old text and its write-back would undo the commit.
+ * The predicate and the handler's shape are guarded (findBarRender /
+ * findBarWiring tests); that WKWebView blurs the block on a button press and
+ * renders before the click is NOT guarded by this suite (no DOM) — manual QA
+ * in the installed app. After a press from outside the bar, focus does not
+ * move into the bar (WebKit leaves it on the page body).
+ */
+export function keepsFocusOnPress(active: unknown): boolean {
+  const el = (active ?? null) as { closest?: (selector: string) => unknown } | null;
+  return typeof el?.closest === "function" && Boolean(el.closest("[data-find-bar]"));
+}
+
+/** onMouseDown of every find-bar button (findBarWiring.test.ts). */
+const keepFieldFocus = (e: MouseEvent) => {
+  if (keepsFocusOnPress(document.activeElement)) e.preventDefault();
+};
+
+/**
+ * The bar's status line. `report` is the FRESH Replace All report
+ * (freshReplaceReport) or null. A report that changed nothing — every match
+ * already read the replacement — says so while those matches are still live
+ * (C12), never "No matches" next to enabled buttons. `t` / `lang` are
+ * parameters so this runs without the store (findBarRender.test.ts).
+ */
+export function findStatus(
+  { report, query, total, current }: { report: ReplaceReport | null; query: string; total: number; current: number },
+  t: (key: string) => string,
+  lang: UiLang
+): string {
+  if (report !== null) {
+    if (report.count > 0) return translateWith("Replaced {n}.", lang, { n: report.count });
+    return total > 0 ? t("Nothing to change.") : t("No matches");
+  }
+  if (!query) return "";
+  if (total === 0) return t("No matches");
+  return current >= 0 ? `${current + 1} / ${total}` : translateWith("{n} matches", lang, { n: total });
+}
 
 const btn =
   "rounded border border-chrome-edge bg-white px-2 py-1 text-xs text-ink-soft hover:bg-chrome-hairline disabled:cursor-not-allowed disabled:opacity-40";
@@ -389,7 +481,10 @@ export default function FindBar() {
   const total = loc.kind === "unavailable" ? 0 : loc.matches.length;
   // "Replaced N." describes only the text Replace All left: an undo, redo or
   // edit after it shows the live matches again (BUG-002, QA 20261003).
-  const report = freshReplaceReport(replaced, searchedText(loc));
+  const report = freshReplaceReport(replaced, searchedText(loc), {
+    caseSensitive: find.caseSensitive,
+    wholeWord: find.wholeWord,
+  });
 
   // Focus the field on every open (⌘F again re-focuses an open bar). A frame
   // later, so a closing palette's focus restore cannot steal it back.
@@ -413,12 +508,14 @@ export default function FindBar() {
       const i = hit ? loc.hits.findIndex((h) => h.chunkId === hit.chunkId && h.from === hit.from && h.to === hit.to) : -1;
       if (i !== s.find.current || (i < 0 && hit)) setFind({ current: i, hit: i < 0 ? null : hit });
     } else {
-      // Markdown: the current match is the source selection, if it is one —
-      // once the view shows the searched text (after a store undo it syncs
-      // an effect later, its selection still on the old text; BUG-002).
-      const view = markdownSourceBridge.view();
-      const sel = view && view.state.doc.toString() === loc.text ? view.state.selection.main : null;
-      const i = sel ? loc.matches.findIndex((m) => m.from === sel.from && m.to === sel.to) : -1;
+      // Markdown: the current match is the source selection, if it is one.
+      // This is a PASSIVE effect and MarkdownEditor syncs the view from the
+      // store in a LAYOUT effect, which React runs first for the whole
+      // commit: after a store undo / redo the view already shows the searched
+      // text here, its selection mapped onto it, so a selected match reads
+      // "k / N" (C14, review follow-up, QA 20261003). The check stays for a
+      // view that does not show it (BUG-002).
+      const i = selectedSourceMatch(markdownSourceBridge.view(), loc);
       if (i !== s.find.current) setFind({ current: i });
     }
   }, [loc, find.open, setFind]);
@@ -439,18 +536,7 @@ export default function FindBar() {
       ? t("Go to Line works in Markdown source — switch to Markdown to use it.")
       : null;
 
-  const status =
-    report !== null
-      ? report.count > 0
-        ? translateWith("Replaced {n}.", lang, { n: report.count })
-        : t("No matches")
-      : !find.query
-        ? ""
-        : total === 0
-          ? t("No matches")
-          : find.current >= 0
-            ? `${find.current + 1} / ${total}`
-            : translateWith("{n} matches", lang, { n: total });
+  const status = findStatus({ report, query: find.query, total, current: find.current }, t, lang);
 
   const closeButton = (
     <Tooltip label={t("Close find bar (Esc)")}>
@@ -546,7 +632,7 @@ export default function FindBar() {
                 {"ab"}
               </button>
             </Tooltip>
-            <span role="status" aria-live="polite" className="min-w-[5rem] px-1 tabular-nums text-ink-faint">
+            <span role="status" aria-live="polite" title={status} className="w-[9.5rem] shrink-0 truncate whitespace-nowrap px-1 tabular-nums text-ink-faint">
               {status}
             </span>
             <Tooltip label={t("Previous match (⇧Enter / ⇧⌘G)")}>
